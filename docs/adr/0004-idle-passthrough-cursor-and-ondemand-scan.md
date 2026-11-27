@@ -5,9 +5,9 @@ status: accepted
 # 悬浮层空闲零开销直通、单系统光标托管与 Lua 按需扫描架构
 
 为彻底根治关闭菜单后鼠标指针随视角高速闪烁以及正常游玩期间周期性掉帧问题，我们对 C++ 悬浮层与 Lua 引擎层确立三项长期架构约束：
-1. **菜单关闭零干扰与单系统光标托管**：永久开启 `ImGuiConfigFlags_NoMouseCursorChange` 并关闭 `io.MouseDrawCursor`；菜单关闭时完全不调用 `ImGui_ImplWin32_WndProcHandler`、绝不触碰光标与输入捕获（M 地图悬停改为只读 `GetCursorPos`）；菜单打开时在窗口线程托管单一系统原生光标并临时解除 `ClipCursor`，关闭或 `Alt+Tab` 失焦瞬间精确还原并派发 `WM_SETCURSOR` 交还 UE4。
+1. **菜单关闭零干扰与菜单期 Win32 光标 API 条件接管**：永久开启 `ImGuiConfigFlags_NoMouseCursorChange` 并关闭 `io.MouseDrawCursor`；菜单关闭时完全不调用 `ImGui_ImplWin32_WndProcHandler`、绝不触碰光标与输入捕获（M 地图悬停改为只读 `GetCursorPos`）；由于 UE4 的 `FSlateApplication::Tick()` / `FWindowsCursor` 在 3D 游玩态下每帧直接调用 `USER32!SetCursor(NULL)` / `ShowCursor(FALSE)` / `ClipCursor` / `SetCursorPos` 绕过 `WM_SETCURSOR`，我们在上述 4 个 Win32 光标 API 上安装轻量化 MinHook——菜单关闭时单条原子判断零开销直通原 API，仅当菜单打开且游戏窗口处于前台时拦截 UE4 对光标的隐藏、锁框与居中拉回，同时记录 UE4 最新光标/锁框/显示计数期望，在关闭菜单或 `Alt+Tab` 失焦瞬间精确还原并派发 `WM_SETCURSOR` 交还 UE4。
 2. **渲染层空闲零开销直通 + 后台异步 IPC**：当菜单关闭、M 地图关闭且开场提示条已消失时，`Present` 直接放行，跳过 DX12 围栏等待、BackBuffer 资源屏障、命令提交与 ImGui 帧构建；同时把 JSON 文件读写与解析全部移出渲染线程交由独立后台 I/O 线程完成，渲染线程仅读取 `std::shared_ptr` 不可变快照。
-3. **Lua 游玩期零全图扫描**：停用每 10 秒全图 `LODActors` 扫表与每 2.5 秒全图 `FindAllOf("LootComponent")` 扫表，掉落倍率改由 `SpawnLoot` 实时 Hook + 进图/改配置一次性扫描保障；目录与乳牙数改为进图首次、打开 M 地图（打开期间降频至 1.8 秒同步一次，拖拽缩放仍由 C++ 满帧直读 Slate 内存）、打开 Mod 菜单超 5 秒静默轻刷新（`refresh_catalog_soft`）或手动刷新时按需更新，并对 `status.json` 写盘做脏检查且缓存高频 UObject 句柄。
+3. **Lua 游玩期零全图扫描与客机本地多源追踪**：停用周期全图 `LODActors` 扫表与任何 `FindAllOf("LootComponent")` 扫表（掉落倍率改为 ADR-0005 约束）；目录与乳牙数改为进图首次、打开 M 地图（打开期间降频至 1.8 秒同步一次，拖拽缩放仍由 C++ 满帧直读 Slate 内存）、打开 Mod 菜单超 5 秒静默轻刷新（`refresh_catalog_soft`）或手动刷新时按需更新，并对 `status.json` 写盘做脏检查且缓存高频 UObject 句柄。多人联机客机端因 `LODActors` 为服务端独占，自动改为本地多源扫描（全队共享的 `TrackedCollectibles` 乳牙/SCA.B + 全图原生同步 ISM 植被 + 客机网络相关性范围内已加载的 `HarvestNode / SurvivalCreature / SpawnedItem / ScienceCollectable / OminentChest`），保持主客机独立追踪且零联机协议风险。
 
 ## Considered Options
 

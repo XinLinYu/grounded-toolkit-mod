@@ -12,10 +12,13 @@
       - L6: 一键找回全队背包（在线队友送回本人脚边、K2_TeleportTo 失败自动降级 K2_SetActorLocation、离线玩家背包归房主代收）
       - L7: 本人无背包但存在队友背包时的友好中文引导提示
       - L8: 退出存档切换世界时清空基准值缓存，进入新难度存档正确读取新基准值
-      - L9: 原有核心功能无回归（物品堆叠保护单件装备、伤害倍率、采集倍率排除背包/乳牙且搬运物封顶 12）
+      - L9: 原有核心功能无回归（物品堆叠保护单件装备、伤害倍率、严禁全图扫表或篡改 CDO/GEN_VARIABLE 掉落模板）
       - L10: 游玩期性能不变量（ADR-0004：30 秒内 0 次周期全图 LOD/LootComponent 扫表、0 次重复 FindFirstOf、0 次无效写盘）
-      - L11: SpawnLoot 实时 Hook 接管新掉落组件并在关闭采集倍率时无损还原
+      - L11: SpawnLoot 瞬时 Pre/Post 还原（仅肩扛搬运物封顶 12 根且执行后立刻还原，普通掉落物与 CDO/GEN_VARIABLE 始终保持原版 1 倍，连续 10 次无复利）
       - L12: 打开菜单 5 秒冷却静默软刷新（refresh_catalog_soft）与 M 地图 1.8 秒刷新节流
+      - L13: 采集入包倍率精确生效（橡果爆出物、联机队友拾取、虫尸直入背包均精确 1 次倍率；自然直拾开关独立控制 ISM 植被与地图预摆物）
+      - L14: 四重防刷拦截回归（玩家丢弃、快捷丢弃、投掷、拆建返还、整堆、不可堆叠装备与储物箱拿取一律严格 1 倍）
+      - L15: 多人联机客机 M 地图本地多源扫描（乳牙全队共享 + 全图植被 + 客机可见采集点/生物/散落物/科学点/宝箱，主客机独立追踪互不共享）
 ]]
 
 -- ============================================================
@@ -286,6 +289,11 @@ local function buildWorld(opts)
     world.lods = {}
     world.loadedBags = {}
     world.lootComponents = {}
+    world.harvestNodes = {}
+    world.creatures = {}
+    world.spawnedItems = {}
+    world.scienceOrbs = {}
+    world.worldIsms = {}
 
     world.gs = makeUObject("SurvivalGameState", "GS_World_" .. tostring(opts.worldTag or "A"), {
         HasAuthority = function() return world.isHost end,
@@ -406,6 +414,11 @@ _G.FindAllOf = function(cls)
     if cls == "SurvivalPlayerCharacter" then return world.teammates end
     if cls == "LootBag" then return world.loadedBags end
     if cls == "LootComponent" then return world.lootComponents end
+    if cls == "HarvestNode" then return world.harvestNodes or {} end
+    if cls == "SurvivalCreature" then return world.creatures or {} end
+    if cls == "SpawnedItem" then return world.spawnedItems or {} end
+    if cls == "ScienceCollectable" then return world.scienceOrbs or {} end
+    if cls == "InstancedStaticMeshComponent" then return world.worldIsms or {} end
     if cls == "SurvivalGameModeSettings" then
         return { world.gs.SurvivalModeManagerComponent.GameModeSettings }
     end
@@ -747,22 +760,23 @@ runCase("L8: 退出存档并进入不同原版难度新存档时，基准值缓�
     assertNear(gms2.ItemDurabilityPenaltyOnDeathPercentage, 0.25, 0.0001, "新档关闭耐久保护应精准还原为新档基准 0.25")
 end)
 
-runCase("L9: 原有核心功能无回归（堆叠保护装备 + 伤害倍率 + 采集倍率排除背包/乳牙且草板封顶 12）", function()
+runCase("L9: 原有核心功能无回归（堆叠保护装备 + 伤害倍率 + 严禁全图扫表或污染 LootComponent 蓝图模板）", function()
     local gms3 = buildWorld({ worldTag = "C", basePlayerDmg = 1.0, baseEnemyDmg = 1.0 })
     local grassEntry = { Type = 0, Count = 5, ItemData = { RowName = makeFName("GrassPlank") } }
-    local oreEntry = { Type = 0, Count = 2, ItemData = { RowName = makeFName("Quartzite") } }
-    local bagLootEntry = { Type = 0, Count = 2, ItemData = { RowName = makeFName("Quartzite") } }
+    local acornEntry = { Type = 0, Count = 2, ItemData = { RowName = makeFName("AcornShell") } }
+    local cdoEntry = { Type = 0, Count = 2, ItemData = { RowName = makeFName("AcornBits") } }
 
-    local lcNormal = makeUObject("LootComponent", "LC_Rock", {
-        GetOuter = function() return makeUObject("HarvestNode", "BP_Rock_WeaponStone1_C") end,
-        Items = { grassEntry, oreEntry },
+    local lcNormal = makeUObject("LootComponent", "LC_Grass", {
+        GetOuter = function() return makeUObject("HarvestNode", "BP_GrassBlade_A_C_1") end,
+        Items = { grassEntry, acornEntry },
     })
-    local lcBackpack = makeUObject("LootComponent", "LC_Backpack", {
-        GetOuter = function() return makeUObject("LootBag", "BP_Backpack_C_1") end,
-        Items = { bagLootEntry },
+    local lcTemplate = makeUObject("LootComponent", "BP_Acorn_C:Loot_GEN_VARIABLE", {
+        GetOuter = function() return makeUObject("HarvestNode", "Default__BP_Acorn_C") end,
+        Items = { cdoEntry },
     })
-    world.lootComponents = { lcNormal, lcBackpack }
+    world.lootComponents = { lcNormal, lcTemplate }
 
+    local faLootBeforeL9 = perfCounters.findAll["LootComponent"] or 0
     writeJsonFile(modDataDir .. "\\config.json", {
         stackEnabled = true, stackMultiplier = 10,
         damageEnabled = true, playerDamageMultiplier = 2.5, enemyDamageMultiplier = 0.5,
@@ -777,9 +791,11 @@ runCase("L9: 原有核心功能无回归（堆叠保护装备 + 伤害倍率 + �
     assertEq(world.globalItemData._entries[2].val, 1, "单件装备基础堆叠 1 必须受保护保持 1")
     assertNear(gms3.PlayerDamageMultiplier, 2.5, 0.001, "玩家伤害倍率应生效为 2.5")
     assertNear(gms3.EnemyDamageMultiplier, 0.5, 0.001, "怪物伤害倍率应生效为 0.5")
-    assertEq(grassEntry.Count, 12, "草板搬运物放大后必须封顶 12 根防物理卡顿")
-    assertEq(oreEntry.Count, 10, "普通矿石 2 x5 应放大为 10")
-    assertEq(bagLootEntry.Count, 2, "玩家死亡背包所属 LootComponent 严禁被采集倍率放大")
+    assertEq((perfCounters.findAll["LootComponent"] or 0) - faLootBeforeL9, 0,
+        "ADR-0005：进图与改配置期间严禁调用 FindAllOf(LootComponent) 扫表")
+    assertEq(grassEntry.Count, 5, "未触发 SpawnLoot 时草板组件应保持原版 Count=5")
+    assertEq(acornEntry.Count, 2, "普通可入包掉落物组件应始终保持原版 1 倍")
+    assertEq(cdoEntry.Count, 2, "蓝图 CDO / GEN_VARIABLE 模板严禁被任何逻辑改写")
 end)
 
 runCase("L10: 正常游玩期 30 秒性能不变量（0 次周期全图扫描、0 次重复 FindFirstOf、0 次无效写盘）", function()
@@ -812,31 +828,63 @@ runCase("L10: 正常游玩期 30 秒性能不变量（0 次周期全图扫描、
         "30 秒内自适应调度应大幅减少 GameThread 唤醒次数（实际=" .. tostring(ticksDelta) .. "）")
 end)
 
-runCase("L11: SpawnLoot 实时 Hook 接管新流式掉落组件，且关闭采集倍率时精准还原", function()
+runCase("L11: SpawnLoot 瞬时 Pre/Post 还原（仅肩扛搬运物缩放封顶 12 并立即还原，橡果/模板始终 1 倍零复利）", function()
     local spawnHook = capturedHooks["/Script/Maine.LootComponent:SpawnLoot"]
-    assertTrue(spawnHook ~= nil and type(spawnHook.pre) == "function", "必须注册 LootComponent:SpawnLoot 实时 Hook")
+    assertTrue(spawnHook ~= nil and type(spawnHook.pre) == "function" and type(spawnHook.post) == "function",
+        "必须注册 LootComponent:SpawnLoot Pre/Post 瞬时还原 Hook")
 
-    local lateOre = { Type = 0, Count = 3, ItemData = { RowName = makeFName("Marble") } }
-    local lateLc = makeUObject("LootComponent", "LC_LateStreamed", {
-        GetOuter = function() return makeUObject("HarvestNode", "BP_Rock_ArmorStone1_C") end,
-        Items = { lateOre },
+    local plankEntry = { Type = 0, Count = 4, ItemData = { RowName = makeFName("GrassPlank") } }
+    local fiberEntry = { Type = 0, Count = 2, ItemData = { RowName = makeFName("PlantFiber") } }
+    local lcGrass = makeUObject("LootComponent", "LC_GrassBlade_Live", {
+        GetOuter = function() return makeUObject("HarvestNode", "BP_GrassBlade_A_C_2147400001") end,
+        Items = { plankEntry, fiberEntry },
     })
 
-    -- 未经过全图扫表的新组件在 SpawnLoot 触发瞬间即可放大（当前倍率 5x -> 3*5=15）
-    spawnHook.pre({ get = function() return lateLc end })
-    assertEq(lateOre.Count, 15, "SpawnLoot 实时 Hook 应在掉落瞬间把新组件放大 5 倍")
+    local acornShell = { Type = 0, Count = 2, ItemData = { RowName = makeFName("AcornShell") } }
+    local acornBits = { Type = 0, Count = 2, ItemData = { RowName = makeFName("AcornBits") } }
+    local acornTop = { Type = 0, Count = 1, ItemData = { RowName = makeFName("AcornTop") } }
+    local lcAcorn = makeUObject("LootComponent", "LC_Acorn_Live", {
+        GetOuter = function() return makeUObject("HarvestNode", "BP_Acorn_C_2147400002") end,
+        Items = { acornShell, acornBits, acornTop },
+    })
 
-    -- 关闭采集倍率配置，验证触发一次全扫还原且 SpawnLoot 也能还原已缓存的新组件
+    local cdoPlank = { Type = 0, Count = 4, ItemData = { RowName = makeFName("GrassPlank") } }
+    local lcCdo = makeUObject("LootComponent", "BP_GrassBlade_A_C:Loot_GEN_VARIABLE", {
+        GetOuter = function() return makeUObject("HarvestNode", "Default__BP_GrassBlade_A_C") end,
+        Items = { cdoPlank },
+    })
+
+    -- 连续触发 10 次 SpawnLoot（倍率=5x）：草板每次瞬时放大封顶 12 并在 Post-Hook 精准还原 4，绝不复利；橡果与纤维保持 1 倍
+    for _ = 1, 10 do
+        spawnHook.pre({ get = function() return lcGrass end })
+        assertEq(plankEntry.Count, 12, "SpawnLoot 执行期间草板应瞬时放大并封顶 12 根")
+        assertEq(fiberEntry.Count, 2, "普通可入包物品（植物纤维）落地期间必须保持原版 1 倍")
+        spawnHook.post({ get = function() return lcGrass end })
+        assertEq(plankEntry.Count, 4, "SpawnLoot Post-Hook 必须立刻将草板 Count 还原为原版 4")
+
+        spawnHook.pre({ get = function() return lcAcorn end })
+        assertEq(acornShell.Count, 2, "锤碎橡果壳地上爆出必须保持原版 1 倍")
+        assertEq(acornBits.Count, 2, "锤碎橡果肉地上爆出必须保持原版 1 倍")
+        assertEq(acornTop.Count, 1, "锤碎橡果盖地上爆出必须保持原版 1 倍")
+        spawnHook.post({ get = function() return lcAcorn end })
+
+        spawnHook.pre({ get = function() return lcCdo end })
+        assertEq(cdoPlank.Count, 4, "蓝图 GEN_VARIABLE/CDO 模板即使触发 SpawnLoot 也绝不可修改")
+        spawnHook.post({ get = function() return lcCdo end })
+    end
+
+    -- 关闭肩扛搬运物子开关，草板也保持原版 4
     writeJsonFile(modDataDir .. "\\config.json", {
         stackEnabled = true, stackMultiplier = 10,
         damageEnabled = true, playerDamageMultiplier = 2.5, enemyDamageMultiplier = 0.5,
-        harvestEnabled = false, harvestMultiplier = 5,
-        harvestAffectHauling = true, harvestAffectPickup = true,
+        harvestEnabled = true, harvestMultiplier = 5,
+        harvestAffectHauling = false, harvestAffectPickup = true,
         keepInventoryOnDeath = false, noDeathDurabilityPenalty = false,
     })
     stepTick(1.0)
-    spawnHook.pre({ get = function() return lateLc end })
-    assertEq(lateOre.Count, 3, "关闭采集倍率后 SpawnLoot 应将已放大的掉落组件还原为原版 3")
+    spawnHook.pre({ get = function() return lcGrass end })
+    assertEq(plankEntry.Count, 4, "关闭搬运物子开关后草板应保持原版 4")
+    spawnHook.post({ get = function() return lcGrass end })
 end)
 
 runCase("L12: 打开菜单静默软刷新（5 秒冷却 + 不覆盖状态提示）与 M 地图 1.8 秒刷新节流", function()
@@ -912,6 +960,346 @@ runCase("L12: 打开菜单静默软刷新（5 秒冷却 + 不覆盖状态提示�
     stepTick(0.5)
     local mapClosed = readJsonFile(modDataDir .. "\\map_live.json")
     assertEq(mapClosed.mapOpen, false, "关闭 M 地图后应立刻写出 mapOpen=false")
+    gameInstanceMock.WidgetManager = nil
+end)
+
+-- 辅助工厂：构造模拟背包物品与地面 ASpawnedItem 用于 L13 / L14 拾取倍率与四重防刷测试
+local function makeInvItem(rowName, stackSize, maxStack, canStack)
+    return makeUObject("Item", "InvItem_" .. rowName, {
+        ItemDataRowHandle = { RowName = makeFName(rowName) },
+        StackSize = stackSize or 1,
+        _maxStack = maxStack or 100,
+        _canStack = (canStack ~= false),
+        CanStack = function(self) return self._canStack end,
+        GetMaxStackSize = function(self) return self._maxStack end,
+        AdjustStackSize = function(self, delta) self.StackSize = (self.StackSize or 0) + delta end,
+    })
+end
+
+local function makeSpawnedItemActor(opts)
+    local itemObj = opts.itemObj or makeInvItem(opts.rowName, opts.stackSize or 1, opts.maxStack or 100, opts.canStack)
+    return makeUObject("SpawnedItem", opts.fullName or ("BP_WorldItem_" .. opts.rowName), {
+        PreplacedType = opts.preplacedType or 0,
+        bWasThrown = opts.wasThrown or false,
+        bIsThrown = opts.isThrown or false,
+        _loc = { X = opts.x or 1000, Y = opts.y or 2000, Z = opts.z or 300 },
+        IsA = function(_, path) return path == "/Script/Maine.SpawnedItem" end,
+        GetItem = function() return itemObj end,
+        GetDroppedBy = function() return opts.droppedBy end,
+        GetDroppedBySpawnedActor = function() return opts.droppedBySpawned end,
+        GetPreplacedType = function(self) return self.PreplacedType end,
+        K2_GetActorLocation = function(self) return { X = self._loc.X, Y = self._loc.Y, Z = self._loc.Z } end,
+    }), itemObj
+end
+
+local function addToInventory(inv, rowName, delta, maxStack, canStack)
+    for _, it in ipairs(inv.Items) do
+        if it.ItemDataRowHandle.RowName:ToString() == rowName and it:CanStack() then
+            it.StackSize = it.StackSize + delta
+            return it
+        end
+    end
+    local it = makeInvItem(rowName, delta, maxStack or 100, canStack)
+    table.insert(inv.Items, it)
+    return it
+end
+
+local function getInvTotal(inv, rowName)
+    local sum = 0
+    for _, it in ipairs(inv.Items) do
+        if it.ItemDataRowHandle.RowName:ToString() == rowName then
+            sum = sum + (it.StackSize or 1)
+        end
+    end
+    return sum
+end
+
+runCase("L13: 采集入包倍率精确生效（橡果爆出物/联机队友拾取/虫尸搜刮均 1 次倍率；自然直拾开关独立控制）", function()
+    local _, _, pHost, pClient = buildWorld({ worldTag = "D_Pickup" })
+    pHost.HasAuthority = function() return true end
+    pClient.HasAuthority = function() return true end -- 客机按 E 通过 RPC 在房主服务端执行
+
+    writeJsonFile(modDataDir .. "\\config.json", {
+        stackEnabled = true, stackMultiplier = 10,
+        harvestEnabled = true, harvestMultiplier = 3,
+        harvestAffectHauling = true, harvestAffectPickup = true,
+    })
+    stepTick(1.0)
+    stepTick(3.0)
+
+    local interactHook = capturedHooks["/Script/Maine.SurvivalPlayerCharacter:ServerHandleInteract"]
+    assertTrue(interactHook ~= nil and interactHook.pre ~= nil and interactHook.post ~= nil,
+        "必须注册 ServerHandleInteract Pre/Post Hook")
+
+    -- 1. 房主拾取锤碎橡果爆出的地上 1 倍橡果壳 -> 进背包精确为 3（绝不二次翻倍成 9）
+    local acornActor = makeSpawnedItemActor({ rowName = "AcornShell", preplacedType = 0 })
+    pHost.InteractableInRange = { ObjectPointer = acornActor }
+    pHost.InteractableFoliageKeyInRange = nil
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "AcornShell", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "AcornShell"), 3, "锤碎橡果爆出 1 个按 E 拾取进包应精确变为 3 个")
+
+    -- 2. 联机客机拾取橡果肉 -> 房主端执行 RPC 同样精确进包 3 个
+    local bitsActor = makeSpawnedItemActor({ rowName = "AcornBits", preplacedType = 0 })
+    pClient.InteractableInRange = { ObjectPointer = bitsActor }
+    interactHook.pre({ get = function() return pClient end })
+    addToInventory(pClient.InventoryComponent, "AcornBits", 1)
+    interactHook.post({ get = function() return pClient end })
+    assertEq(getInvTotal(pClient.InventoryComponent, "AcornBits"), 3, "联机客机拾取爆出物进包同样应精确为 3 倍")
+
+    -- 3. 按 E 搜刮死蜘蛛尸体（原版一次直入背包 4 个蜘蛛块 + 1 个蜘蛛牙 -> 3 倍后精确为 12 + 3，不受旧 <=3 截断）
+    local deadSpider = makeUObject("SurvivalCreature", "BP_Spider_Wolf_C_1", {
+        IsA = function(_, path) return path == "/Script/Maine.SurvivalCreature" end,
+        HealthComponent = makeUObject("HealthComponent", "HC_Spider", { IsDead = function() return true end }),
+    })
+    pHost.InteractableInRange = { ObjectPointer = deadSpider }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "SpiderChunk", 4)
+    addToInventory(pHost.InventoryComponent, "SpiderFang", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "SpiderChunk"), 12, "搜刮死虫尸体直入背包 4 块应精确放大为 12 块")
+    assertEq(getInvTotal(pHost.InventoryComponent, "SpiderFang"), 3, "搜刮死虫尸体直入背包 1 牙应精确放大为 3 牙")
+
+    -- 4. 地面天然 ISM 植被（树枝）与地图预摆物（鹅卵石）：开启 harvestAffectPickup 时走 3 倍
+    local fakeIsm = makeUObject("InstancedStaticMeshComponent", "ISM_Sprig")
+    pHost.InteractableInRange = nil
+    pHost.InteractableFoliageKeyInRange = { InstancedStaticMeshComponent = fakeIsm, MeshIndex = 7 }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Sprig", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Sprig"), 3, "开启自然直拾开关时 ISM 树枝直拾应为 3 个")
+
+    local preplacedPebble = makeSpawnedItemActor({ rowName = "Pebblet", preplacedType = 2 })
+    pHost.InteractableInRange = { ObjectPointer = preplacedPebble }
+    pHost.InteractableFoliageKeyInRange = nil
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Pebblet", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Pebblet"), 3, "开启自然直拾开关时地图预摆鹅卵石直拾应为 3 个")
+
+    -- 5. 关闭 harvestAffectPickup：自然直拾保持 1 倍，但橡果爆出物仍走 3 倍
+    writeJsonFile(modDataDir .. "\\config.json", {
+        harvestEnabled = true, harvestMultiplier = 3,
+        harvestAffectHauling = true, harvestAffectPickup = false,
+    })
+    stepTick(1.0)
+    pHost.InteractableInRange = nil
+    pHost.InteractableFoliageKeyInRange = { InstancedStaticMeshComponent = fakeIsm, MeshIndex = 8 }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Sprig", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Sprig"), 4, "关闭自然直拾开关后 ISM 树枝仅增加 1 个(3->4)")
+
+    pHost.InteractableInRange = { ObjectPointer = makeSpawnedItemActor({ rowName = "Pebblet", preplacedType = 2 }) }
+    pHost.InteractableFoliageKeyInRange = nil
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Pebblet", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Pebblet"), 4, "关闭自然直拾开关后地图预摆鹅卵石仅增加 1 个(3->4)")
+
+    pHost.InteractableInRange = { ObjectPointer = makeSpawnedItemActor({ rowName = "AcornShell", preplacedType = 0 }) }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "AcornShell", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "AcornShell"), 6, "关闭自然直拾后锤碎橡果爆出物拾取仍按 3 倍入包(3->6)")
+end)
+
+runCase("L14: 四重防刷拦截回归（玩家丢弃/快捷丢弃/投掷/拆建返还/整堆/装备/箱子拿取一律严格 1 倍）", function()
+    local _, _, pHost = buildWorld({ worldTag = "E_AntiDupe" })
+    pHost.HasAuthority = function() return true end
+
+    writeJsonFile(modDataDir .. "\\config.json", {
+        harvestEnabled = true, harvestMultiplier = 5,
+        harvestAffectHauling = true, harvestAffectPickup = true,
+    })
+    stepTick(1.0)
+    stepTick(3.0)
+
+    local interactHook = capturedHooks["/Script/Maine.SurvivalPlayerCharacter:ServerHandleInteract"]
+    local dropHook = capturedHooks["/Script/Maine.InventoryComponent:ServerDropItem"]
+    local bldDropHook = capturedHooks["/Script/Maine.Building:DropNewItem"]
+    local notifySpawnHook = capturedHooks["/Script/Maine.SpawnedItem:NotifySpawned"]
+    assertTrue(dropHook ~= nil and bldDropHook ~= nil and notifySpawnHook ~= nil,
+        "必须注册防刷丢弃与拆建返还钩子")
+
+    -- 1. 玩家从背包丢弃物品（即使 GetDroppedBy 恰好为空，也由 ServerDropItem + NotifySpawned 黑名单拦截为 1 倍）
+    local droppedItemObj = makeInvItem("Clay", 1, 100, true)
+    local droppedActor = makeSpawnedItemActor({ rowName = "Clay", itemObj = droppedItemObj, x = 1010, y = 2010, z = 300 })
+    pHost.InventoryComponent.GetOuter = function() return pHost end
+    dropHook.pre({ get = function() return pHost.InventoryComponent end }, { get = function() return droppedItemObj end }, { get = function() return 1 end })
+    notifySpawnHook.pre({ get = function() return droppedActor end })
+    dropHook.post()
+
+    pHost.InteractableInRange = { ObjectPointer = droppedActor }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Clay", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Clay"), 1, "玩家自丢物品再捡回必须严格保持 1 倍")
+
+    -- 2. 原生 GetDroppedBy() 非空物品 -> 严格 1 倍
+    local nativeDropped = makeSpawnedItemActor({ rowName = "Quartzite", droppedBy = pHost })
+    pHost.InteractableInRange = { ObjectPointer = nativeDropped }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Quartzite", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Quartzite"), 1, "GetDroppedBy 非空物品必须严格保持 1 倍")
+
+    -- 3. 玩家投掷出的物品（bWasThrown=true）-> 严格 1 倍
+    local thrownPebble = makeSpawnedItemActor({ rowName = "Pebblet", wasThrown = true })
+    pHost.InteractableInRange = { ObjectPointer = thrownPebble }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Pebblet", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Pebblet"), 1, "玩家投掷出的物品捡回必须严格保持 1 倍")
+
+    -- 4. 拆毁建筑返还掉出的材料（即使 NotifySpawned 未走 ProcessEvent，也靠空间+RowName 事件精准拦截）
+    local mockBld = makeUObject("Building", "BP_ClayFoundation_C_1", {
+        K2_GetActorLocation = function() return { X = 1100, Y = 2100, Z = 300 } end,
+    })
+    bldDropHook.pre({ get = function() return mockBld end }, { get = function() return { RowName = makeFName("Marble") } end })
+    bldDropHook.post()
+    local refundActor = makeSpawnedItemActor({ rowName = "Marble", x = 1120, y = 2110, z = 300 })
+    pHost.InteractableInRange = { ObjectPointer = refundActor }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "Marble", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "Marble"), 1, "拆建返还掉在地上的材料捡回必须严格保持 1 倍")
+
+    -- 5. 地上整堆多件（StackSize=4）、不可堆叠装备（CanStack=false）以及储物箱交互 -> 一律 1 倍
+    local multiStackActor = makeSpawnedItemActor({ rowName = "FoodMint", stackSize = 4 })
+    pHost.InteractableInRange = { ObjectPointer = multiStackActor }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "FoodMint", 4)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "FoodMint"), 4, "地上整堆多件物品必须保持原版 4 个不翻倍")
+
+    local spearActor = makeSpawnedItemActor({ rowName = "SpearPebblet", stackSize = 1, maxStack = 1, canStack = false })
+    pHost.InteractableInRange = { ObjectPointer = spearActor }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "SpearPebblet", 1, 1, false)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "SpearPebblet"), 1, "不可堆叠武器装备严禁翻倍")
+
+    local chestObj = makeUObject("StorageBuilding", "BP_Storage_Big_C_1", {
+        IsA = function(_, path) return path == "/Script/Maine.Building" end,
+    })
+    pHost.InteractableInRange = { ObjectPointer = chestObj }
+    interactHook.pre({ get = function() return pHost end })
+    addToInventory(pHost.InventoryComponent, "AcornShell", 1)
+    interactHook.post({ get = function() return pHost end })
+    assertEq(getInvTotal(pHost.InventoryComponent, "AcornShell"), 1, "从储物箱/建筑容器交互拿取物品严禁翻倍")
+end)
+
+runCase("L15: 多人联机客机 M 地图本地多源扫描（乳牙全队共享 + 全图植被 + 客机可见实体 + 独立追踪）", function()
+    buildWorld({ worldTag = "F_ClientMap", isHost = false })
+    -- 模拟客机端 LODActors 为空（Grounded 原生服务端独占行为）
+    world.lods = {}
+    world.gs.LODActorManagerComponent.LODActors = world.lods
+    -- 模拟游戏原生全队同步的乳牙（普通 + 高级）
+    world.gs.TrackedCollectibles = {
+        { Type = 2, State = 0, bHiddenForThisNewGameLoop = 0, WorldPos = { X = 1100, Y = 2200, Z = 100 } },
+        { Type = 3, State = 0, bHiddenForThisNewGameLoop = 0, WorldPos = { X = -3300, Y = 4400, Z = -200 } },
+    }
+    -- 模拟客机网络相关性范围内已加载的采集点、活体生物、已死尸体(应排除)、CDO(应排除)、散落物、科学点与宝箱
+    local clientAcorn = makeUObject("BP_Acorn_C", "AR_00:PersistentLevel.BP_Acorn_C_1", {
+        K2_GetActorLocation = function() return { X = 2000, Y = 3000, Z = 50 } end,
+        LootComponent = makeUObject("LootComponent", "LC_ClientAcorn", {
+            Items = { { Type = 0, Count = 2, ItemData = { RowName = makeFName("AcornShell") } } },
+        }),
+    })
+    local clientAcornCdo = makeUObject("BP_Acorn_C", "Default__BP_Acorn_C", {
+        K2_GetActorLocation = function() return { X = 10, Y = 10, Z = 10 } end,
+    })
+    local clientSpiderAlive = makeUObject("BP_Spider_Wolf_C", "AR_00:PersistentLevel.BP_Spider_Wolf_C_1", {
+        K2_GetActorLocation = function() return { X = 5000, Y = 6000, Z = 80 } end,
+        HealthComponent = makeUObject("HealthComponent", "HC_Alive", { IsDead = function() return false end }),
+    })
+    local clientSpiderDead = makeUObject("BP_Spider_Wolf_C", "AR_00:PersistentLevel.BP_Spider_Wolf_C_Dead", {
+        K2_GetActorLocation = function() return { X = 5100, Y = 6100, Z = 80 } end,
+        HealthComponent = makeUObject("HealthComponent", "HC_Dead", { IsDead = function() return true end }),
+    })
+    local clientMintItem = makeSpawnedItemActor({ rowName = "FoodMint", x = 7000, y = 8000, z = 40 })
+    local clientSciOrb = makeUObject("ScienceCollectable", "AR_00:PersistentLevel.BP_RawScience_1", {
+        K2_GetActorLocation = function() return { X = 9000, Y = 1000, Z = 200 } end,
+    })
+    local clientChest = makeLootBag({
+        id = "OminentChestClient", bagType = 0, itemCount = 3,
+        fullName = "BP_Ominent_Chest_C_1", x = -4000, y = -5000, z = -100,
+    })
+    clientChest._className = "BP_Ominent_Chest_C"
+
+    world.harvestNodes = { clientAcorn, clientAcornCdo }
+    world.creatures = { clientSpiderAlive, clientSpiderDead }
+    world.spawnedItems = { clientMintItem }
+    world.scienceOrbs = { clientSciOrb }
+    world.loadedBags = { clientChest }
+
+    -- 模拟客机本机独立勾选追踪列表并打开 M 地图
+    local mapPanelMock = makeUObject("MapPanelWidget", "MapPanelClient", {
+        MinBounds = { X = -80000, Y = -80000 },
+        MaxBounds = { X = 80000, Y = 80000 },
+        TextureSize = { X = 2048, Y = 2048 },
+        CollectibleCanvas = makeUObject("CanvasPanel", "CollectibleCanvasClient"),
+        MapBorder = makeUObject("Border", "MapBorderClient"),
+        PlayerCanvas = makeUObject("CanvasPanel", "PlayerCanvasClient", {
+            GetChildrenCount = function() return 0 end,
+        }),
+    })
+    local rootWinMock = makeUObject("InGameMenuWidget", "UI_InGameMenuClient", {
+        Map = makeUObject("UI_Map", "UI_Map_Client", { Active = true, MapPanel = mapPanelMock }),
+    })
+    gameInstanceMock.WidgetManager = makeUObject("WidgetManager", "WM_Client", {
+        GetTopWindow = function() return rootWinMock end,
+        WindowStack = { rootWinMock },
+    })
+
+    writeJsonFile(modDataDir .. "\\config.json", {
+        showMilkMolars = true, showMegaMilkMolars = true,
+        trackedIds = { "node:Acorn", "creature:Spider_Wolf", "item:FoodMint", "special:RawScience", "special:OminentChest" },
+    })
+    stepTick(1.0)
+    stepTick(3.0)
+    stepTick(0.5)
+
+    local cat = readJsonFile(modDataDir .. "\\catalog.json")
+    assertTrue(cat ~= nil and #cat >= 5, "客机本地多源扫描应产出采集点/生物/散落物/科学点/宝箱目录")
+    local catById = {}
+    for _, e in ipairs(cat) do catById[e.id] = e end
+    assertEq(catById["node:Acorn"] and catById["node:Acorn"].count, 1, "客机目录应包含 1 处橡果采集点并排除 CDO")
+    assertEq(catById["creature:Spider_Wolf"] and catById["creature:Spider_Wolf"].count, 1, "客机目录应仅包含存活狼蛛并过滤死尸")
+    assertEq(catById["item:FoodMint"] and catById["item:FoodMint"].count, 1, "客机目录应包含薄荷散落物")
+    assertEq(catById["special:RawScience"] and catById["special:RawScience"].count, 1, "客机目录应包含原始科学点")
+    assertEq(catById["special:OminentChest"] and catById["special:OminentChest"].count, 1, "客机目录应包含非空 Ominent 宝箱")
+
+    local mapLive = readJsonFile(modDataDir .. "\\map_live.json")
+    assertTrue(mapLive ~= nil and mapLive.mapOpen == true and mapLive.pins ~= nil, "客机打开 M 地图应输出实时标点")
+    local pinIds = {}
+    for _, p in ipairs(mapLive.pins) do pinIds[p.id] = (pinIds[p.id] or 0) + 1 end
+    assertEq(pinIds["__molar"], 1, "客机应显示全队共享普通乳牙")
+    assertEq(pinIds["__megamolar"], 1, "客机应显示全队共享高级乳牙")
+    assertEq(pinIds["node:Acorn"], 1, "客机勾选橡果后 M 地图必须显示标点")
+    assertEq(pinIds["creature:Spider_Wolf"], 1, "客机勾选狼蛛后 M 地图必须显示标点")
+    assertEq(pinIds["item:FoodMint"], 1, "客机勾选薄荷后 M 地图必须显示标点")
+    assertEq(pinIds["special:RawScience"], 1, "客机勾选科学点后 M 地图必须显示标点")
+    assertEq(pinIds["special:OminentChest"], 1, "客机勾选宝箱后 M 地图必须显示标点")
+
+    -- 清空客机本机 trackedIds：独立追踪标点立刻消失，但全队共享乳牙保留
+    writeJsonFile(modDataDir .. "\\config.json", {
+        showMilkMolars = true, showMegaMilkMolars = true,
+        trackedIds = {},
+    })
+    stepTick(1.0)
+    stepTick(0.6)
+    local mapLiveCleared = readJsonFile(modDataDir .. "\\map_live.json")
+    local clearedIds = {}
+    for _, p in ipairs(mapLiveCleared.pins) do clearedIds[p.id] = (clearedIds[p.id] or 0) + 1 end
+    assertEq(clearedIds["__molar"], 1, "清空自由追踪后共享普通乳牙仍应显示")
+    assertEq(clearedIds["node:Acorn"], nil, "清空本机 trackedIds 后橡果标点应消失")
+    assertEq(clearedIds["creature:Spider_Wolf"], nil, "清空本机 trackedIds 后狼蛛标点应消失")
+
+    rootWinMock.Map.Active = false
+    stepTick(0.5)
     gameInstanceMock.WidgetManager = nil
 end)
 

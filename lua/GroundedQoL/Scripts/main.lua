@@ -143,8 +143,12 @@ local origMaxDropStackSize = nil
 local lastStackSummary = ""
 
 local origDamageMap = {}   -- key=USurvivalGameModeSettings 地址，保存伤害/免材/死亡行为等原版基准值
-local origLootCounts = {}  -- key=ULootComponent 地址，保存各掉落槽位的原版数量
-local managedLootCount = 0
+local harvestBoostHits = 0 -- 当次进图实时生效的采集入包/搬运倍率计数（彻底替代旧的全图 LootComponent 扫表）
+local spawnLootRestoreStack = {}      -- key=ULootComponent 地址 -> LIFO 原版 Count 恢复栈（仅搬运物瞬时缩放）
+local excludedSpawnedActorAddrs = {}  -- 本局内通过玩家丢弃/投掷/拆建生成的 ASpawnedItem 地址黑名单
+local excludedItemObjAddrs = {}       -- 本局内被玩家丢弃/拆建返还的 UItem 对象地址黑名单
+local recentExcludedDropEvents = {}   -- 近期玩家丢弃/拆建事件的空间兜底缓冲（防 C++ 内部新建 UItem 绕过地址表）
+local inExcludedDropDepth = 0         -- 同步 Hook 深度：>0 时新生成的 ASpawnedItem 自动记入防刷黑名单
 
 -- 引擎单件、高频世界对象与静态数据表句柄缓存（避免每帧/每秒重复 FindFirstOf 扫描 GObjects）
 local cachedGlobalItemData = nil
@@ -552,10 +556,19 @@ local function applyGameModeSettings(isHost, gsIn)
 end
 
 -- ============================================================
--- 6. 功能三：采集与掉落数量倍率（ULootComponent + SpawnLoot Hook + 自然拾取）
+-- 6. 功能三：采集入包倍率与搬运物瞬时缩放（ADR-0005：零模板修改 + 四重防刷拦截）
 -- ============================================================
 
---- 判断掉落组件所属对象是否需要排除（玩家死亡背包、乳牙、宝箱与储物箱，避免异常复制）。
+--- 判断对象名是否属于蓝图 CDO、SCS 组件模板或骨架类（严禁对模板对象写入任何掉落数量）。
+local function isTemplateOrCdoName(fullName)
+    if not fullName or fullName == "" then return false end
+    return fullName:find("Default__", 1, true) ~= nil
+        or fullName:find("_GEN_VARIABLE", 1, true) ~= nil
+        or fullName:find("SKEL_", 1, true) ~= nil
+        or fullName:find("REINST_", 1, true) ~= nil
+end
+
+--- 判断掉落组件所属对象是否需要排除（玩家死亡背包、乳牙、宝箱、储物箱与玩家自身）。
 local function shouldSkipLootOwner(ownerFullName)
     if not ownerFullName or ownerFullName == "" then return false end
     local low = ownerFullName:lower()
@@ -568,112 +581,351 @@ local function shouldSkipLootOwner(ownerFullName)
         or low:find("chest") ~= nil
 end
 
---- 幂等地将单个 ULootComponent 的普通物品掉落数量按倍率放大（支持随时关闭还原原版数量）。
-local function applyLootComponent(lc)
-    if not safeValid(lc) then return false end
-    local ownerName = ""
+--- 判断一个 UObject 的类或名称是否属于储物箱/背包/建筑/工作台等非拾取容器。
+local function isContainerOrBuildingObject(obj)
+    if not safeValid(obj) then return false end
+    local clsName = ""
+    local fullName = ""
+    pcall(function() clsName = obj:GetClass():GetFName():ToString():lower() end)
+    pcall(function() fullName = obj:GetFullName():lower() end)
+    local isBuilding = false
     pcall(function()
-        local outer = lc:GetOuter()
-        if safeValid(outer) then ownerName = outer:GetFullName() end
+        if obj.IsA and (obj:IsA("/Script/Maine.Building") or obj:IsA("/Script/Maine.LootBag")) then
+            isBuilding = true
+        end
     end)
-    if shouldSkipLootOwner(ownerName) then return false end
+    if isBuilding then return true end
+    return clsName:find("lootbag") ~= nil
+        or clsName:find("storage") ~= nil
+        or clsName:find("chest") ~= nil
+        or clsName:find("building") ~= nil
+        or fullName:find("lootbag") ~= nil
+        or fullName:find("backpack") ~= nil
+        or fullName:find("storage") ~= nil
+        or fullName:find("chest") ~= nil
+end
 
-    local addr = lc:GetAddress()
-    local items = nil
-    pcall(function() items = lc.Items end)
-    if not items then return false end
+--- 安全解包 UE4SS 返回的 TScriptInterface<IInteractableInterface> 为实际 UObject。
+local function unwrapInteractable(val)
+    if not val then return nil end
+    if safeValid(val) then return val end
+    local inner = nil
+    pcall(function()
+        if val.ObjectPointer and safeValid(val.ObjectPointer) then
+            inner = val.ObjectPointer
+        elseif val.GetObject then
+            local o = val:GetObject()
+            if safeValid(o) then inner = o end
+        end
+    end)
+    return inner
+end
 
-    local len = 0
-    pcall(function() len = #items end)
-    if len <= 0 then return false end
+--- 判断 FFoliageKey 是否指向一个有效的世界植被实例（ISM）。
+local function hasValidFoliageKey(fk)
+    if not fk then return false end
+    local valid = false
+    pcall(function()
+        local ism = fk.InstancedStaticMeshComponent
+        local idx = fk.MeshIndex
+        if safeValid(ism) and (idx == nil or idx >= 0) then
+            valid = true
+        end
+    end)
+    return valid
+end
 
-    local orig = origLootCounts[addr]
-    if not orig then
-        orig = {}
-        origLootCounts[addr] = orig
+--- 向防刷黑名单登记被玩家丢弃、投掷或拆建返还的 UItem 与空间事件（有界裁剪防内存增长）。
+local function recordExcludedDrop(itemObj, rowNameHint, actorForPos, countHint, radiusOverride)
+    if safeValid(itemObj) then
+        pcall(function()
+            excludedItemObjAddrs[itemObj:GetAddress()] = true
+        end)
+        if (not rowNameHint or rowNameHint == "" or rowNameHint == "None") then
+            pcall(function() rowNameHint = itemObj.ItemDataRowHandle.RowName:ToString() end)
+        end
     end
 
-    local mult = (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) and cfg.harvestMultiplier or 1
-
-    for i = 1, len do
+    local px, py, pz = nil, nil, nil
+    if safeValid(actorForPos) then
         pcall(function()
-            local entry = items[i]
-            -- 仅放大 ELootType::Item (0)，绝不触碰乳牙 Actor / 科学点 / 装备等特殊掉落
-            if entry and entry.Type == 0 then
-                local cur = entry.Count or 0
-                if orig[i] == nil then
-                    orig[i] = cur
-                end
-                local baseCnt = orig[i]
-                if baseCnt and baseCnt > 0 then
-                    local rowName = ""
-                    pcall(function() rowName = entry.ItemData.RowName:ToString() end)
-                    local target = baseCnt
-                    if mult > 1 then
-                        if isHaulingRowName(rowName) then
-                            if cfg.harvestAffectHauling then
-                                -- 搬运物单棵封顶 12 根，防止满地草板触发物理引擎剧烈抖动与掉帧
-                                target = math.min(12, math.max(baseCnt, math.floor(baseCnt * mult + 0.5)))
-                            end
-                        else
-                            target = math.min(999, math.max(baseCnt, math.floor(baseCnt * mult + 0.5)))
-                        end
-                    end
-                    if cur ~= target then
-                        entry.Count = target
-                    end
-                end
-            end
+            local loc = actorForPos:K2_GetActorLocation()
+            if loc then px, py, pz = loc.X or 0, loc.Y or 0, loc.Z or 0 end
         end)
     end
-    return true
+    if px ~= nil then
+        local rn = (rowNameHint and rowNameHint ~= "None") and rowNameHint or ""
+        table.insert(recentExcludedDropEvents, {
+            rowName = rn,
+            x = px, y = py, z = pz,
+            radius = radiusOverride or 450.0,
+            remaining = math.max(1, tonumber(countHint) or 1),
+            clock = os.clock(),
+        })
+        if #recentExcludedDropEvents > 128 then
+            table.remove(recentExcludedDropEvents, 1)
+        end
+    end
 end
 
---- 扫描世界中全部已加载的 ULootComponent 与植被映射掉落表，批量应用采集倍率。
-local function applyAllLootComponents()
-    local cnt = 0
-    local ok, list = pcall(FindAllOf, "LootComponent")
-    if ok and list then
-        for _, lc in ipairs(list) do
-            if applyLootComponent(lc) then
-                cnt = cnt + 1
+--- 检查指定地面物品是否命中近期玩家丢弃/拆建返还的空间事件；命中则扣减配额并返回 true（强制 1 倍）。
+local function consumeMatchingExcludedDropEvent(rowName, itemActor)
+    if #recentExcludedDropEvents == 0 or not safeValid(itemActor) then return false end
+    local loc = nil
+    pcall(function() loc = itemActor:K2_GetActorLocation() end)
+    if not loc then return false end
+    local ix, iy, iz = loc.X or 0, loc.Y or 0, loc.Z or 0
+    local now = os.clock()
+
+    local matchedIdx = nil
+    for i = #recentExcludedDropEvents, 1, -1 do
+        local ev = recentExcludedDropEvents[i]
+        local maxAge = (ev.rowName ~= "") and 180.0 or 15.0
+        if (now - ev.clock) > maxAge or ev.remaining <= 0 then
+            table.remove(recentExcludedDropEvents, i)
+        else
+            local rowOk = (ev.rowName == "" or ev.rowName == rowName)
+            if rowOk then
+                local dx = ix - ev.x
+                local dy = iy - ev.y
+                local dz = iz - ev.z
+                local r = ev.radius or 450.0
+                if (dx * dx + dy * dy + dz * dz) <= (r * r) then
+                    matchedIdx = i
+                    break
+                end
             end
         end
     end
-    -- 同步处理 GameInstance.FoliageMappings 挂载的植被模板掉落组件（草、杂草、蘑菇等）
-    pcall(function()
-        local gi = UEHelpers.GetGameInstance()
-        if safeValid(gi) and gi.FoliageMappings then
-            gi.FoliageMappings:ForEach(function(_, mapParam)
-                pcall(function()
-                    local m = mapParam:get()
-                    if m and safeValid(m.LootComponent) then
-                        if applyLootComponent(m.LootComponent) then
-                            cnt = cnt + 1
-                        end
-                    end
-                end)
-            end)
+
+    if matchedIdx then
+        local ev = recentExcludedDropEvents[matchedIdx]
+        ev.remaining = ev.remaining - 1
+        if ev.remaining <= 0 then
+            table.remove(recentExcludedDropEvents, matchedIdx)
         end
-    end)
-    managedLootCount = cnt
+        return true
+    end
+    return false
 end
 
--- 在 SpawnLoot 触发瞬间确保刚生成的草/矿石/怪物掉落表与当前倍率配置一致（含关闭时还原，彻底替代周期全图扫表）
+--- 仅在 ULootComponent:SpawnLoot 触发瞬间对「肩扛搬运物」（草板/杂草茎）做瞬时缩放，
+-- 并在 Post-Hook 立刻精确还原原版 Count；普通可入包物品严格保持 1 倍落地，绝不污染任何蓝图模板（ADR-0005）。
 pcall(function()
     RegisterHook("/Script/Maine.LootComponent:SpawnLoot", function(selfParam)
         pcall(function()
             local lc = selfParam:get()
             if not safeValid(lc) then return end
-            if (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1)
-                or origLootCounts[lc:GetAddress()] ~= nil then
-                applyLootComponent(lc)
+            if not (cfg.harvestEnabled and cfg.harvestAffectHauling and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
+                return
+            end
+            local lcName = ""
+            pcall(function() lcName = lc:GetFullName() end)
+            if isTemplateOrCdoName(lcName) then return end
+
+            local ownerName = ""
+            pcall(function()
+                local outer = lc:GetOuter()
+                if safeValid(outer) then ownerName = outer:GetFullName() end
+            end)
+            if isTemplateOrCdoName(ownerName) or shouldSkipLootOwner(ownerName) then return end
+
+            local items = nil
+            pcall(function() items = lc.Items end)
+            if not items then return end
+            local len = 0
+            pcall(function() len = #items end)
+            if len <= 0 then return end
+
+            local mult = cfg.harvestMultiplier
+            local saved = nil
+            for i = 1, len do
+                pcall(function()
+                    local entry = items[i]
+                    -- 仅放大 ELootType::Item (0) 且属于肩扛搬运物的条目，其余普通物品保持原版 1 倍爆出
+                    if entry and entry.Type == 0 then
+                        local baseCnt = entry.Count or 0
+                        if baseCnt > 0 then
+                            local rowName = ""
+                            pcall(function() rowName = entry.ItemData.RowName:ToString() end)
+                            if isHaulingRowName(rowName) then
+                                local target = math.min(12, math.max(baseCnt, math.floor(baseCnt * mult + 0.5)))
+                                if target ~= baseCnt then
+                                    if not saved then saved = {} end
+                                    table.insert(saved, { idx = i, orig = baseCnt })
+                                    entry.Count = target
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+
+            if saved then
+                local addr = lc:GetAddress()
+                local stk = spawnLootRestoreStack[addr]
+                if not stk then
+                    stk = {}
+                    spawnLootRestoreStack[addr] = stk
+                end
+                table.insert(stk, saved)
+                harvestBoostHits = harvestBoostHits + 1
+            end
+        end)
+    end, function(selfParam)
+        pcall(function()
+            local lc = selfParam:get()
+            if not safeValid(lc) then return end
+            local addr = lc:GetAddress()
+            local stk = spawnLootRestoreStack[addr]
+            if not stk or #stk == 0 then return end
+            local saved = table.remove(stk)
+            if #stk == 0 then
+                spawnLootRestoreStack[addr] = nil
+            end
+
+            local items = nil
+            pcall(function() items = lc.Items end)
+            if not items then return end
+            for _, rec in ipairs(saved) do
+                pcall(function()
+                    local entry = items[rec.idx]
+                    if entry then
+                        entry.Count = rec.orig
+                    end
+                end)
             end
         end)
     end)
 end)
 
---- 采集玩家当前背包内各物品 RowName 的总堆叠数量快照，用于前后对比计算拾取增量。
+-- 四重防刷拦截钩子：实时登记玩家丢弃、快捷丢弃、投掷以及拆毁建筑/取消蓝图返还的地面物品（始终保持 1 倍）。
+pcall(function()
+    RegisterHook("/Script/Maine.InventoryComponent:ServerDropItem", function(selfParam, itemParam, countParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local inv = selfParam:get()
+            local owner = safeValid(inv) and inv:GetOuter() or nil
+            local it = itemParam and itemParam:get() or nil
+            local cnt = countParam and countParam:get() or 1
+            recordExcludedDrop(it, "", owner, cnt, 400.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHotDrop", function(selfParam, itemParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local player = selfParam:get()
+            local it = itemParam and itemParam:get() or nil
+            recordExcludedDrop(it, "", player, 1, 400.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHandleDrop", function(selfParam, objParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local player = selfParam:get()
+            local obj = objParam and objParam:get() or nil
+            if safeValid(obj) then
+                excludedSpawnedActorAddrs[obj:GetAddress()] = true
+            end
+            recordExcludedDrop(nil, "", player, 1, 400.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerReleaseThrow", function(selfParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local player = selfParam:get()
+            recordExcludedDrop(nil, "", player, 1, 600.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.Building:DropItem", function(selfParam, itemParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local bld = selfParam:get()
+            local it = itemParam and itemParam:get() or nil
+            recordExcludedDrop(it, "", bld, 4, 550.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.Building:DropNewItem", function(selfParam, rowParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local bld = selfParam:get()
+            local rn = ""
+            pcall(function()
+                local h = rowParam and rowParam:get() or nil
+                if h and h.RowName then rn = h.RowName:ToString() end
+            end)
+            recordExcludedDrop(nil, rn, bld, 4, 550.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.Building:BlueprintDropItems", function(selfParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            recordExcludedDrop(nil, "", selfParam:get(), 16, 600.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.Building:CancelBuild", function(selfParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            recordExcludedDrop(nil, "", selfParam:get(), 16, 600.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.SpawnedItem:NotifySpawned", function(selfParam)
+        if inExcludedDropDepth <= 0 then return end
+        pcall(function()
+            local actor = selfParam:get()
+            if safeValid(actor) then
+                excludedSpawnedActorAddrs[actor:GetAddress()] = true
+                local it = nil
+                pcall(function() it = actor:GetItem() end)
+                if safeValid(it) then
+                    excludedItemObjAddrs[it:GetAddress()] = true
+                end
+            end
+        end)
+    end)
+end)
+
+--- 采集玩家当前背包内各物品 RowName 的总堆叠数量快照，用于前后对比计算入包增量。
 local function snapshotInventoryCounts(invComp)
     local counts = {}
     if not safeValid(invComp) then return counts end
@@ -693,37 +945,185 @@ local function snapshotInventoryCounts(invComp)
     return counts
 end
 
--- 地面自然植被与无主刷新物按 E 拾取增量 Hook：
--- 通过对比 ServerHandleInteract 前后的背包增量，仅对自然无主可堆叠资源补发 (mult - 1) 倍额外数量，
--- 避免把玩家自己丢在地上的物品反复拾取刷成无限。
+--- 判定交互对象是否为地面 ASpawnedItem 实例。
+local function isSpawnedItemObject(obj)
+    if not safeValid(obj) then return false end
+    local okA, resA = pcall(function()
+        return obj.IsA and obj:IsA("/Script/Maine.SpawnedItem") == true
+    end)
+    if okA and resA then return true end
+    local cname = ""
+    pcall(function() cname = obj:GetClass():GetFName():ToString() end)
+    return cname == "SpawnedItem" or cname:find("WorldItem", 1, true) ~= nil
+end
+
+--- 判定交互对象是否为已死亡可搜刮的生物尸体（排除玩家角色、背包与建筑容器）。
+local function isDeadCreatureCorpse(obj)
+    if not safeValid(obj) then return false end
+    if isContainerOrBuildingObject(obj) then return false end
+    local isPlayer = false
+    pcall(function()
+        if obj.IsA and obj:IsA("/Script/Maine.SurvivalPlayerCharacter") then isPlayer = true end
+    end)
+    if isPlayer then return false end
+
+    local isCreature = false
+    pcall(function()
+        if obj.IsA and (obj:IsA("/Script/Maine.SurvivalCreature") or obj:IsA("/Script/Maine.SurvivalCharacter")) then
+            isCreature = true
+        end
+    end)
+    if not isCreature then
+        local cname = ""
+        pcall(function() cname = obj:GetClass():GetFName():ToString():lower() end)
+        if cname:find("creature") or cname:find("spider") or cname:find("ant") or cname:find("bug") or cname:find("weevil") or cname:find("aphid") or cname:find("grub") then
+            isCreature = true
+        end
+    end
+    if not isCreature then return false end
+
+    local dead = false
+    pcall(function()
+        local hc = obj.HealthComponent
+        if safeValid(hc) then
+            if (hc.IsDead and hc:IsDead() == true) or (hc.GetHealthState and hc:GetHealthState() == 2) then
+                dead = true
+            end
+        end
+    end)
+    return dead
+end
+
+-- 统一入包倍率 Hook（ADR-0005）：
+--   - 破坏/击杀爆出到地上的普通可堆叠物品（橡果/植物/矿石/糖果/虫材）地上保持 1 倍，按 E 拾取进背包时按倍率放大；
+--   - 按 E 搜刮死虫尸体直入背包时同样按倍率放大（仅乘 1 次）；
+--   - 地面天然散落物（ISM 植被与 PreplacedDesign 预摆自然物）由 harvestAffectPickup 独立控制；
+--   - 严格通过四重防刷拦截排除玩家丢弃物、投掷物、拆建返还物、容器拿取、不可堆叠装备与多件整堆。
 pcall(function()
     RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHandleInteract", function(selfParam)
-        if not (cfg.harvestEnabled and cfg.harvestAffectPickup and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
+        if not (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
             return
         end
         local player = selfParam:get()
         if not safeValid(player) then return end
 
-        local allowBoost = false
+        -- 房主权威校验（客机按 E 也会通过 RPC 在房主端执行此函数，全队统一生效）
+        local hasAuth = true
         pcall(function()
-            local curObj = player.CurrentInteractable
-            if not safeValid(curObj) then
-                -- 植被实例（ISM）交互时 CurrentInteractable 可能为空，允许后续按小增量判定
-                allowBoost = true
-            elseif curObj:IsA("/Script/Maine.SpawnedItem") then
-                -- 仅放行无丢弃者（DroppedBy 为空）且有地图预摆数据的自然刷新单件可堆叠物品
-                local droppedBy = nil
-                pcall(function() droppedBy = curObj:GetDroppedBy() end)
-                local placedRow = ""
-                pcall(function() placedRow = curObj.PlacedItemData.RowName:ToString() end)
-                local itemObj = nil
-                pcall(function() itemObj = curObj:GetItem() end)
-                if not safeValid(droppedBy) and placedRow ~= "" and placedRow ~= "None" and safeValid(itemObj) then
-                    local canStack = false
-                    pcall(function() canStack = itemObj:CanStack() end)
-                    if canStack and (itemObj.StackSize or 1) == 1 then
-                        allowBoost = true
+            if player.HasAuthority then hasAuth = (player:HasAuthority() == true) end
+        end)
+        if not hasAuth then return end
+
+        local allowBoost = false
+        local expectedRow = nil
+        local maxDelta = 1
+
+        pcall(function()
+            -- 读取玩家当前准星对准的真实交互对象（不再误读仅在持续界面交互时才非空的 CurrentInteractable）
+            local targetObj = unwrapInteractable(player.InteractableInRange)
+            if not safeValid(targetObj) then
+                targetObj = unwrapInteractable(player.InteractableInRangeOnClient)
+            end
+            if not safeValid(targetObj) then
+                targetObj = unwrapInteractable(player.TemporarilyDeinstancedInteractableInRange)
+            end
+
+            local isFoliage = hasValidFoliageKey(player.InteractableFoliageKeyInRange)
+                or hasValidFoliageKey(player.InteractableFoliageKeyInRangeOnClient)
+
+            if safeValid(targetObj) then
+                if isContainerOrBuildingObject(targetObj) then
+                    -- 储物箱、掉落背包、工作台与建筑容器一律不走倍率
+                    allowBoost = false
+                elseif isSpawnedItemObject(targetObj) then
+                    local actorAddr = targetObj:GetAddress()
+                    if excludedSpawnedActorAddrs[actorAddr] then
+                        return
                     end
+                    -- 拦截原生丢弃者、投掷物与玩家放置物
+                    local droppedBy = nil
+                    local droppedBySpawned = nil
+                    pcall(function() droppedBy = targetObj:GetDroppedBy() end)
+                    pcall(function() droppedBySpawned = targetObj:GetDroppedBySpawnedActor() end)
+                    if safeValid(droppedBy) or safeValid(droppedBySpawned) then
+                        return
+                    end
+                    local wasThrown = (targetObj.bWasThrown == true or targetObj.bWasThrown == 1
+                        or targetObj.bIsThrown == true or targetObj.bIsThrown == 1)
+                    if wasThrown then
+                        return
+                    end
+
+                    local preplaced = 0
+                    pcall(function() preplaced = targetObj.PreplacedType or 0 end)
+                    if preplaced == 0 then
+                        pcall(function()
+                            if targetObj.GetPreplacedType then preplaced = targetObj:GetPreplacedType() or 0 end
+                        end)
+                    end
+                    if preplaced == 1 then
+                        -- EPreplacedType::PreplacedUser (1)：玩家放置物一律排除
+                        return
+                    end
+
+                    local itemObj = nil
+                    pcall(function() itemObj = targetObj:GetItem() end)
+                    if not safeValid(itemObj) then return end
+                    if excludedItemObjAddrs[itemObj:GetAddress()] then
+                        return
+                    end
+
+                    local canStack = false
+                    local maxStack = 1
+                    pcall(function() canStack = (itemObj:CanStack() == true) end)
+                    pcall(function() maxStack = itemObj:GetMaxStackSize() or 1 end)
+                    if (not canStack) or maxStack <= 1 then
+                        return
+                    end
+                    -- 仅对地上单件物品生效；多件整堆（如玩家整堆丢出或拆建返还堆）强制保持 1 倍
+                    if (itemObj.StackSize or 1) ~= 1 then
+                        return
+                    end
+
+                    local rn = ""
+                    pcall(function() rn = itemObj.ItemDataRowHandle.RowName:ToString() end)
+                    if rn == "" or rn == "None" or isHaulingRowName(rn) then
+                        return
+                    end
+                    if consumeMatchingExcludedDropEvent(rn, targetObj) then
+                        return
+                    end
+
+                    -- 区分「天然预摆自然物」(PreplacedDesign=2 / PreplacedDesignDynamic=3) 与「采集/击杀爆出物」(NotPreplaced=0)
+                    local isNaturalPreplaced = (preplaced == 2 or preplaced == 3)
+                    if isNaturalPreplaced then
+                        if cfg.harvestAffectPickup then
+                            allowBoost = true
+                            expectedRow = rn
+                            maxDelta = 1
+                        end
+                    else
+                        allowBoost = true
+                        expectedRow = rn
+                        maxDelta = 1
+                    end
+                elseif isDeadCreatureCorpse(targetObj) then
+                    -- 按 E 搜刮死虫子尸体直入背包：总开关开启即按倍率入包（仅此一处翻倍，绝不二次叠加）
+                    allowBoost = true
+                    expectedRow = nil
+                    maxDelta = 24
+                elseif isFoliage and cfg.harvestAffectPickup then
+                    -- 部分植被交互的 targetObj 可能是 FoliageDispenser/ISM 组件本身
+                    allowBoost = true
+                    expectedRow = nil
+                    maxDelta = 4
+                end
+            elseif isFoliage then
+                -- 纯 ISM 地面植被直拾（树枝、植物纤维、鹅卵石、小蘑菇、树液等）
+                if cfg.harvestAffectPickup then
+                    allowBoost = true
+                    expectedRow = nil
+                    maxDelta = 4
                 end
             end
         end)
@@ -736,6 +1136,8 @@ pcall(function()
             inv = inv,
             before = snapshotInventoryCounts(inv),
             mult = cfg.harvestMultiplier,
+            expectedRow = expectedRow,
+            maxDelta = maxDelta,
         }
     end, function(selfParam)
         local player = selfParam:get()
@@ -749,34 +1151,42 @@ pcall(function()
         local extraMult = (snap.mult or 1) - 1
         if extraMult <= 0 then return end
 
+        local boostedAny = false
         for rn, newTotal in pairs(after) do
-            local oldTotal = snap.before[rn] or 0
-            local delta = newTotal - oldTotal
-            -- 限制单次增量 <= 3，避免从储物箱或掉落背包整堆拾取时误触倍率放大
-            if delta > 0 and delta <= 3 and not isHaulingRowName(rn) then
-                local addAmount = delta * extraMult
-                pcall(function()
-                    local items = snap.inv.Items
-                    for i = 1, #items do
-                        local it = items[i]
-                        if safeValid(it) and it.ItemDataRowHandle.RowName:ToString() == rn then
-                            local canStack = false
-                            pcall(function() canStack = it:CanStack() end)
-                            if canStack then
-                                local maxS = it:GetMaxStackSize()
-                                local curS = it.StackSize or 1
-                                local room = math.max(0, maxS - curS)
-                                local give = math.min(addAmount, room)
-                                if give > 0 then
-                                    it:AdjustStackSize(give)
-                                    addAmount = addAmount - give
+            if (not snap.expectedRow) or rn == snap.expectedRow then
+                local oldTotal = snap.before[rn] or 0
+                local delta = newTotal - oldTotal
+                if delta > 0 and delta <= (snap.maxDelta or 1) and not isHaulingRowName(rn) then
+                    local addAmount = delta * extraMult
+                    pcall(function()
+                        local items = snap.inv.Items
+                        for i = 1, #items do
+                            local it = items[i]
+                            if safeValid(it) and it.ItemDataRowHandle.RowName:ToString() == rn then
+                                local canStack = false
+                                pcall(function() canStack = (it:CanStack() == true) end)
+                                if canStack then
+                                    local maxS = it:GetMaxStackSize()
+                                    local curS = it.StackSize or 1
+                                    if maxS and maxS > 1 then
+                                        local room = math.max(0, maxS - curS)
+                                        local give = math.min(addAmount, room)
+                                        if give > 0 then
+                                            it:AdjustStackSize(give)
+                                            addAmount = addAmount - give
+                                            boostedAny = true
+                                        end
+                                        if addAmount <= 0 then break end
+                                    end
                                 end
-                                if addAmount <= 0 then break end
                             end
                         end
-                    end
-                end)
+                    end)
+                end
             end
+        end
+        if boostedAny then
+            harvestBoostHits = harvestBoostHits + 1
         end
     end)
 end)
@@ -1823,6 +2233,292 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
         end
     end)
 
+    -- B2. 多人联机客机本地多源兜底扫描（ADR-0004 / Q8）：
+    -- Grounded 的 LODActorManagerComponent.LODActors 为房主独占、客机端为空；
+    -- 当检测到客机（HasAuthority()==false）或 LODActors 未产出任何标点时，直接扫描客机本地已加载/网络同步范围内的
+    -- 真实世界实体与全图原生同步植被（ISM），与房主使用完全一致的 ID 规范（node:/creature:/item:/special:），
+    -- 保持主客机独立追踪互不共享、乳牙全队共享且零联机协议风险。
+    local isHostNow = true
+    pcall(function() isHostNow = (gs:HasAuthority() == true) end)
+    local hasAnyLodBucket = (next(newBuckets) ~= nil)
+    if (not isHostNow) or (not hasAnyLodBucket) then
+        local seenClientActors = {}
+        local function isLiveWorldActor(act)
+            if not safeValid(act) then return false end
+            local addr = act:GetAddress()
+            if seenClientActors[addr] then return false end
+            local fullName = ""
+            pcall(function() fullName = act:GetFullName() end)
+            if isTemplateOrCdoName(fullName) then return false end
+            local bad = false
+            pcall(function()
+                if act.IsActorBeingDestroyed and act:IsActorBeingDestroyed() == true then bad = true end
+                if (not bad) and act.IsHidden and act:IsHidden() == true then bad = true end
+            end)
+            if bad then return false end
+            pcall(function()
+                local hc = act.HealthComponent
+                if safeValid(hc) then
+                    if (hc.IsDead and hc:IsDead() == true) or (hc.GetHealthState and hc:GetHealthState() == 2) then
+                        bad = true
+                    end
+                end
+            end)
+            if bad then return false end
+            seenClientActors[addr] = true
+            return true
+        end
+
+        local function getActorPosSafe(act)
+            local loc = nil
+            pcall(function() loc = act:K2_GetActorLocation() end)
+            if not loc then return nil end
+            local x, y, z = loc.X or 0, loc.Y or 0, loc.Z or 0
+            if x == 0 and y == 0 and z == 0 then return nil end
+            return x, y, z
+        end
+
+        -- 1) 客机可见采集点 / 矿石 / 橡果 / 糖果 / 浆果
+        pcall(function()
+            local nodes = FindAllOf("HarvestNode")
+            if not nodes then return end
+            for _, node in ipairs(nodes) do
+                if isLiveWorldActor(node) then
+                    pcall(function()
+                        local x, y, z = getActorPosSafe(node)
+                        if not x then return end
+                        local actorClsShort = cleanClassName(node:GetClass():GetFName():ToString())
+                        if actorClsShort == "" then return end
+                        local lowCls = actorClsShort:lower()
+                        if lowCls:find("milk_nugget_party") then
+                            addCollectibleEntry(3, 0, x, y, z)
+                            return
+                        elseif lowCls:find("milk_nugget_personal") then
+                            addCollectibleEntry(2, 0, x, y, z)
+                            return
+                        end
+
+                        local zh = nodeClassToZhName[actorClsShort]
+                        local dropRows = nodeClassToDropRows[actorClsShort]
+                        if not zh then
+                            pcall(function()
+                                local d = locStringToZh(node.DisplayName)
+                                if d ~= "" then zh = d end
+                            end)
+                            pcall(function()
+                                local lc = node.LootComponent
+                                if safeValid(lc) and lc.Items then
+                                    dropRows = {}
+                                    for k = 1, #lc.Items do
+                                        local it = lc.Items[k]
+                                        if it and it.Type == 0 then
+                                            local drn = it.ItemData.RowName:ToString()
+                                            if drn and drn ~= "None" then
+                                                table.insert(dropRows, drn)
+                                            end
+                                        end
+                                    end
+                                    nodeClassToDropRows[actorClsShort] = dropRows
+                                end
+                            end)
+                            if (not zh or zh == "") and dropRows and #dropRows > 0 then
+                                local dzh = itemRowToZhName[dropRows[1]]
+                                if dzh and dzh ~= "" then zh = dzh .. " (采集点)" end
+                            end
+                            if not zh or zh == "" then
+                                zh = fallbackNodeZh(actorClsShort)
+                            end
+                            nodeClassToZhName[actorClsShort] = zh
+                        end
+                        local primaryRow = (dropRows and dropRows[1]) or ""
+                        local isSurv = (primaryRow ~= "" and surveyableRows[primaryRow] == true)
+                        pushPin("node:" .. actorClsShort, zh, actorClsShort, "node", x, y, z, isSurv, primaryRow)
+                        if dropRows then
+                            for _, drn in ipairs(dropRows) do
+                                local dzh = itemRowToZhName[drn] or drn
+                                pushPin("item:" .. drn, dzh, drn, "item", x, y, z, surveyableRows[drn] == true, drn)
+                            end
+                        end
+                    end)
+                end
+            end
+        end)
+
+        -- 2) 客机可见生物 / 昆虫（存活）
+        pcall(function()
+            local creatures = FindAllOf("SurvivalCreature")
+            if not creatures then return end
+            for _, cr in ipairs(creatures) do
+                if isLiveWorldActor(cr) then
+                    pcall(function()
+                        local x, y, z = getActorPosSafe(cr)
+                        if not x then return end
+                        local actorClsShort = cleanClassName(cr:GetClass():GetFName():ToString())
+                        if actorClsShort == "" then actorClsShort = "Creature" end
+                        local zh = creatureClassToZhName[actorClsShort]
+                        if not zh then
+                            pcall(function()
+                                if cr.GetCharacterTypeName then
+                                    local s = locStringToZh(cr:GetCharacterTypeName())
+                                    if s ~= "" then zh = s end
+                                end
+                            end)
+                            if not zh or zh == "" then
+                                local nk = normalizeKey(actorClsShort)
+                                if charTableByHint[nk] then
+                                    zh = charTableByHint[nk]
+                                else
+                                    for k, v in pairs(charTableByHint) do
+                                        if nk == k or nk:find(k, 1, true) then
+                                            zh = v .. " (" .. actorClsShort .. ")"
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                            if not zh or zh == "" then zh = actorClsShort end
+                            creatureClassToZhName[actorClsShort] = zh
+                        end
+                        pushPin("creature:" .. actorClsShort, zh, actorClsShort, "creature", x, y, z, false, "")
+                    end)
+                end
+            end
+        end)
+
+        -- 3) 客机可见散落世界物品（排除拿在手里的装备）
+        pcall(function()
+            local spawned = FindAllOf("SpawnedItem")
+            if not spawned then return end
+            for _, si in ipairs(spawned) do
+                if isLiveWorldActor(si) then
+                    pcall(function()
+                        if safeValid(si.EquippedOwner) then return end
+                        local x, y, z = getActorPosSafe(si)
+                        if not x then return end
+                        local itemObj = nil
+                        pcall(function() itemObj = si:GetItem() end)
+                        if not safeValid(itemObj) then return end
+                        local stackCnt = 1
+                        pcall(function() stackCnt = itemObj.StackSize or 1 end)
+                        if stackCnt <= 0 then return end
+                        local rn = ""
+                        pcall(function() rn = itemObj.ItemDataRowHandle.RowName:ToString() end)
+                        if rn ~= "" and rn ~= "None" then
+                            local zh = itemRowToZhName[rn]
+                            if not zh or zh == "" then
+                                pcall(function() zh = itemObj:GetDisplayName():ToString() end)
+                            end
+                            if not zh or zh == "" then zh = rn end
+                            pushPin("item:" .. rn, zh, rn, "item", x, y, z, surveyableRows[rn] == true, rn)
+                        end
+                    end)
+                end
+            end
+        end)
+
+        -- 4) 客机可见原始科学点
+        pcall(function()
+            local scis = FindAllOf("ScienceCollectable")
+            if not scis then return end
+            for _, sc in ipairs(scis) do
+                if isLiveWorldActor(sc) then
+                    pcall(function()
+                        local x, y, z = getActorPosSafe(sc)
+                        if x then
+                            pushPin("special:RawScience", "原始科学点 (Raw Science)", "RawScience", "special", x, y, z, false, "")
+                        end
+                    end)
+                end
+            end
+        end)
+
+        -- 5) 客机可见非空 Ominent 宝箱 / 补给箱
+        pcall(function()
+            local bags = FindAllOf("LootBag")
+            if not bags then return end
+            for _, bag in ipairs(bags) do
+                if isLiveWorldActor(bag) then
+                    pcall(function()
+                        local actorClsShort = cleanClassName(bag:GetClass():GetFName():ToString())
+                        local lowCls = actorClsShort:lower()
+                        if not (lowCls:find("ominent_chest") or lowCls:find("treasure")) then return end
+                        local inv = bag.InventoryComponent
+                        if safeValid(inv) and inv.Items and #inv.Items == 0 then return end
+                        local x, y, z = getActorPosSafe(bag)
+                        if x then
+                            pushPin("special:OminentChest", "Ominent 宝箱 / 补给箱", actorClsShort, "special", x, y, z, false, "")
+                        end
+                    end)
+                end
+            end
+        end)
+
+        -- 6) 客机全图植被资源目录充实（只读查询，绝不修改 FoliageMappings；让全图植被在目录中显示真实可用状态）
+        pcall(function()
+            local gi = UEHelpers.GetGameInstance()
+            if not safeValid(gi) then return end
+            if not cachedWorldIsms then
+                cachedWorldIsms = FindAllOf("InstancedStaticMeshComponent") or {}
+            end
+            local meshAliveCounts = {}
+            for _, ism in ipairs(cachedWorldIsms) do
+                if safeValid(ism) and ism.StaticMesh and safeValid(ism.StaticMesh) then
+                    local vis = true
+                    pcall(function() vis = ism:IsVisible() end)
+                    if vis then
+                        local ic = 0
+                        pcall(function() ic = ism:GetInstanceCount() end)
+                        if ic > 0 then
+                            local ma = ism.StaticMesh:GetAddress()
+                            meshAliveCounts[ma] = (meshAliveCounts[ma] or 0) + ic
+                        end
+                    end
+                end
+            end
+            if next(meshAliveCounts) ~= nil and safeValid(cachedAllItemsTable) and gi.GetFoliageMeshesFromItemHandle then
+                for rn, _ in pairs(surveyableRows) do
+                    if not noFoliageRows[rn] then
+                        pcall(function()
+                            local meshes = gi:GetFoliageMeshesFromItemHandle({ DataTable = cachedAllItemsTable, RowName = FName(rn) }, false)
+                            if meshes and #meshes > 0 then
+                                local totalInst = 0
+                                for k = 1, #meshes do
+                                    local m = meshes[k]
+                                    if safeValid(m) then
+                                        totalInst = totalInst + (meshAliveCounts[m:GetAddress()] or 0)
+                                    end
+                                end
+                                if totalInst > 0 then
+                                    local itemId = "item:" .. rn
+                                    local zh = itemRowToZhName[rn] or rn
+                                    local approxDisplay = math.min(240, totalInst)
+                                    if not metaById[itemId] then
+                                        metaById[itemId] = {
+                                            id = itemId,
+                                            name = zh,
+                                            rawName = rn,
+                                            category = "item",
+                                            count = approxDisplay,
+                                            surveyable = true,
+                                            rowName = rn,
+                                        }
+                                    elseif metaById[itemId].count < approxDisplay then
+                                        metaById[itemId].count = approxDisplay
+                                        if metaById[itemId].category == "survey" then
+                                            metaById[itemId].category = "item"
+                                        end
+                                    end
+                                end
+                            else
+                                noFoliageRows[rn] = true
+                            end
+                        end)
+                    end
+                end
+            end
+        end)
+    end
+
     -- 记录本存档已知的全部词条：即使某生物/资源暂时被全部清光（count=0 等待重生），
     -- 仍保留在菜单列表中供取消勾选，且重生后会立刻自动恢复标点与数量。
     for id, m in pairs(metaById) do
@@ -2393,7 +3089,7 @@ local function writeRuntimeStatus(inWorld, isHost, diffName, liveP, liveE, liveK
         totalMilkMolars = molarStats.totMilk,
         totalMegaMolars = molarStats.totMega,
         catalogCount = #catalogList,
-        lootCompCount = managedLootCount,
+        lootCompCount = harvestBoostHits,
         stackSummary = lastStackSummary,
         surveyedItemName = lastSurveyedName,
         lastMessage = lastStatusMessage,
@@ -2493,7 +3189,7 @@ local function onGameThreadTick()
             -- 缓存句柄轻心跳维持 USurvivalGameModeSettings 原地覆写（兼顾 ADR-0001 与零 GObjects 扫描）
             local liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost, gs)
 
-            -- 进图 2.5 秒后执行一次性初始扫描；正常游玩期彻底停用 10s 全图 LOD 扫表与 2.5s LootComponent 全扫（见 ADR-0004）
+            -- 进图 2.5 秒后执行一次性初始扫描；彻底停用任何全图 LootComponent 扫表与周期全图 LOD 扫表（见 ADR-0004 / ADR-0005）
             local harvestKey = getHarvestConfigKey()
             if (not worldInitialScanDone) and (now - worldEnterClock >= 2.5) then
                 worldInitialScanDone = true
@@ -2501,17 +3197,15 @@ local function onGameThreadTick()
                 lastHarvestConfigKey = harvestKey
                 applyStackSizeMultiplier()
                 liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost, gs)
-                applyAllLootComponents()
                 refreshWorldCatalogAndPins(true, false)
                 lastStatusMessage = "已就绪！按 M 查看乳牙与追踪资源，按 Insert/F8 调节参数"
             elseif worldInitialScanDone and (harvestKey ~= lastHarvestConfigKey) then
                 lastHarvestConfigKey = harvestKey
-                applyAllLootComponents()
             end
 
             writeRuntimeStatus(true, isHost, diffName, liveP, liveE, liveKeepInv, liveNoDurPenalty)
         else
-            -- 退出存档返回主菜单时彻底清空旧世界对象地址缓存，避免悬空地址复用
+            -- 退出存档返回主菜单时彻底清空旧世界对象地址与防刷黑名单缓存，避免悬空地址复用
             if catalogBuiltForWorld ~= nil or cachedPawnAddr ~= nil then
                 catalogBuiltForWorld = nil
                 worldInitialScanDone = false
@@ -2529,7 +3223,13 @@ local function onGameThreadTick()
                 knownCatalogMeta = {}
                 cachedWorldIsms = nil
                 origDamageMap = {}
-                origLootCounts = {}
+                harvestBoostHits = 0
+                spawnLootRestoreStack = {}
+                excludedSpawnedActorAddrs = {}
+                excludedItemObjAddrs = {}
+                recentExcludedDropEvents = {}
+                inExcludedDropDepth = 0
+                interactSnapshot = {}
                 if lastMapOpen then
                     lastMapOpen = false
                     lastMapLiveJson = ""
@@ -2564,4 +3264,4 @@ LoopAsync(100, function()
     return false
 end)
 
-logInfo("GroundedQoL v1.3 初始化完成（混合中文输入法 + 零光标闪烁 + 空闲零开销直通与按需扫描）！按 Insert 或 F8 打开中文菜单。")
+logInfo("GroundedQoL v1.4 初始化完成（采集入包倍率零模板污染 + 客机独立地图追踪 + 菜单期光标零闪烁 + 顶层自绘中文候选条）！按 Insert 或 F8 打开中文菜单。")

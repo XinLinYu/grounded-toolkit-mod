@@ -24,6 +24,7 @@
 #include <dxgi1_4.h>
 #include <imm.h>
 #include <msctf.h>
+#include <windowsx.h>
 #include <MinHook.h>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -63,12 +64,20 @@ using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, con
 using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using TFGetThreadMgrFn = HRESULT(WINAPI*)(ITfThreadMgr**);
+using SetCursorFn = HCURSOR(WINAPI*)(HCURSOR);
+using ShowCursorFn = int(WINAPI*)(BOOL);
+using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
+using SetCursorPosFn = BOOL(WINAPI*)(int, int);
 
 // MinHook 保存的原函数蹦床指针与原窗口过程
 PresentFn g_origPresent = nullptr;
 Present1Fn g_origPresent1 = nullptr;
 ResizeBuffersFn g_origResizeBuffers = nullptr;
 ExecuteCommandListsFn g_origExecuteCommandLists = nullptr;
+SetCursorFn g_origSetCursor = nullptr;
+ShowCursorFn g_origShowCursor = nullptr;
+ClipCursorFn g_origClipCursor = nullptr;
+SetCursorPosFn g_origSetCursorPos = nullptr;
 WNDPROC g_origWndProc = nullptr;
 
 std::mutex g_logMutex;
@@ -78,6 +87,8 @@ std::mutex g_srvAllocMutex;
 // 时 Windows 会同步重入 HookedWndProc（如 WM_CAPTURECHANGED），非递归 mutex 会在同线程重入时抛 std::system_error 闪退。
 std::recursive_mutex g_imguiInputMutex;
 std::mutex g_imeStateMutex;
+std::mutex g_imeHitMutex;
+std::mutex g_clipRectMutex;
 
 // 全局运行期状态（涉及渲染线程与消息线程共享的标志使用 atomic）
 GraphicsApi g_activeApi = GraphicsApi::None;
@@ -98,18 +109,30 @@ std::atomic<bool> g_isExclusiveFullscreen{false};
 std::atomic<int> g_desiredImGuiCursor{ImGuiMouseCursor_Arrow};
 // 防止 DXGI Present1 内部调用 Present 或第三方叠加层转发导致同一帧重复渲染 ImGui
 thread_local bool t_inPresent = false;
+// 标记当前线程正由本插件主动调用 Win32 光标 API，避免自递归拦截
+thread_local bool t_inOverlayCursorCall = false;
 
 // 性能与测试观测指标
 std::atomic<bool> g_lastFrameIdle{false};
 std::atomic<unsigned long long> g_idleFrameCount{0};
 std::atomic<unsigned long long> g_renderedFrameCount{0};
 std::atomic<int> g_imeCharsCommitted{0};
+std::atomic<bool> g_selfDrawnImeRenderedLastFrame{false};
+std::atomic<int> g_lastClickedImeCandidateForTest{-1};
 
-// ==================== 光标接管状态（严格仅在窗口主线程读写） ====================
+// ==================== 光标接管状态（ADR-0004：菜单期 Win32 光标 API 条件拦截，关闭期零干扰直通） ====================
+std::atomic<bool> g_cursorApiInterceptEnabled{false};
+std::atomic<HCURSOR> g_lastUe4RequestedCursor{nullptr};
 bool g_cursorOverrideActive = false;
 int g_showCursorAdded = 0;
 bool g_hasSavedClipRect = false;
 RECT g_savedClipRect{};
+
+// ==================== 自绘候选条零抢焦命中区（渲染线程每帧更新，窗口线程只读命中） ====================
+bool g_imeHitVisible = false;
+ImeCandidateHitRect g_imeBarBounds{};
+std::vector<ImeCandidateHitRect> g_imeItemRects;
+bool g_swallowNextImeCandMouseUp = false;
 
 // ==================== IME / TSF 状态 ====================
 // 渲染线程写入的期望状态 -> 通过 PostMessageW(WM_GQOL_SYNC_IME) 通知窗口主线程执行
@@ -212,6 +235,78 @@ LPCWSTR ImGuiCursorToWin32(int imguiCursor) {
     }
 }
 
+/// RAII 守卫：标记本线程正由悬浮层主动调用底层 Win32 光标 API，防止进入自拦截分支。
+struct ScopedOverlayCursorCall {
+    bool prev;
+    ScopedOverlayCursorCall() : prev(t_inOverlayCursorCall) { t_inOverlayCursorCall = true; }
+    ~ScopedOverlayCursorCall() { t_inOverlayCursorCall = prev; }
+};
+
+inline HCURSOR CallOrigSetCursor(HCURSOR hCur) {
+    ScopedOverlayCursorCall guard;
+    return g_origSetCursor ? g_origSetCursor(hCur) : ::SetCursor(hCur);
+}
+
+inline int CallOrigShowCursor(BOOL bShow) {
+    ScopedOverlayCursorCall guard;
+    return g_origShowCursor ? g_origShowCursor(bShow) : ::ShowCursor(bShow);
+}
+
+inline BOOL CallOrigClipCursor(const RECT* lpRect) {
+    ScopedOverlayCursorCall guard;
+    return g_origClipCursor ? g_origClipCursor(lpRect) : ::ClipCursor(lpRect);
+}
+
+/// 判定当前是否应当拦截游戏本体（UE4 FSlateApplication::Tick / FWindowsCursor）发出的 Win32 光标 API 调用。
+/// 菜单关闭时仅做 1 次 relaxed atomic 读取即放行原 API，保证正常游玩期间绝对零干扰（ADR-0004）。
+inline bool ShouldInterceptGameCursorApi() {
+    return !t_inOverlayCursorCall &&
+           !g_shuttingDown.load(std::memory_order_relaxed) &&
+           g_menuOpen.load(std::memory_order_relaxed) &&
+           g_cursorApiInterceptEnabled.load(std::memory_order_relaxed);
+}
+
+HCURSOR WINAPI HookedSetCursor(HCURSOR hCursor) {
+    if (!ShouldInterceptGameCursorApi()) {
+        return g_origSetCursor(hCursor);
+    }
+    g_lastUe4RequestedCursor.store(hCursor, std::memory_order_relaxed);
+    HCURSOR want = ::LoadCursorW(nullptr, ImGuiCursorToWin32(g_desiredImGuiCursor.load(std::memory_order_relaxed)));
+    CallOrigSetCursor(want);
+    return hCursor;
+}
+
+int WINAPI HookedShowCursor(BOOL bShow) {
+    if (!ShouldInterceptGameCursorApi()) {
+        return g_origShowCursor(bShow);
+    }
+    // UE4 FWindowsCursor::Show 内部采用 while(::ShowCursor(FALSE) >= 0){} 与 while(::ShowCursor(TRUE) < 0){} 循环，
+    // 必须直接返回对应终止计数（FALSE->-1, TRUE->0），既防止死循环又绝不真正递减 OS 显示计数导致光标消失。
+    return bShow ? 0 : -1;
+}
+
+BOOL WINAPI HookedClipCursor(const RECT* lpRect) {
+    if (!ShouldInterceptGameCursorApi()) {
+        return g_origClipCursor(lpRect);
+    }
+    std::lock_guard<std::mutex> lk(g_clipRectMutex);
+    if (lpRect) {
+        g_savedClipRect = *lpRect;
+        g_hasSavedClipRect = true;
+    } else {
+        g_hasSavedClipRect = false;
+    }
+    return TRUE;
+}
+
+BOOL WINAPI HookedSetCursorPos(int X, int Y) {
+    if (!ShouldInterceptGameCursorApi()) {
+        return g_origSetCursorPos(X, Y);
+    }
+    // 菜单打开期间阻止 UE4 第一人称视角把鼠标拉回屏幕中心
+    return TRUE;
+}
+
 /// 在窗口主线程安全更新 Win32 IME 组词窗与候选窗锚点坐标（紧贴 ImGui 输入框正下方）。
 void UpdateImeWindowPosOnWindowThread(HWND hWnd) {
     if (!hWnd) return;
@@ -279,7 +374,10 @@ void ReadImmCompositionOnWindowThread(HWND hWnd, LPARAM lParam) {
         std::lock_guard<std::mutex> lk(g_imeStateMutex);
         g_imeState.compositionUtf8 = std::move(compUtf8);
         g_imeState.cursorByteOffset = cursorByte;
-        if (g_imeState.compositionUtf8.empty() && g_imeState.candidates.empty() && lParam == 0) {
+        if (!g_imeState.compositionUtf8.empty()) {
+            g_imeState.composing = true;
+            g_imeComposing.store(true);
+        } else if (g_imeState.candidates.empty() && lParam == 0) {
             g_imeState.composing = false;
             g_imeComposing.store(false);
         }
@@ -319,20 +417,27 @@ void ReadImmCandidateListOnWindowThread(HWND hWnd) {
                 selInPage = static_cast<int>(list->dwSelection - pageStart);
             }
 
-            std::lock_guard<std::mutex> lk(g_imeStateMutex);
-            g_imeState.candidates = std::move(items);
-            g_imeState.selectedIndex = selInPage;
-            g_imeState.pageStart = static_cast<int>(pageStart);
-            g_imeState.totalCandidates = static_cast<int>(count);
+            if (!items.empty()) {
+                std::lock_guard<std::mutex> lk(g_imeStateMutex);
+                g_imeState.composing = true;
+                g_imeComposing.store(true);
+                g_imeState.candidates = std::move(items);
+                g_imeState.selectedIndex = selInPage;
+                g_imeState.pageStart = static_cast<int>(pageStart);
+                g_imeState.totalCandidates = static_cast<int>(count);
+                g_imeState.candidateSource = 1; // IMM32
+            }
         }
     }
 
     ::ImmReleaseContext(hWnd, himc);
 }
 
-/// 轻量 COM TSF UIElementSink：在内置自绘模式下接管现代 Win10/11 微软拼音候选列表并隐藏系统浮窗。
+/// 轻量 COM TSF UIElementSink：在内置自绘模式下接管现代 Win10/11 微软拼音候选列表与拼音读音，并隐藏系统浮窗。
 class TsfUiElementSink final : public ITfUIElementSink {
 public:
+    DWORD GetActiveCandidateId() const { return m_activeCandId; }
+
     STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override {
         if (!ppvObj) return E_INVALIDARG;
         *ppvObj = nullptr;
@@ -384,6 +489,13 @@ public:
             g_imeState.selectedIndex = 0;
             g_imeState.pageStart = 0;
             g_imeState.totalCandidates = 0;
+            if (g_imeState.compositionUtf8.empty()) {
+                g_imeState.composing = false;
+                g_imeComposing.store(false);
+            }
+        }
+        if (dwUIElementId == m_activeReadingId) {
+            m_activeReadingId = 0;
         }
         return S_OK;
     }
@@ -394,6 +506,7 @@ private:
         ITfUIElement* elem = nullptr;
         if (FAILED(g_tsfUiElemMgr->GetUIElement(dwUIElementId, &elem)) || !elem) return;
 
+        // 1. 采集现代 TSF 候选列表（含分页缺失时的智能 9 项分页兜底）
         ITfCandidateListUIElement* cand = nullptr;
         if (SUCCEEDED(elem->QueryInterface(IID_ITfCandidateListUIElement, reinterpret_cast<void**>(&cand))) && cand) {
             m_activeCandId = dwUIElementId;
@@ -414,6 +527,9 @@ private:
                     pageStart = pageIndices[curPage];
                     pageEnd = (curPage + 1 < pageCount) ? pageIndices[curPage + 1] : total;
                 }
+            } else if (total > 0) {
+                pageStart = (selection / 9) * 9;
+                pageEnd = std::min<UINT>(total, pageStart + 9);
             }
             if (pageEnd > pageStart + 10) pageEnd = pageStart + 10;
 
@@ -435,6 +551,11 @@ private:
 
             {
                 std::lock_guard<std::mutex> lk(g_imeStateMutex);
+                if (!items.empty()) {
+                    g_imeState.composing = true;
+                    g_imeComposing.store(true);
+                    g_imeState.candidateSource = 2; // TSF
+                }
                 g_imeState.candidates = std::move(items);
                 g_imeState.selectedIndex = selInPage;
                 g_imeState.pageStart = static_cast<int>(pageStart);
@@ -442,11 +563,31 @@ private:
             }
             cand->Release();
         }
+
+        // 2. 补充采集 TSF 拼音读音串（部分 Win11 现代 TSF 输入法不通过 IMM GCS_COMPSTR 同步读音）
+        ITfReadingInformationUIElement* reading = nullptr;
+        if (SUCCEEDED(elem->QueryInterface(IID_ITfReadingInformationUIElement, reinterpret_cast<void**>(&reading))) && reading) {
+            m_activeReadingId = dwUIElementId;
+            BSTR bstr = nullptr;
+            if (SUCCEEDED(reading->GetString(&bstr)) && bstr) {
+                std::string rUtf8 = WideToUtf8(bstr, static_cast<int>(::SysStringLen(bstr)));
+                ::SysFreeString(bstr);
+                if (!rUtf8.empty()) {
+                    std::lock_guard<std::mutex> lk(g_imeStateMutex);
+                    g_imeState.composing = true;
+                    g_imeComposing.store(true);
+                    g_imeState.compositionUtf8 = std::move(rUtf8);
+                    g_imeState.cursorByteOffset = static_cast<int>(g_imeState.compositionUtf8.size());
+                }
+            }
+            reading->Release();
+        }
         elem->Release();
     }
 
     LONG m_refCount = 1;
     DWORD m_activeCandId = 0;
+    DWORD m_activeReadingId = 0;
 };
 
 /// 在窗口主线程懒挂载 TSF ITfUIElementSink（若当前线程已存在 TSF ThreadMgr，则接入候选字监听）。
@@ -642,17 +783,103 @@ void SyncImeOnWindowThread(HWND hWnd) {
     g_imeState.inputLineHeight = g_imeWantLineH.load(std::memory_order_relaxed);
 }
 
+/// 在窗口主线程通过 TSF（优先）或 IMM32 提交指定页内索引的候选字，全程不抢走输入框焦点。
+void SelectImeCandidateOnWindowThread(HWND hWnd, int pageIdx) {
+    if (pageIdx < 0) return;
+    g_lastClickedImeCandidateForTest.store(pageIdx, std::memory_order_relaxed);
+    if (!g_imeAttachedOnWndThread) return;
+
+    int absIdx = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_imeStateMutex);
+        absIdx = g_imeState.pageStart + pageIdx;
+    }
+
+    // 1. 优先尝试现代 TSF ITfCandidateListUIElementBehavior（Win10/11 微软拼音原生选词上屏）
+    bool handledByTsf = false;
+    if (g_tsfUiElemMgr && g_tsfSink && g_tsfSink->GetActiveCandidateId() != 0) {
+        ITfUIElement* elem = nullptr;
+        if (SUCCEEDED(g_tsfUiElemMgr->GetUIElement(g_tsfSink->GetActiveCandidateId(), &elem)) && elem) {
+            ITfCandidateListUIElementBehavior* beh = nullptr;
+            if (SUCCEEDED(elem->QueryInterface(IID_ITfCandidateListUIElementBehavior,
+                                               reinterpret_cast<void**>(&beh))) && beh) {
+                if (SUCCEEDED(beh->SetSelection(static_cast<UINT>(absIdx)))) {
+                    beh->Finalize();
+                    handledByTsf = true;
+                }
+                beh->Release();
+            }
+            elem->Release();
+        }
+    }
+
+    // 2. 兜底使用 IMM32 选词通知（兼容搜狗/微信/传统 IMM 输入法）
+    if (!handledByTsf && hWnd) {
+        if (HIMC himc = ::ImmGetContext(hWnd)) {
+            ::ImmNotifyIME(himc, NI_SELECTCANDIDATESTR, 0, static_cast<DWORD>(absIdx));
+            ::ImmReleaseContext(hWnd, himc);
+        }
+    }
+}
+
+/// 测试当前鼠标客户区点击是否落在顶层前景自绘候选条或其某枚候选字上（不把点击透传给 ImGui，防止输入框失焦）。
+bool HitTestImeCandidateBarOnWindowThread(HWND hWnd, LPARAM lParam, int& outItemIndex, bool& outInsideBar) {
+    outItemIndex = -1;
+    outInsideBar = false;
+    if (!hWnd || !ComputeUseSelfDrawnIme()) return false;
+
+    float mx = static_cast<float>(GET_X_LPARAM(lParam));
+    float my = static_cast<float>(GET_Y_LPARAM(lParam));
+
+    // 将客户区坐标对齐到 ImGui DisplaySize（兼容高 DPI / 窗口缩放）
+    RECT rc{};
+    if (g_imguiInitialized && ::GetClientRect(hWnd, &rc)) {
+        const float cw = static_cast<float>(rc.right - rc.left);
+        const float ch = static_cast<float>(rc.bottom - rc.top);
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        if (cw > 1.0f && ch > 1.0f && disp.x > 1.0f && disp.y > 1.0f) {
+            mx = (mx / cw) * disp.x;
+            my = (my / ch) * disp.y;
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(g_imeHitMutex);
+    if (!g_imeHitVisible) return false;
+
+    for (size_t i = 0; i < g_imeItemRects.size(); ++i) {
+        const auto& r = g_imeItemRects[i];
+        if (mx >= r.x0 && mx <= r.x1 && my >= r.y0 && my <= r.y1) {
+            outItemIndex = static_cast<int>(i);
+            outInsideBar = true;
+            return true;
+        }
+    }
+    if (mx >= g_imeBarBounds.x0 && mx <= g_imeBarBounds.x1 &&
+        my >= g_imeBarBounds.y0 && my <= g_imeBarBounds.y1) {
+        outInsideBar = true;
+        return true;
+    }
+    return false;
+}
+
 /// 在窗口主线程接管单一系统原生光标与解除鼠标区域锁定（打开 Mod 菜单或 Alt+Tab 切回时调用）。
 void AcquireCursorOverrideOnWindowThread(HWND hWnd) {
-    if (!hWnd || g_cursorOverrideActive) return;
+    if (!hWnd) return;
+    g_cursorApiInterceptEnabled.store(true, std::memory_order_release);
 
-    // 1. 记录并临时解除 UE4 可能施加的 ClipCursor 窗口锁定（见 Q8）
+    if (g_cursorOverrideActive) {
+        CallOrigSetCursor(::LoadCursorW(nullptr, ImGuiCursorToWin32(g_desiredImGuiCursor.load(std::memory_order_relaxed))));
+        return;
+    }
+
+    // 1. 记录并临时解除 UE4 可能施加的 ClipCursor 窗口锁定（见 Q8 / ADR-0004）
     RECT curClip{};
     if (::GetClipCursor(&curClip)) {
         const int vLeft = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
         const int vTop = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
         const int vRight = vLeft + ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
         const int vBottom = vTop + ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        std::lock_guard<std::mutex> lk(g_clipRectMutex);
         if (curClip.left > vLeft || curClip.top > vTop || curClip.right < vRight || curClip.bottom < vBottom) {
             g_savedClipRect = curClip;
             g_hasSavedClipRect = true;
@@ -660,27 +887,28 @@ void AcquireCursorOverrideOnWindowThread(HWND hWnd) {
             g_hasSavedClipRect = false;
         }
     }
-    ::ClipCursor(nullptr);
+    CallOrigClipCursor(nullptr);
 
-    // 2. 平衡 ShowCursor 引用计数（通常 UE4 仅用 SetCursor(NULL)，此处作为计数 <0 时的安全兜底）
+    // 2. 平衡 ShowCursor 引用计数（通过原 API 精确拉升到 >=0，同时 HookedShowCursor 阻止 UE4 再减回去）
     g_showCursorAdded = 0;
-    int cnt = ::ShowCursor(TRUE);
+    int cnt = CallOrigShowCursor(TRUE);
     if (cnt > 0) {
-        ::ShowCursor(FALSE);
+        CallOrigShowCursor(FALSE);
     } else {
         g_showCursorAdded = 1;
         while (cnt < 0 && g_showCursorAdded < 16) {
-            cnt = ::ShowCursor(TRUE);
+            cnt = CallOrigShowCursor(TRUE);
             g_showCursorAdded++;
         }
     }
 
     g_cursorOverrideActive = true;
-    ::SetCursor(::LoadCursorW(nullptr, ImGuiCursorToWin32(g_desiredImGuiCursor.load(std::memory_order_relaxed))));
+    CallOrigSetCursor(::LoadCursorW(nullptr, ImGuiCursorToWin32(g_desiredImGuiCursor.load(std::memory_order_relaxed))));
 }
 
 /// 在窗口主线程精确归还系统光标、鼠标锁定范围与输入捕获给 UE4（关闭菜单或 Alt+Tab 切出时调用）。
 void ReleaseCursorOverrideOnWindowThread(HWND hWnd, bool notifyOrigCursor) {
+    g_cursorApiInterceptEnabled.store(false, std::memory_order_release);
     if (!hWnd) return;
     if (::GetCapture() == hWnd) {
         ::ReleaseCapture();
@@ -688,12 +916,15 @@ void ReleaseCursorOverrideOnWindowThread(HWND hWnd, bool notifyOrigCursor) {
 
     if (g_cursorOverrideActive) {
         while (g_showCursorAdded > 0) {
-            ::ShowCursor(FALSE);
+            CallOrigShowCursor(FALSE);
             g_showCursorAdded--;
         }
-        if (g_hasSavedClipRect) {
-            ::ClipCursor(&g_savedClipRect);
-            g_hasSavedClipRect = false;
+        {
+            std::lock_guard<std::mutex> lk(g_clipRectMutex);
+            if (g_hasSavedClipRect) {
+                CallOrigClipCursor(&g_savedClipRect);
+                g_hasSavedClipRect = false;
+            }
         }
         g_cursorOverrideActive = false;
     }
@@ -723,9 +954,13 @@ void ApplyMenuOpenTransition(bool next, const char* source) {
 
     OverlayLog("Menu toggled -> %s (via %s)", next ? "OPEN" : "CLOSED", source);
     if (next) {
+        // 立刻开启菜单期 Win32 光标 API 拦截，杜绝首次打开瞬间在消息到达前被 UE4 Tick 抢先隐藏光标
+        g_cursorApiInterceptEnabled.store(true, std::memory_order_release);
         MaybeTriggerMenuSoftRefresh();
     } else {
+        g_cursorApiInterceptEnabled.store(false, std::memory_order_release);
         g_imeWantVisible.store(false, std::memory_order_relaxed);
+        UpdateImeCandidateHitRects(false, {}, {});
         if (g_imguiInitialized) {
             std::lock_guard<std::recursive_mutex> lk(g_imguiInputMutex);
             ImGui::GetIO().ClearInputKeys();
@@ -914,7 +1149,11 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         return 0;
     }
     if (msg == WM_GQOL_SYNC_CURSOR) {
-        if (wParam != 0 && g_menuOpen.load()) {
+        if (wParam == 2) {
+            if (g_menuOpen.load() && g_cursorOverrideActive) {
+                CallOrigSetCursor(::LoadCursorW(nullptr, ImGuiCursorToWin32(g_desiredImGuiCursor.load(std::memory_order_relaxed))));
+            }
+        } else if (wParam != 0 && g_menuOpen.load()) {
             AcquireCursorOverrideOnWindowThread(hWnd);
         } else {
             ReleaseCursorOverrideOnWindowThread(hWnd, true);
@@ -922,17 +1161,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         return 0;
     }
     if (msg == WM_GQOL_SELECT_CANDIDATE) {
-        if (g_imeAttachedOnWndThread) {
-            int absIdx = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_imeStateMutex);
-                absIdx = g_imeState.pageStart + static_cast<int>(wParam);
-            }
-            if (HIMC himc = ::ImmGetContext(hWnd)) {
-                ::ImmNotifyIME(himc, NI_SELECTCANDIDATESTR, 0, static_cast<DWORD>(absIdx));
-                ::ImmReleaseContext(hWnd, himc);
-            }
-        }
+        SelectImeCandidateOnWindowThread(hWnd, static_cast<int>(wParam));
         return 0;
     }
 
@@ -1037,8 +1266,15 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             UpdateImeWindowPosOnWindowThread(hWnd);
             return useSelfDrawn ? 0 : DefWindowProcW(hWnd, msg, wParam, lParam);
         case WM_IME_COMPOSITION:
+            if ((lParam & GCS_COMPSTR) != 0) {
+                g_imeComposing.store(true);
+            }
             UpdateImeWindowPosOnWindowThread(hWnd);
             ReadImmCompositionOnWindowThread(hWnd, lParam);
+            if (lParam == 0 || (lParam & (GCS_COMPSTR | GCS_CURSORPOS)) != 0) {
+                // 部分输入法在 WM_IME_COMPOSITION 期间刷新候选列表但不单独发送 IMN_CHANGECANDIDATE
+                ReadImmCandidateListOnWindowThread(hWnd);
+            }
             if (useSelfDrawn) {
                 if ((lParam & GCS_RESULTSTR) != 0) {
                     if (HIMC himc = ::ImmGetContext(hWnd)) {
@@ -1111,7 +1347,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     // 6. 菜单打开状态下托管单一系统原生光标（仅客户区，不调用 ImGui 自己的 SetCursor）
     if (msg == WM_SETCURSOR) {
         if (LOWORD(lParam) == HTCLIENT) {
-            ::SetCursor(::LoadCursorW(nullptr, ImGuiCursorToWin32(g_desiredImGuiCursor.load(std::memory_order_relaxed))));
+            CallOrigSetCursor(::LoadCursorW(nullptr, ImGuiCursorToWin32(g_desiredImGuiCursor.load(std::memory_order_relaxed))));
             return TRUE;
         }
         return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -1120,6 +1356,22 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     // 7. 输入法处理中的虚拟键（VK_PROCESSKEY）交给 DefWindowProcW 保障 IME 正常消费
     if ((msg == WM_KEYDOWN || msg == WM_KEYUP) && wParam == VK_PROCESSKEY) {
         return DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+
+    // 7.5 顶层前景自绘候选条零抢焦鼠标点选（命中候选条区域直接消费，绝不传给 ImGui 以免输入框失焦取消组词）
+    if (msg == WM_LBUTTONDOWN) {
+        int hitCandIdx = -1;
+        bool insideBar = false;
+        if (HitTestImeCandidateBarOnWindowThread(hWnd, lParam, hitCandIdx, insideBar) && insideBar) {
+            g_swallowNextImeCandMouseUp = true;
+            if (hitCandIdx >= 0) {
+                SelectImeCandidateOnWindowThread(hWnd, hitCandIdx);
+            }
+            return 0;
+        }
+    } else if (msg == WM_LBUTTONUP && g_swallowNextImeCandMouseUp) {
+        g_swallowNextImeCandMouseUp = false;
+        return 0;
     }
 
     // 8. 菜单打开期间将键鼠消息线程安全地送入 ImGui，并拦截防止穿透到游戏本体
@@ -1427,6 +1679,7 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
     // 菜单关闭 + M 地图关闭 + 开场横幅消失 -> 完全跳过 DX12 Fence/Barrier/ExecuteCommandLists 与 ImGui 帧构建
     if (!menuOpen && !mapOpen && !bannerVisible) {
         ResetOverlayIdleState();
+        UpdateImeCandidateHitRects(false, {}, {});
         g_lastFrameIdle.store(true, std::memory_order_relaxed);
         g_idleFrameCount.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -1469,7 +1722,13 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
         if (menuOpen != g_menuOpen.load(std::memory_order_relaxed)) {
             ApplyMenuOpenTransition(menuOpen, "UI:CloseButton");
         }
-        g_desiredImGuiCursor.store(static_cast<int>(ImGui::GetMouseCursor()), std::memory_order_relaxed);
+        {
+            const int nextCur = static_cast<int>(ImGui::GetMouseCursor());
+            const int prevCur = g_desiredImGuiCursor.exchange(nextCur, std::memory_order_relaxed);
+            if (menuOpen && prevCur != nextCur && g_gameHwnd) {
+                ::PostMessageW(g_gameHwnd, WM_GQOL_SYNC_CURSOR, 2, 0);
+            }
+        }
 
         ImGui::Render();
 
@@ -1521,7 +1780,13 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
         if (menuOpen != g_menuOpen.load(std::memory_order_relaxed)) {
             ApplyMenuOpenTransition(menuOpen, "UI:CloseButton");
         }
-        g_desiredImGuiCursor.store(static_cast<int>(ImGui::GetMouseCursor()), std::memory_order_relaxed);
+        {
+            const int nextCur = static_cast<int>(ImGui::GetMouseCursor());
+            const int prevCur = g_desiredImGuiCursor.exchange(nextCur, std::memory_order_relaxed);
+            if (menuOpen && prevCur != nextCur && g_gameHwnd) {
+                ::PostMessageW(g_gameHwnd, WM_GQOL_SYNC_CURSOR, 2, 0);
+            }
+        }
 
         ImGui::Render();
         if (g_d3d11Rtv) {
@@ -1773,6 +2038,30 @@ bool InstallGraphicsHook() {
     OverlayLog("MH_CreateHook(ResizeBuffers) -> %d", static_cast<int>(st));
     if (st != MH_OK) return false;
 
+    // 挂接 USER32 光标 API（ADR-0004）：菜单关闭时单分支零开销直通，菜单打开时阻止 UE4 每帧隐藏/闪烁/锁框
+    if (HMODULE user32 = ::GetModuleHandleW(L"user32.dll")) {
+        if (void* pSetCur = reinterpret_cast<void*>(::GetProcAddress(user32, "SetCursor"))) {
+            MH_STATUS cs = MH_CreateHook(pSetCur, reinterpret_cast<void*>(&HookedSetCursor),
+                                         reinterpret_cast<void**>(&g_origSetCursor));
+            OverlayLog("MH_CreateHook(user32!SetCursor) -> %d", static_cast<int>(cs));
+        }
+        if (void* pShowCur = reinterpret_cast<void*>(::GetProcAddress(user32, "ShowCursor"))) {
+            MH_STATUS cs = MH_CreateHook(pShowCur, reinterpret_cast<void*>(&HookedShowCursor),
+                                         reinterpret_cast<void**>(&g_origShowCursor));
+            OverlayLog("MH_CreateHook(user32!ShowCursor) -> %d", static_cast<int>(cs));
+        }
+        if (void* pClipCur = reinterpret_cast<void*>(::GetProcAddress(user32, "ClipCursor"))) {
+            MH_STATUS cs = MH_CreateHook(pClipCur, reinterpret_cast<void*>(&HookedClipCursor),
+                                         reinterpret_cast<void**>(&g_origClipCursor));
+            OverlayLog("MH_CreateHook(user32!ClipCursor) -> %d", static_cast<int>(cs));
+        }
+        if (void* pSetPos = reinterpret_cast<void*>(::GetProcAddress(user32, "SetCursorPos"))) {
+            MH_STATUS cs = MH_CreateHook(pSetPos, reinterpret_cast<void*>(&HookedSetCursorPos),
+                                         reinterpret_cast<void**>(&g_origSetCursorPos));
+            OverlayLog("MH_CreateHook(user32!SetCursorPos) -> %d", static_cast<int>(cs));
+        }
+    }
+
     st = MH_EnableHook(MH_ALL_HOOKS);
     OverlayLog("MH_EnableHook(ALL) -> %d", static_cast<int>(st));
     return st == MH_OK;
@@ -1851,6 +2140,15 @@ ImeCandidateState GetImeCandidateState() {
     ImeCandidateState snap = g_imeState;
     snap.useSelfDrawnUi = ComputeUseSelfDrawnIme();
     snap.isExclusiveFullscreen = g_isExclusiveFullscreen.load(std::memory_order_relaxed);
+    // 实时合并渲染线程最新输入框光标锚点，杜绝首帧快速输入时短暂锚定到屏幕左上角 (0, 0)
+    const float wx = g_imeWantPosX.load(std::memory_order_relaxed);
+    const float wy = g_imeWantPosY.load(std::memory_order_relaxed);
+    const float wlh = g_imeWantLineH.load(std::memory_order_relaxed);
+    if (wx > 0.5f || wy > 0.5f) {
+        snap.inputPosX = wx;
+        snap.inputPosY = wy;
+        snap.inputLineHeight = (wlh > 1.0f) ? wlh : 20.0f;
+    }
     return snap;
 }
 
@@ -1858,6 +2156,31 @@ void SelectImeCandidateByPageIndex(int pageIdx) {
     if (g_gameHwnd && pageIdx >= 0) {
         ::PostMessageW(g_gameHwnd, WM_GQOL_SELECT_CANDIDATE, static_cast<WPARAM>(pageIdx), 0);
     }
+}
+
+void NotifyImeModeChanged() {
+    if (g_gameHwnd) {
+        ::PostMessageW(g_gameHwnd, WM_GQOL_SYNC_IME, 0, 0);
+    }
+}
+
+void UpdateImeCandidateHitRects(bool visible,
+                                const ImeCandidateHitRect& barBounds,
+                                const std::vector<ImeCandidateHitRect>& itemRects) {
+    g_selfDrawnImeRenderedLastFrame.store(visible, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_imeHitMutex);
+    g_imeHitVisible = visible;
+    if (visible) {
+        g_imeBarBounds = barBounds;
+        g_imeItemRects = itemRects;
+    } else {
+        g_imeBarBounds = {};
+        g_imeItemRects.clear();
+    }
+}
+
+bool WasSelfDrawnImeBarRenderedLastFrame() {
+    return g_selfDrawnImeRenderedLastFrame.load(std::memory_order_relaxed);
 }
 
 bool WasLastFrameIdlePassThrough() {
@@ -1886,6 +2209,31 @@ void ForceWantTextInputForTest(bool want, float x, float y) {
     if (g_gameHwnd) {
         ::PostMessageW(g_gameHwnd, WM_GQOL_SYNC_IME, 0, 0);
     }
+}
+
+void ForceInjectImeCandidatesForTest(const char* compositionUtf8, const char* const* candidates, int count) {
+    std::lock_guard<std::mutex> lk(g_imeStateMutex);
+    const bool hasContent = (compositionUtf8 && compositionUtf8[0] != '\0') || (candidates && count > 0);
+    g_imeState.composing = hasContent;
+    g_imeComposing.store(hasContent);
+    g_imeState.compositionUtf8 = compositionUtf8 ? compositionUtf8 : "";
+    g_imeState.cursorByteOffset = static_cast<int>(g_imeState.compositionUtf8.size());
+    g_imeState.candidates.clear();
+    if (candidates && count > 0) {
+        for (int i = 0; i < count; ++i) {
+            if (candidates[i]) g_imeState.candidates.emplace_back(candidates[i]);
+        }
+        g_imeState.candidateSource = 2;
+    } else {
+        g_imeState.candidateSource = 0;
+    }
+    g_imeState.selectedIndex = 0;
+    g_imeState.pageStart = 0;
+    g_imeState.totalCandidates = static_cast<int>(g_imeState.candidates.size());
+}
+
+int GetLastClickedImeCandidateForTest() {
+    return g_lastClickedImeCandidateForTest.load(std::memory_order_relaxed);
 }
 
 } // namespace gqol

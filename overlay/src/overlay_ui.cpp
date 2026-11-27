@@ -680,84 +680,142 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
     }
 }
 
-/// 渲染内置自绘输入法候选条（仅在独占全屏自动降级或手动选择内置自绘、且处于组词/候选展示时显示，见 Q7）。
+/// 渲染内置自绘输入法候选条（ADR-0003）：
+/// 直接绘制在 ImGui::GetForegroundDrawList() 最顶层前景，彻底杜绝因点击 Mod 主菜单导致普通窗口被压在背后看不见的 Z 轴遮挡，
+/// 并向 WndProc 上报每枚候选按钮矩形实现零抢焦鼠标点选上屏（绝不令 InputText 失焦取消组词）。
 void RenderImeCandidateBar(float uiScale) {
     const ImeCandidateState ime = GetImeCandidateState();
-    if (!ime.useSelfDrawnUi) return;
-    if (!ime.composing && ime.compositionUtf8.empty() && ime.candidates.empty()) return;
-
-    const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    const float estHeight = (!ime.candidates.empty() ? 66.0f : 36.0f) * uiScale;
-    float posX = std::clamp(ime.inputPosX, 8.0f * uiScale, std::max(8.0f * uiScale, disp.x - 360.0f * uiScale));
-    float posY = ime.inputPosY + ime.inputLineHeight + 6.0f * uiScale;
-    if (posY + estHeight > disp.y - 8.0f * uiScale) {
-        // 靠近屏幕底边时自动翻到输入框上方防裁切
-        posY = std::max(8.0f * uiScale, ime.inputPosY - estHeight - 6.0f * uiScale);
+    if (!ime.useSelfDrawnUi || (!ime.composing && ime.compositionUtf8.empty() && ime.candidates.empty())) {
+        UpdateImeCandidateHitRects(false, {}, {});
+        return;
     }
 
-    ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.96f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * uiScale, 7.0f * uiScale));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f * uiScale);
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.32f, 0.78f, 0.98f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.14f, 0.97f));
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 disp = io.DisplaySize;
+    if (disp.x < 100.0f || disp.y < 100.0f) {
+        UpdateImeCandidateHitRects(false, {}, {});
+        return;
+    }
 
-    ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoFocusOnAppearing |
-        ImGuiWindowFlags_NoNav;
+    const float padX = 11.0f * uiScale;
+    const float padY = 8.0f * uiScale;
+    const float fontH = ImGui::GetFontSize();
+    const float chipPadX = 7.0f * uiScale;
+    const float chipPadY = 3.0f * uiScale;
+    const float chipGap = 6.0f * uiScale;
+    const float sepGap = 6.0f * uiScale;
 
-    if (ImGui::Begin("##GQOL_ImeCandidateBar", nullptr, flags)) {
-        // 上行：当前拼音组词串 + 插入点标记 + Esc 取消提示
-        if (!ime.compositionUtf8.empty()) {
-            const size_t split = std::min(static_cast<size_t>(std::max(0, ime.cursorByteOffset)), ime.compositionUtf8.size());
-            std::string displayComp = ime.compositionUtf8.substr(0, split) + "|" + ime.compositionUtf8.substr(split);
-            ImGui::TextColored(ImVec4(0.45f, 0.90f, 1.0f, 1.0f), "%s", displayComp.c_str());
-        } else {
-            ImGui::TextColored(ImVec4(0.45f, 0.90f, 1.0f, 1.0f), "中文组词中...");
+    std::string displayComp;
+    if (!ime.compositionUtf8.empty()) {
+        const size_t split = std::min(static_cast<size_t>(std::max(0, ime.cursorByteOffset)), ime.compositionUtf8.size());
+        displayComp = ime.compositionUtf8.substr(0, split) + "|" + ime.compositionUtf8.substr(split);
+    } else {
+        displayComp = "中文组词中...";
+    }
+    const char* hintText = "空格/1~9/点选 | Esc取消";
+
+    const ImVec2 compSz = ImGui::CalcTextSize(displayComp.c_str());
+    const ImVec2 hintSz = ImGui::CalcTextSize(hintText);
+    const float row1W = compSz.x + 16.0f * uiScale + hintSz.x;
+    const float row1H = std::max(compSz.y, hintSz.y);
+
+    std::vector<std::string> chipLabels;
+    std::vector<float> chipWidths;
+    float row2W = 0.0f;
+    float row2H = 0.0f;
+    std::string pageInfo;
+    if (!ime.candidates.empty()) {
+        chipLabels.reserve(ime.candidates.size());
+        chipWidths.reserve(ime.candidates.size());
+        for (size_t i = 0; i < ime.candidates.size(); ++i) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "%d.%s", static_cast<int>(i + 1), ime.candidates[i].c_str());
+            chipLabels.emplace_back(buf);
+            const float w = ImGui::CalcTextSize(buf).x + chipPadX * 2.0f;
+            chipWidths.push_back(w);
+            if (i > 0) row2W += chipGap;
+            row2W += w;
         }
-        ImGui::SameLine(0.0f, 14.0f * uiScale);
-        ImGui::TextDisabled("空格/1~9选词 | Esc取消");
+        if (ime.totalCandidates > static_cast<int>(ime.candidates.size())) {
+            char pbuf[48];
+            std::snprintf(pbuf, sizeof(pbuf), "(%d/%d)", ime.pageStart + ime.selectedIndex + 1, ime.totalCandidates);
+            pageInfo = pbuf;
+            row2W += 10.0f * uiScale + ImGui::CalcTextSize(pbuf).x;
+        }
+        row2H = fontH + chipPadY * 2.0f;
+    }
 
-        // 下行：横向编号候选字（高亮当前选中项，支持鼠标直接点选上屏）
-        if (!ime.candidates.empty()) {
-            ImGui::Separator();
-            for (size_t i = 0; i < ime.candidates.size(); ++i) {
-                if (i > 0) ImGui::SameLine(0.0f, 6.0f * uiScale);
-                const bool isSel = (static_cast<int>(i) == ime.selectedIndex);
-                char btnLabel[160];
-                std::snprintf(btnLabel, sizeof(btnLabel), "%d.%s##imecand%zu",
-                              static_cast<int>(i + 1), ime.candidates[i].c_str(), i);
-                if (isSel) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.48f, 0.68f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.58f, 0.80f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.96f, 0.72f, 1.0f));
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.16f, 0.22f, 0.90f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.30f, 0.42f, 0.95f));
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.95f, 0.98f, 1.0f));
-                }
-                if (ImGui::SmallButton(btnLabel)) {
-                    SelectImeCandidateByPageIndex(static_cast<int>(i));
-                }
-                ImGui::PopStyleColor(3);
+    const float barW = std::max(row1W, row2W) + padX * 2.0f;
+    const float barH = padY * 2.0f + row1H + (ime.candidates.empty() ? 0.0f : (sepGap * 2.0f + 1.0f + row2H));
+
+    // 当尚未收到有效输入框光标坐标时，默认锚定在屏幕上中偏上可见位置，避免躲到角落
+    float anchorX = (ime.inputPosX > 1.0f || ime.inputPosY > 1.0f) ? ime.inputPosX : (disp.x * 0.5f - barW * 0.5f);
+    float anchorY = (ime.inputPosX > 1.0f || ime.inputPosY > 1.0f) ? ime.inputPosY : (disp.y * 0.35f);
+    float lineH = (ime.inputLineHeight > 1.0f) ? ime.inputLineHeight : (20.0f * uiScale);
+
+    float posX = std::clamp(anchorX, 8.0f * uiScale, std::max(8.0f * uiScale, disp.x - barW - 8.0f * uiScale));
+    float posY = anchorY + lineH + 6.0f * uiScale;
+    if (posY + barH > disp.y - 8.0f * uiScale) {
+        // 靠近屏幕底边时自动上翻到输入框上方防裁切
+        posY = std::max(8.0f * uiScale, anchorY - barH - 6.0f * uiScale);
+    }
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImVec2 bMin(posX, posY);
+    const ImVec2 bMax(posX + barW, posY + barH);
+    const float round = 6.0f * uiScale;
+
+    // 柔和阴影 + 顶层高亮边框背景卡片
+    dl->AddRectFilled(ImVec2(bMin.x + 2.0f * uiScale, bMin.y + 3.0f * uiScale),
+                      ImVec2(bMax.x + 2.0f * uiScale, bMax.y + 3.0f * uiScale),
+                      IM_COL32(0, 0, 0, 145), round);
+    dl->AddRectFilled(bMin, bMax, IM_COL32(14, 21, 32, 248), round);
+    dl->AddRect(bMin, bMax, IM_COL32(82, 200, 250, 238), round, 0, 1.5f * uiScale);
+
+    // 上行：当前拼音组词串 + 快捷键提示
+    const float yRow1 = posY + padY;
+    dl->AddText(ImVec2(posX + padX, yRow1), IM_COL32(115, 230, 255, 255), displayComp.c_str());
+    dl->AddText(ImVec2(posX + padX + compSz.x + 16.0f * uiScale, yRow1), IM_COL32(150, 168, 186, 225), hintText);
+
+    // 下行：横向编号候选字按钮（支持悬停高亮 + WndProc 零抢焦点击上屏）
+    std::vector<ImeCandidateHitRect> hitRects;
+    if (!chipLabels.empty()) {
+        const float ySep = yRow1 + row1H + sepGap;
+        dl->AddLine(ImVec2(posX + padX, ySep), ImVec2(bMax.x - padX, ySep), IM_COL32(72, 130, 165, 135), 1.0f);
+
+        const float yRow2 = ySep + sepGap + 1.0f;
+        float curX = posX + padX;
+        const ImVec2 mouse = io.MousePos;
+        hitRects.reserve(chipLabels.size());
+
+        for (size_t i = 0; i < chipLabels.size(); ++i) {
+            const float w = chipWidths[i];
+            const ImVec2 cMin(curX, yRow2);
+            const ImVec2 cMax(curX + w, yRow2 + row2H);
+            const bool isSel = (static_cast<int>(i) == ime.selectedIndex);
+            const bool isHov = (mouse.x >= cMin.x && mouse.x <= cMax.x && mouse.y >= cMin.y && mouse.y <= cMax.y);
+
+            ImU32 fillCol = IM_COL32(30, 41, 56, 230);
+            ImU32 textCol = IM_COL32(235, 243, 250, 255);
+            if (isSel) {
+                fillCol = isHov ? IM_COL32(56, 148, 204, 255) : IM_COL32(41, 122, 173, 255);
+                textCol = IM_COL32(255, 245, 184, 255);
+            } else if (isHov) {
+                fillCol = IM_COL32(46, 76, 108, 245);
+                textCol = IM_COL32(255, 255, 255, 255);
             }
-            if (ime.totalCandidates > static_cast<int>(ime.candidates.size())) {
-                ImGui::SameLine(0.0f, 10.0f * uiScale);
-                ImGui::TextDisabled("(%d/%d)",
-                                    ime.pageStart + ime.selectedIndex + 1,
-                                    ime.totalCandidates);
-            }
+            dl->AddRectFilled(cMin, cMax, fillCol, 4.0f * uiScale);
+            dl->AddText(ImVec2(cMin.x + chipPadX, cMin.y + chipPadY), textCol, chipLabels[i].c_str());
+
+            hitRects.push_back({cMin.x, cMin.y, cMax.x, cMax.y});
+            curX += w + chipGap;
+        }
+        if (!pageInfo.empty()) {
+            dl->AddText(ImVec2(curX + 4.0f * uiScale, yRow2 + chipPadY), IM_COL32(150, 168, 186, 225), pageInfo.c_str());
         }
     }
-    ImGui::End();
 
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(2);
+    UpdateImeCandidateHitRects(true, {bMin.x, bMin.y, bMax.x, bMax.y}, hitRects);
 }
 
 /// 渲染游戏内 Mod 主配置菜单。
@@ -860,9 +918,9 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
             ImGui::Separator();
             ImGui::Spacing();
 
-            // 3. 采集数量倍率
-            ImGui::TextColored(ImVec4(0.55f, 0.96f, 0.55f, 1.0f), "3. 采集与掉落数量倍率（房主设置全队生效）");
-            if (ImGui::Checkbox("启用采集数量倍率##harv", &cfg.harvestEnabled)) cfgDirty = true;
+            // 3. 采集入包与搬运倍率（ADR-0005：普通物品 1 倍爆出、入包统一乘倍率；仅搬运物砍倒瞬时缩放）
+            ImGui::TextColored(ImVec4(0.55f, 0.96f, 0.55f, 1.0f), "3. 采集入包与搬运数量倍率（房主设置全队生效，地上仅爆 1 倍防卡顿）");
+            if (ImGui::Checkbox("启用采集入包倍率（砍/锤/挖/杀爆出保持 1 倍，拾取入包与摸尸走倍率）##harv", &cfg.harvestEnabled)) cfgDirty = true;
             ImGui::BeginDisabled(!cfg.harvestEnabled);
             if (ImGui::SliderInt("采集倍率 (x)##harvMult", &cfg.harvestMultiplier, 1, 20, "%d 倍")) cfgDirty = true;
             ImGui::SameLine();
@@ -876,14 +934,14 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
                 ImGui::SameLine();
             }
             ImGui::NewLine();
-            if (ImGui::Checkbox("同时对草板/杂草茎等搬运物生效（单棵上限 12 根防物理卡顿）", &cfg.harvestAffectHauling)) {
+            if (ImGui::Checkbox("同时对草板/杂草茎等肩扛搬运物生效（砍倒瞬间缩放并还原，单棵封顶 12 根）", &cfg.harvestAffectHauling)) {
                 cfgDirty = true;
             }
-            if (ImGui::Checkbox("同时对地面直接按 E 拾取的自然资源生效（树枝/植物纤维/鹅卵石等）", &cfg.harvestAffectPickup)) {
+            if (ImGui::Checkbox("同时对地面天然散落物直拾生效（树枝/植物纤维/鹅卵石/小蘑菇等）", &cfg.harvestAffectPickup)) {
                 cfgDirty = true;
             }
             ImGui::EndDisabled();
-            ImGui::TextDisabled("已接管世界掉落组件数量: %d（自动排除玩家死亡背包与乳牙，避免异常复制）",
+            ImGui::TextDisabled("零模板污染架构：严格排除玩家丢弃物、投掷物、拆建返还物、容器转移与单件装备 | 本次已生效: %d 次",
                                 status.lootCompCount);
 
             ImGui::Spacing();
@@ -995,8 +1053,12 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
             }
 
             ImGui::Separator();
+            if (status.inWorld && !status.isHost) {
+                ImGui::TextColored(ImVec4(0.45f, 0.90f, 1.0f, 1.0f),
+                                   "客机独立追踪模式：乳牙/SCA.B 与全图植被已同步，采集点/生物/宝箱自动追踪客机周边已加载范围（主客机勾选互不共享）。");
+            }
             ImGui::TextColored(ImVec4(0.55f, 0.96f, 0.55f, 1.0f),
-                               "自由追踪全游戏物品 / 道具 / 资源 / 采集点 / 生物（可多选，共 %d 项）",
+                               "自由追踪全游戏物品 / 道具 / 资源 / 采集点 / 生物（仅本机可见、可多选，共 %d 项）",
                                static_cast<int>(catalog.size()));
 
             static char searchBuf[128] = "";
@@ -1114,24 +1176,29 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
             const char* imeModes[] = {
                 "自动（推荐：无边框走系统原生，独占全屏切内置自绘）",
                 "强制使用系统原生候选框",
-                "强制使用内置自绘候选条（原生窗被遮挡时可选）",
+                "强制使用内置自绘候选条（顶层防遮挡，支持键鼠双选词）",
             };
             int imeMode = std::clamp(cfg.imeCandidateMode, 0, 2);
-            ImGui::SetNextItemWidth(420.0f * uiScale);
+            ImGui::SetNextItemWidth(440.0f * uiScale);
             if (ImGui::Combo("输入法候选框模式##imemode", &imeMode, imeModes, IM_ARRAYSIZE(imeModes))) {
                 cfg.imeCandidateMode = imeMode;
                 cfgDirty = true;
             }
             const ImeCandidateState imeInfo = GetImeCandidateState();
-            ImGui::TextDisabled("当前检测：%s | 实际候选框方式：%s（仅点击输入框时按需唤醒，不干扰跑图按键）",
+            const char* candSrcText = (imeInfo.candidateSource == 2) ? "TSF" :
+                                      ((imeInfo.candidateSource == 1) ? "IMM32" : "待组词");
+            ImGui::TextDisabled("当前检测：%s | 实际方式：%s | 候选源：%s（切换立即生效）",
                                 imeInfo.isExclusiveFullscreen ? "独占全屏模式" : "无边框/窗口模式",
-                                imeInfo.useSelfDrawnUi ? "ImGui 内置自绘候选条" : "Windows 系统原生候选框");
+                                imeInfo.useSelfDrawnUi ? "ImGui 顶层自绘候选条" : "Windows 系统原生候选框",
+                                candSrcText);
 
             ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.40f, 1.0f), "多人联机（房主模式）注意事项：");
-            ImGui::BulletText("玩家伤害倍率、怪物伤害倍率、采集数量倍率、原版路标与原版热区扫描：仅房主安装即可全队生效。");
+            ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.40f, 1.0f), "多人联机（房主 / 客机）说明：");
+            ImGui::BulletText("玩家伤害倍率、怪物伤害倍率、采集入包与搬运倍率、原版路标与原版热区扫描：仅房主安装即可全队生效。");
+            ImGui::BulletText("M 地图自由勾选追踪：主机与客机各自独立保存、互不共享（客机可独立追踪全图植被与周边同步范围内的采集点/生物/宝箱）；乳牙与高级乳牙全队共享同步。");
+            ImGui::BulletText("列表右侧的 [原版热区(全队)] 与悬停按 G/Ctrl+左键 放置的原版路标调用游戏原版联机机制，会对全队生效。");
             ImGui::BulletText("死亡背包保留、免除死亡耐久惩罚与一键找回背包：仅限房主操作，开启死亡保留后全队共享；房主点击“找回全队背包”可将在线队友的掉落背包送至各自脚边（离线玩家背包送至房主脚边）。");
-            ImGui::BulletText("物品堆叠上限倍率：房主可直接享受大堆叠；队友如不安装，手动拆分/拖动超量物品时客户端 UI 可能按原版上限截断，建议把生成的绿色分享包发给队友解压使用。");
+            ImGui::BulletText("物品堆叠上限倍率：房主可直接享受大堆叠；队友安装绿色分享包后可同步享受大堆叠、免费制作与客机独立 M 地图追踪。");
             ImGui::BulletText("本插件不会将存档切换为“自定义模式”，不影响 Steam 成就解锁。");
             ImGui::EndTabItem();
         }
@@ -1208,12 +1275,18 @@ void RenderOverlayFrame(bool& menuOpen, float uiScale) {
     // 2. 游戏内 Mod 配置菜单（按 Insert / F8 呼出）与内置自绘中文候选条
     if (menuOpen) {
         ModConfig editableCfg = *cfgSnap;
+        const int prevImeMode = editableCfg.imeCandidateMode;
         bool dirty = false;
         RenderModMenuWindow(*cfgSnap, editableCfg, dirty, menuOpen, uiScale);
         if (dirty) {
             IpcBridge::Instance().UpdateConfigAndSave(editableCfg);
+            if (editableCfg.imeCandidateMode != prevImeMode) {
+                NotifyImeModeChanged();
+            }
         }
         RenderImeCandidateBar(uiScale);
+    } else {
+        UpdateImeCandidateHitRects(false, {}, {});
     }
 }
 

@@ -4,7 +4,7 @@ status: accepted
 
 # 窗口主线程按需恢复 IME/TSF 与原生/自绘混合候选框策略
 
-为了让 GroundedQoL 中文悬浮菜单内的文本输入框正常唤起中文输入法并展示候选字，我们选择绕开 Dear ImGui 默认在 DX12/DX11 渲染线程调用的 `Platform_SetImeDataFn`，改为在输入框获焦（`io.WantTextInput`）变化时通过非阻塞 `PostMessageW` 投递到游戏主窗口线程，先检测并暂存解绑 UE4 绑定在窗口上的空 TSF 禁用文档管理器（`ITfThreadMgr::AssociateFocus(hWnd, nullptr)`），再调用 `ImmAssociateContextEx(..., IACE_DEFAULT)` 促使 Windows CUAS 恢复活跃 TSF/IMM 输入法上下文并定位候选窗；同时采用混合候选框策略——窗口/无边框全屏优先走系统原生候选窗，独占全屏或用户手动切换时自动降级为 ImGui 内嵌自绘拼音与候选条（通过 IMM32 与 TSF `ITfUIElementSink` 采集候选字），并在失焦或关闭菜单瞬间精确还原 UE4 原先的 TSF 与 IMM 禁用状态。
+为了让 GroundedQoL 中文悬浮菜单内的文本输入框正常唤起中文输入法并展示候选字，我们选择绕开 Dear ImGui 默认在 DX12/DX11 渲染线程调用的 `Platform_SetImeDataFn`，改为在输入框获焦（`io.WantTextInput`）变化或切换候选框模式时通过非阻塞 `PostMessageW` 投递到游戏主窗口线程，先检测并暂存解绑 UE4 绑定在窗口上的空 TSF 禁用文档管理器（`ITfThreadMgr::AssociateFocus(hWnd, nullptr)`），再调用 `ImmAssociateContextEx(..., IACE_DEFAULT)` 促使 Windows CUAS 恢复活跃 TSF/IMM 输入法上下文并定位候选窗；同时采用混合候选框策略——窗口/无边框全屏优先走系统原生候选窗，独占全屏或用户手动切换时自动降级为 ImGui 顶层前景自绘拼音与候选条（使用 `ImGui::GetForegroundDrawList()` 直接绘制在全部菜单窗口之上并做零抢焦鼠标命中测试，彻底规避 `NoFocusOnAppearing` 普通窗口被点击后的主菜单 Z 轴遮挡及点选候选字导致输入框失焦的问题；通过 IMM32 同步轮询与 TSF `ITfUIElementSink` 同时采集 `ITfCandidateListUIElement` / `ITfReadingInformationUIElement` 候选与拼音，并优先经 `ITfCandidateListUIElementBehavior` / `ImmNotifyIME` 提交点击选词），并在失焦或关闭菜单瞬间精确还原 UE4 原先的 TSF 与 IMM 禁用状态。
 
 ## Considered Options
 

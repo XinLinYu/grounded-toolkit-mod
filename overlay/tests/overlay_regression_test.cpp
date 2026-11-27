@@ -39,6 +39,8 @@ using QueryStateFn = int(__cdecl*)();
 using QueryMetricsFn = void(__cdecl*)(unsigned long long*, unsigned long long*, int*);
 using VoidTestFn = void(__cdecl*)();
 using SetWantTextFn = void(__cdecl*)(int, float, float);
+using InjectImeCandFn = void(__cdecl*)(const char*, const char* const*, int);
+using GetClickedCandFn = int(__cdecl*)();
 
 static int g_origSetCursorCalls = 0;
 static int g_origMouseDownCalls = 0;
@@ -262,7 +264,9 @@ static int RunDx12Test(const std::wstring& dllPath) {
     auto queryMetrics = reinterpret_cast<QueryMetricsFn>(GetProcAddress(mod, "GroundedQoL_QueryTestMetrics"));
     auto expireBanner = reinterpret_cast<VoidTestFn>(GetProcAddress(mod, "GroundedQoL_TestExpireStartupBanner"));
     auto setWantText = reinterpret_cast<SetWantTextFn>(GetProcAddress(mod, "GroundedQoL_TestSetWantTextInput"));
-    if (!queryState || !queryMetrics || !expireBanner || !setWantText) {
+    auto injectIme = reinterpret_cast<InjectImeCandFn>(GetProcAddress(mod, "GroundedQoL_TestInjectImeCandidates"));
+    auto getClickedCand = reinterpret_cast<GetClickedCandFn>(GetProcAddress(mod, "GroundedQoL_TestGetLastClickedCandidate"));
+    if (!queryState || !queryMetrics || !expireBanner || !setWantText || !injectIme || !getClickedCand) {
         std::printf("[FAIL] Missing test exports in DLL\n");
         return 2;
     }
@@ -451,7 +455,11 @@ static int RunDx12Test(const std::wstring& dllPath) {
         std::printf("[TEST-DX12] Verified DX12 idle zero-overhead pass-through!\n");
     }
 
-    // 5. 按 Insert 打开 Mod 菜单：验证单系统光标接管、游戏鼠标屏蔽与自动软刷新指令（Q3 / Q9）
+    // 5. 按 Insert 首次打开 Mod 菜单：验证首次必显示光标、菜单期拦截 UE4 每帧 SetCursor(NULL)/ShowCursor(FALSE)/ClipCursor/SetCursorPos 零闪烁与自动软刷新（ADR-0004 / Q3 / Q9）
+    // 先模拟 UE4 3D 游玩态下把光标藏起来（ShowCursor(FALSE) 循环 + SetCursor(NULL)）
+    while (::ShowCursor(FALSE) >= 0) {}
+    ::SetCursor(nullptr);
+
     SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
     if (!pumpAndPresent(6)) return 12;
     int st2 = queryState();
@@ -463,7 +471,39 @@ static int RunDx12Test(const std::wstring& dllPath) {
     {
         int prevSetCur = g_origSetCursorCalls;
         int prevMouseDown = g_origMouseDownCalls;
-        SendMessageW(hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+        // 首次打开瞬间必须立即可见（未触发 WM_SETCURSOR 前也不应为 NULL）
+        if (::GetCursor() == nullptr) {
+            std::printf("[FAIL] First menu open cursor was NULL!\n");
+            return 35;
+        }
+        // 模拟 UE4 FSlateApplication::Tick() 每帧直接调用 Win32 API 尝试隐藏/闪烁/锁框/拉回光标（30 次高频冲击）
+        RECT ue4LockRect{200, 200, 260, 260};
+        for (int iter = 0; iter < 30; ++iter) {
+            ::SetCursor(nullptr);
+            // 验证 UE4 风格的 while(::ShowCursor(FALSE) >= 0){} 立刻终止且不藏光标
+            int guardLoops = 0;
+            while (::ShowCursor(FALSE) >= 0 && guardLoops < 10) { guardLoops++; }
+            if (guardLoops >= 10) {
+                std::printf("[FAIL] HookedShowCursor caused UE4 ShowCursor(FALSE) loop hang!\n");
+                return 35;
+            }
+            ::ClipCursor(&ue4LockRect);
+            ::SetCursorPos(10, 10);
+            if (::GetCursor() == nullptr) {
+                std::printf("[FAIL] UE4 direct SetCursor(NULL) flickered/hid cursor during menu open at iter=%d!\n", iter);
+                return 35;
+            }
+            RECT curClip{};
+            if (::GetClipCursor(&curClip) && curClip.right - curClip.left <= 65 && curClip.bottom - curClip.top <= 65) {
+                std::printf("[FAIL] UE4 ClipCursor locked mouse while Mod menu was open!\n");
+                return 35;
+            }
+            SendMessageW(hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+            if (::GetCursor() == nullptr) {
+                std::printf("[FAIL] WM_SETCURSOR resulted in NULL cursor during menu open!\n");
+                return 35;
+            }
+        }
         // 连续模拟完整鼠标点击（按下 -> SetCapture -> 抬起 -> ReleaseCapture 同步重入 WM_CAPTURECHANGED），
         // 严格回归防复发：此前非递归 mutex 会在此处同步重入并抛 std::system_error 闪退！
         SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(300, 300));
@@ -623,7 +663,7 @@ static int RunDx12Test(const std::wstring& dllPath) {
     }
     if (!pumpAndPresent(5)) return 15;
 
-    // 8. 按 F8 关闭菜单 -> 验证立即向 UE4 归还隐藏光标
+    // 8. 按 F8 关闭菜单 -> 验证立即向 UE4 归还隐藏光标与 ClipCursor，并复测二次打开无闪烁
     Sleep(220);
     int prevSetCurBeforeClose = g_origSetCursorCalls;
     SendMessageW(hwnd, WM_KEYDOWN, VK_F8, 0);
@@ -638,7 +678,24 @@ static int RunDx12Test(const std::wstring& dllPath) {
                     prevSetCurBeforeClose, g_origSetCursorCalls, ::GetCursor());
         return 46;
     }
-    std::printf("[TEST-DX12] Verified F8 close immediately restored UE4 hidden cursor!\n");
+    ::ClipCursor(nullptr); // 解除测试中 UE4 锁框以便二次打开与退出
+
+    // 9. 二次打开菜单再锤 15 次 UE4 SetCursor(NULL)，验证二次打开也全程 0 闪烁，然后再关闭
+    Sleep(220);
+    SendMessageW(hwnd, WM_KEYDOWN, VK_F8, 0);
+    if (!pumpAndPresent(4)) return 49;
+    for (int iter = 0; iter < 15; ++iter) {
+        ::SetCursor(nullptr);
+        SendMessageW(hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+        if (::GetCursor() == nullptr) {
+            std::printf("[FAIL] Second menu open flickered cursor at iter=%d!\n", iter);
+            return 50;
+        }
+    }
+    Sleep(220);
+    SendMessageW(hwnd, WM_KEYDOWN, VK_F8, 0);
+    if (!pumpAndPresent(4)) return 51;
+    std::printf("[TEST-DX12] Verified first & second menu open ZERO cursor flicker + F8 clean restore!\n");
 
     DeleteFileW((dataDir + L"\\map_live.json").c_str());
     DeleteFileW((dataDir + L"\\status.json").c_str());
@@ -674,7 +731,10 @@ static int RunDx11Test(const std::wstring& dllPath) {
     if (!mod) return 21;
     auto queryState = reinterpret_cast<QueryStateFn>(GetProcAddress(mod, "GroundedQoL_QueryTestState"));
     auto expireBanner = reinterpret_cast<VoidTestFn>(GetProcAddress(mod, "GroundedQoL_TestExpireStartupBanner"));
-    if (!queryState || !expireBanner) return 22;
+    auto setWantText = reinterpret_cast<SetWantTextFn>(GetProcAddress(mod, "GroundedQoL_TestSetWantTextInput"));
+    auto injectIme = reinterpret_cast<InjectImeCandFn>(GetProcAddress(mod, "GroundedQoL_TestInjectImeCandidates"));
+    auto getClickedCand = reinterpret_cast<GetClickedCandFn>(GetProcAddress(mod, "GroundedQoL_TestGetLastClickedCandidate"));
+    if (!queryState || !expireBanner || !setWantText || !injectIme || !getClickedCand) return 22;
 
     Sleep(800);
 
@@ -752,6 +812,54 @@ static int RunDx11Test(const std::wstring& dllPath) {
     int st2 = queryState();
     std::printf("[TEST-DX11] After F8 state=0x%X (expect bit2=MenuOpen)\n", st2);
     if ((st2 & 4) == 0) return 26;
+
+    // 验证内置自绘候选条（imeCandidateMode=2）在点击主菜单置顶后依然在顶层前景渲染、且鼠标点击候选字不抢焦点（ADR-0003 / Q4）
+    setWantText(1, 360.0f, 260.0f);
+    PumpMessages();
+    const char* mockCands[] = {"\xE8\x96\x84\xE8\x8D\xB7", "\xE5\x8D\x9A\xE5\x90\x88", "\xE6\x8B\xA8\xE6\xB2\xB3"};
+    injectIme("bohe", mockCands, 3);
+    for (int i = 0; i < 3; ++i) { PumpMessages(); swap->Present(0, 0); Sleep(16); }
+    if ((queryState() & (1 << 8)) == 0) {
+        std::printf("[FAIL] Foreground self-drawn IME candidate bar did NOT render!\n");
+        return 52;
+    }
+
+    // 故意连续点击 Mod 主菜单窗口多处区域（此前会把主菜单置顶覆盖 ##GQOL_ImeCandidateBar 导致弹窗消失）
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(500, 120));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(500, 120));
+    for (int i = 0; i < 3; ++i) { PumpMessages(); swap->Present(0, 0); Sleep(16); }
+    if ((queryState() & (1 << 8)) == 0) {
+        std::printf("[FAIL] Self-drawn IME candidate bar disappeared after clicking Mod menu window!\n");
+        return 53;
+    }
+
+    // 1) 点击候选条空白边缘区域：必须拦截不穿透且不触发误选
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(364, 296));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(364, 296));
+    PumpMessages();
+    if (getClickedCand() != -1 || (queryState() & (1 << 5)) == 0) {
+        std::printf("[FAIL] Clicking candidate bar background triggered selection or lost IME focus! idx=%d state=0x%X\n",
+                    getClickedCand(), queryState());
+        return 54;
+    }
+
+    // 2) 点击顶层候选条内第 1 枚候选字（位于输入框 (360, 260) 正下方第二行芯片中心约 (390, 338)）
+    int downBefore = g_origMouseDownCalls;
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(390, 338));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(390, 338));
+    PumpMessages();
+    int clickedIdx = getClickedCand();
+    int stAfterClick = queryState();
+    std::printf("[TEST-DX11] Self-drawn IME foreground click check: clickedIdx=%d state=0x%X origDown=%d->%d\n",
+                clickedIdx, stAfterClick, downBefore, g_origMouseDownCalls);
+    if (clickedIdx != 0 || (stAfterClick & (1 << 5)) == 0 || g_origMouseDownCalls != downBefore) {
+        std::printf("[FAIL] Focus-safe candidate click failed! clickedIdx=%d state=0x%X\n", clickedIdx, stAfterClick);
+        return 54;
+    }
+    injectIme("", nullptr, 0);
+    setWantText(0, 0.0f, 0.0f);
+    for (int i = 0; i < 2; ++i) { PumpMessages(); swap->Present(0, 0); Sleep(16); }
+    std::printf("[TEST-DX11] Verified foreground self-drawn IME bar NEVER hidden by menu + focus-safe click!\n");
 
     DeleteFileW((dataDir + L"\\config.json").c_str());
     DeleteFileW((dataDir + L"\\actions.json").c_str());

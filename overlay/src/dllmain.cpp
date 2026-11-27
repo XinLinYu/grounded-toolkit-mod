@@ -59,6 +59,7 @@ extern "C" __declspec(dllexport) int __cdecl GroundedQoL_Bootstrap(void*) {
 ///   bit5 = 当前窗口线程 IME 已启用
 ///   bit6 = 当前处于中文输入法组词中
 ///   bit7 = 当前自绘候选条模式生效
+///   bit8 = 最近一帧顶层前景自绘候选条已实际绘制
 extern "C" __declspec(dllexport) int __cdecl GroundedQoL_QueryTestState() {
     int flags = 0;
     const char* api = gqol::GetActiveGraphicsBackend();
@@ -71,6 +72,7 @@ extern "C" __declspec(dllexport) int __cdecl GroundedQoL_QueryTestState() {
     if (ime.active) flags |= (1 << 5);
     if (ime.composing) flags |= (1 << 6);
     if (ime.useSelfDrawnUi) flags |= (1 << 7);
+    if (gqol::WasSelfDrawnImeBarRenderedLastFrame()) flags |= (1 << 8);
     return flags;
 }
 
@@ -90,6 +92,17 @@ extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestExpireStartupBanne
 /// 供自动化回归测试直接驱动输入框获焦态以验证窗口线程 IME 激活与还原行为。
 extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestSetWantTextInput(int want, float x, float y) {
     gqol::ForceWantTextInputForTest(want != 0, x, y);
+}
+
+/// 供自动化回归测试注入自绘候选列表并验证顶层前景渲染与零抢焦鼠标点击。
+extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestInjectImeCandidates(
+    const char* compositionUtf8, const char* const* candidates, int count) {
+    gqol::ForceInjectImeCandidatesForTest(compositionUtf8, candidates, count);
+}
+
+/// 供自动化回归测试查询最近一次被鼠标点击选中的候选字页内索引（-1 表示未点击）。
+extern "C" __declspec(dllexport) int __cdecl GroundedQoL_TestGetLastClickedCandidate() {
+    return gqol::GetLastClickedImeCandidateForTest();
 }
 
 /// DLL 生命周期入口：Attach 时保证只拉起一次初始化线程，Detach 时安全卸载图形钩子与异步 IPC 线程。
