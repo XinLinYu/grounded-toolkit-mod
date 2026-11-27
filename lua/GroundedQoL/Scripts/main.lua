@@ -121,12 +121,17 @@ local cfg = {
     showMapLabels = false,
     showMapLegend = true,
     mapIconScale = 1.0,
+    imeCandidateMode = 0,
     trackedIds = {},
 }
 
 local lastConfigRaw = ""
 local lastActionSeq = 0
 local lastStatusMessage = "插件已就绪，按 Insert 或 F8 打开中文菜单"
+local lastStatusJson = ""
+local lastMapLiveJson = ""
+local lastStackConfigKey = ""
+local lastHarvestConfigKey = ""
 
 -- ============================================================
 -- 3. 缓存状态与辅助工具
@@ -141,7 +146,11 @@ local origDamageMap = {}   -- key=USurvivalGameModeSettings 地址，保存伤�
 local origLootCounts = {}  -- key=ULootComponent 地址，保存各掉落槽位的原版数量
 local managedLootCount = 0
 
--- 引擎单件与静态数据表句柄缓存
+-- 引擎单件、高频世界对象与静态数据表句柄缓存（避免每帧/每秒重复 FindFirstOf 扫描 GObjects）
+local cachedGlobalItemData = nil
+local cachedGameState = nil
+local cachedPawnAddr = nil
+local cachedWidgetManager = nil
 local cachedOEITextLib = nil
 local cachedSlateLib = nil
 local cachedLayoutLib = nil
@@ -340,9 +349,28 @@ end
 
 --- 按配置倍率原地调整 GlobalItemData 的各类物品堆叠上限。
 -- 自动跳过基础堆叠 <= 1 的武器/防具/工具，避免耐久或强化词条异常合并。
+local function getStackConfigKey()
+    return tostring(cfg.stackEnabled == true) .. ":" .. tostring(cfg.stackMultiplier or 1)
+end
+
+local function getHarvestConfigKey()
+    return tostring(cfg.harvestEnabled == true)
+        .. ":" .. tostring(cfg.harvestMultiplier or 1)
+        .. ":" .. tostring(cfg.harvestAffectHauling == true)
+        .. ":" .. tostring(cfg.harvestAffectPickup == true)
+end
+
 local function applyStackSizeMultiplier()
-    local ok, gid = pcall(FindFirstOf, "GlobalItemData")
-    if not ok or not safeValid(gid) then return end
+    local gid = cachedGlobalItemData
+    if not safeValid(gid) then
+        local ok, found = pcall(FindFirstOf, "GlobalItemData")
+        if ok and safeValid(found) then
+            gid = found
+            cachedGlobalItemData = found
+        else
+            return
+        end
+    end
 
     if origStackBonusPerTier == nil then
         pcall(function() origStackBonusPerTier = gid.ItemStackBonusPerTier end)
@@ -406,8 +434,9 @@ end
 -- 设计约束（见 ADR-0001）：只直接修改活跃 USurvivalGameModeSettings 字段并缓存原版基准值用于还原，
 -- 绝不调用 SwapToCustom / SetGameMode / UpdateCustomSettings，从而保持原版生存模式、100% 不影响 Steam 成就。
 -- @param isHost 当前端是否具备房主权威；死亡保护类设置仅在房主端写入，由主机自然同步给全队。
+-- @param gsIn   调用方已缓存并校验有效的 SurvivalGameState，避免重复 FindFirstOf 扫描。
 -- @return livePlayerDmg, liveEnemyDmg, diffName, liveKeepInv, liveNoDurPenalty
-local function applyGameModeSettings(isHost)
+local function applyGameModeSettings(isHost, gsIn)
     local livePlayerDmg = 1.0
     local liveEnemyDmg = 1.0
     local diffName = "未知"
@@ -491,9 +520,13 @@ local function applyGameModeSettings(isHost)
         else diffName = "自定义" end
     end
 
-    -- 优先通过当前 SurvivalGameState 的模式管理器获取正在生效的设置实例
-    local okGs, gs = pcall(FindFirstOf, "SurvivalGameState")
-    if okGs and safeValid(gs) then
+    -- 优先通过当前 SurvivalGameState 的模式管理器获取正在生效的设置实例（复用调用方缓存对象，零 GObjects 扫描）
+    local gs = gsIn
+    if not safeValid(gs) then
+        local okGs, foundGs = pcall(FindFirstOf, "SurvivalGameState")
+        if okGs and safeValid(foundGs) then gs = foundGs end
+    end
+    if safeValid(gs) then
         pcall(function()
             local sm = gs.SurvivalModeManagerComponent
             if safeValid(sm) and safeValid(sm.GameModeSettings) then
@@ -626,12 +659,17 @@ local function applyAllLootComponents()
     managedLootCount = cnt
 end
 
--- 在 SpawnLoot 触发瞬间确保刚生成的草/矿石/怪物掉落表已被放大（幂等、无 NotifyOnNewObject 并发风险）
+-- 在 SpawnLoot 触发瞬间确保刚生成的草/矿石/怪物掉落表与当前倍率配置一致（含关闭时还原，彻底替代周期全图扫表）
 pcall(function()
     RegisterHook("/Script/Maine.LootComponent:SpawnLoot", function(selfParam)
-        if cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1 then
-            pcall(function() applyLootComponent(selfParam:get()) end)
-        end
+        pcall(function()
+            local lc = selfParam:get()
+            if not safeValid(lc) then return end
+            if (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1)
+                or origLootCounts[lc:GetAddress()] ~= nil then
+                applyLootComponent(lc)
+            end
+        end)
     end)
 end)
 
@@ -1434,6 +1472,7 @@ local knownCatalogMeta = {}
 local noFoliageRows = {}
 local cachedWorldIsms = nil
 local lastCatalogWriteClock = 0
+local lastCatalogRefreshClock = -100.0
 
 --- 判断 LODActor 或其实体是否已死亡、被摧毁或正在销毁（确保击杀昆虫/挖掉矿点后标点立刻消失）。
 local function isLodDeadOrInvalid(lod, fullActor, healthLodCls)
@@ -1489,8 +1528,16 @@ end
 -- @param writeCatalogFile 是否将排序后的资源目录原子写入 data/catalog.json 供 C++ 菜单展示
 -- @param quietLog         是否静默日志（定时增量刷新时设为 true 避免刷屏）
 local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
-    local okGs, gs = pcall(FindFirstOf, "SurvivalGameState")
-    if not okGs or not safeValid(gs) then return false end
+    local gs = cachedGameState
+    if not safeValid(gs) then
+        local okGs, found = pcall(FindFirstOf, "SurvivalGameState")
+        if okGs and safeValid(found) then
+            gs = found
+            cachedGameState = found
+        end
+    end
+    if not safeValid(gs) then return false end
+    lastCatalogRefreshClock = os.clock()
 
     loadTableTranslations()
     if not safeValid(cachedHealthLodClass) then
@@ -1854,7 +1901,7 @@ end
 local function getFoliagePinsForRow(rowName, now, forceRefresh)
     if noFoliageRows[rowName] then return {} end
     local cached = foliagePinCache[rowName]
-    if cached and (not forceRefresh) and ((now - cached.clock) < 2.5) then
+    if cached and (not forceRefresh) and ((now - cached.clock) < 6.0) then
         return cached.pins
     end
 
@@ -1877,11 +1924,12 @@ local function getFoliagePinsForRow(rowName, now, forceRefresh)
             if safeValid(m) then targetMeshSet[m:GetAddress()] = true end
         end
 
-        -- 获取 FoliageManagerComponent 以精准剔除已采集/已砍伐/默认移除的植被实例
+        -- 获取 FoliageManagerComponent 以精准剔除已采集/已砍伐/默认移除的植被实例（复用缓存 GameState）
         local fm = nil
         local removedIsmSet = {}
         pcall(function()
-            local gs = FindFirstOf("SurvivalGameState")
+            local gs = cachedGameState
+            if not safeValid(gs) then gs = FindFirstOf("SurvivalGameState") end
             if safeValid(gs) and safeValid(gs.FoliageManagerComponent) then
                 fm = gs.FoliageManagerComponent
                 if fm.DefaultRemovedISMs then
@@ -1971,15 +2019,17 @@ local function addrToHex(obj)
     return ""
 end
 
---- 通过 Grounded 原生 UWidgetManager.WindowStack 精准获取当前正在显示的 M 地图面板与顶层全屏窗口。
+--- 通过 Grounded 原生 UWidgetManager.WindowStack 精准获取当前正在显示的 M 地图面板与顶层全屏窗口（缓存 WidgetManager 避免重复 FindFirstOf）。
 local function findActiveMapPanel()
-    local wm = nil
-    pcall(function()
-        local gi = UEHelpers.GetGameInstance()
-        if safeValid(gi) and safeValid(gi.WidgetManager) then
-            wm = gi.WidgetManager
-        end
-    end)
+    local wm = cachedWidgetManager
+    if not safeValid(wm) then
+        pcall(function()
+            local gi = UEHelpers.GetGameInstance()
+            if safeValid(gi) and safeValid(gi.WidgetManager) then
+                wm = gi.WidgetManager
+            end
+        end)
+    end
     if not safeValid(wm) then
         pcall(function()
             local pc = UEHelpers.GetPlayerController()
@@ -1993,6 +2043,9 @@ local function findActiveMapPanel()
             local found = FindFirstOf("WidgetManager")
             if safeValid(found) then wm = found end
         end)
+    end
+    if safeValid(wm) then
+        cachedWidgetManager = wm
     end
 
     if safeValid(wm) then
@@ -2050,6 +2103,7 @@ local function updateMapLiveFrame(now)
     if not safeValid(panel) then
         if lastMapOpen then
             lastMapOpen = false
+            lastMapLiveJson = ""
             writeAtomicText(MAP_LIVE_PATH, json.encode({ mapOpen = false }))
             logInfo("M 地图已关闭")
         end
@@ -2057,17 +2111,16 @@ local function updateMapLiveFrame(now)
     end
 
     local justOpened = not lastMapOpen
-    -- M 地图刚打开或每 0.45 秒实时刷新一次全图资源、徘徊中动物及死亡/采集状态
-    if justOpened or (now - lastLivePinRefreshClock >= 0.45) then
+    -- M 地图刚打开瞬间立即刷新一次，保持打开期间放宽至每 1.8 秒刷新生物位置与采集状态（拖拽缩放仍由 C++ 满帧直读 Slate 内存）
+    if justOpened or (now - lastLivePinRefreshClock >= 1.8) then
         lastLivePinRefreshClock = now
         local shouldSyncCatalog = justOpened and ((now - lastCatalogWriteClock) >= 6.0)
         refreshWorldCatalogAndPins(shouldSyncCatalog, true)
     end
     lastMapOpen = true
 
-    -- C++ 悬浮层每帧直接从 Slate 内存读取控件 FGeometry（60~144Hz 零延迟），
-    -- Lua 只需在刚打开时立刻写出，其余时候按 4Hz 同步最新动物与玩家坐标即可。
-    if (not justOpened) and (now - lastMapWriteClock < 0.25) then
+    -- 仅在刚打开或每 0.5 秒同步最新坐标，并做脏检查避免无变化重复落盘
+    if (not justOpened) and (now - lastMapWriteClock < 0.5) then
         return true
     end
     lastMapWriteClock = now
@@ -2185,7 +2238,7 @@ local function updateMapLiveFrame(now)
             panelHex, canvasHex, borderHex, rootWinHex, minX, maxX, minY, maxY, texW, texH, lastValidVpW, lastValidVpH, #pins))
     end
 
-    writeAtomicText(MAP_LIVE_PATH, json.encode({
+    local encodedMap = json.encode({
         mapOpen = true,
         hasTransform = false,
         vpW = lastValidVpW,
@@ -2205,7 +2258,11 @@ local function updateMapLiveFrame(now)
         hasPlayerPos = hasPlayerPos,
         playerX = plX, playerY = plY, playerZ = plZ,
         pins = json.array(pins),
-    }))
+    })
+    if justOpened or encodedMap ~= lastMapLiveJson then
+        lastMapLiveJson = encodedMap
+        writeAtomicText(MAP_LIVE_PATH, encodedMap)
+    end
     return true
 end
 
@@ -2286,6 +2343,12 @@ local function processActions()
         recoverDroppedBackpacks(false)
     elseif t == "recover_all_backpacks" then
         recoverDroppedBackpacks(true)
+    elseif t == "refresh_catalog_soft" then
+        -- 打开 Mod 菜单自动按需静默刷新（距上次扫描 >= 5 秒才执行，不覆盖状态栏提示，见 ADR-0004）
+        local now = os.clock()
+        if catalogBuiltForWorld ~= nil and (now - lastCatalogRefreshClock) >= 5.0 then
+            refreshWorldCatalogAndPins(true, true)
+        end
     elseif t == "refresh_catalog" then
         foliagePinCache = {}
         noFoliageRows = {}
@@ -2299,7 +2362,7 @@ local function processActions()
 end
 
 -- ============================================================
--- 10. 单线程安全主调度器（彻底避免 UE4SS 多 LoopAsync 并发崩溃）
+-- 10. 单线程安全主调度器（彻底避免 UE4SS 多 LoopAsync 并发崩溃，游玩期零周期全扫）
 -- ============================================================
 
 --- 轮询 data/config.json，若文本内容发生变化则解码并合并到内存配置表 cfg。
@@ -2315,9 +2378,9 @@ local function pollConfig()
     return true
 end
 
---- 将当前世界状态、实时伤害/死亡保护生效值及乳牙统计原子写入 data/status.json 供菜单顶部展示。
+--- 将当前世界状态、实时伤害/死亡保护生效值及乳牙统计按脏检查原子写入 data/status.json（无变化时零写盘）。
 local function writeRuntimeStatus(inWorld, isHost, diffName, liveP, liveE, liveKeepInv, liveNoDurPenalty)
-    writeAtomicText(STATUS_PATH, json.encode({
+    local encoded = json.encode({
         inWorld = inWorld,
         isHost = isHost,
         difficulty = diffName,
@@ -2334,52 +2397,85 @@ local function writeRuntimeStatus(inWorld, isHost, diffName, liveP, liveE, liveK
         stackSummary = lastStackSummary,
         surveyedItemName = lastSurveyedName,
         lastMessage = lastStatusMessage,
-    }))
+    })
+    if encoded ~= lastStatusJson then
+        lastStatusJson = encoded
+        writeAtomicText(STATUS_PATH, encoded)
+    end
 end
 
 local tickInFlight = false
 local tickStartClock = 0
-local lastSlowTickClock = 0
-local lastLootSweepClock = 0
-local lastMapCheckClock = 0
+local lastSlowTickClock = -10.0
+local lastMapCheckClock = -10.0
+
+--- 解析当前活跃存档的 SurvivalGameState 与玩家角色（优先复用缓存句柄，避免每 0.6 秒扫描 GObjects）。
+local function resolveActiveWorldObjects()
+    local pc = UEHelpers.GetPlayerController()
+    local pawn = safeValid(pc) and pc.Pawn or nil
+    if not safeValid(pawn) then
+        return false, nil
+    end
+
+    local pAddr = pawn:GetAddress()
+    if pAddr ~= cachedPawnAddr then
+        -- 玩家角色实例切换（读档/切换世界/重生），主动刷新缓存句柄
+        cachedPawnAddr = pAddr
+        cachedGameState = nil
+        cachedGlobalItemData = nil
+        cachedWidgetManager = nil
+    end
+
+    local gs = cachedGameState
+    if not safeValid(gs) then
+        local okGs, foundGs = pcall(FindFirstOf, "SurvivalGameState")
+        if okGs and safeValid(foundGs) then
+            gs = foundGs
+            cachedGameState = foundGs
+        end
+    end
+    if not safeValid(gs) then
+        return false, nil
+    end
+
+    return true, gs
+end
 
 --- 游戏主线程统一调度入口（由唯一 LoopAsync 经 ExecuteInGameThread 串行驱动，保证 UObject 线程安全）。
 local function onGameThreadTick()
     local now = os.clock()
 
-    -- 1. 高频任务：仅在已进入存档时检测与刷新 M 地图标点（M 地图打开时 40ms 刷新，关闭时 250ms 探测）
+    -- 1. M 地图状态探测与按需刷新（关闭时 0.35s 轻检测，打开时 0.25s 驱动节流同步）
     if catalogBuiltForWorld ~= nil then
-        local mapInterval = lastMapOpen and 0.04 or 0.25
+        local mapInterval = lastMapOpen and 0.25 or 0.35
         if now - lastMapCheckClock >= mapInterval then
             lastMapCheckClock = now
             pcall(updateMapLiveFrame, now)
         end
     end
 
-    -- 2. 低频任务（每 0.6 秒）：同步配置、执行菜单操作、维护堆叠/伤害/死亡保护与进图状态
+    -- 2. 低频任务（每 0.6 秒）：同步配置、消费操作指令、按需应用堆叠/采集倍率并用缓存句柄轻维护游戏模式设置
     if now - lastSlowTickClock >= 0.6 then
         lastSlowTickClock = now
 
         local cfgChanged = pollConfig()
         processActions()
-        applyStackSizeMultiplier()
 
-        local okGs, gs = pcall(FindFirstOf, "SurvivalGameState")
-        local okChar, char = pcall(FindFirstOf, "SurvivalPlayerCharacter")
-        local inWorld = okGs and safeValid(gs) and okChar and safeValid(char)
+        local inWorld, gs = resolveActiveWorldObjects()
 
         if inWorld then
             local isHost = true
             pcall(function() isHost = gs:HasAuthority() end)
 
-            local liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost)
-
-            -- 检测到切换世界/新读档，重置上一存档的资源目录缓存并等待 2.5 秒完成流式加载
+            -- 检测到切换世界/新读档，重置上一存档缓存并等待 2.5 秒完成流式加载
             local worldKey = gs:GetAddress()
-            if catalogBuiltForWorld ~= worldKey then
+            local enteredNewWorld = (catalogBuiltForWorld ~= worldKey)
+            if enteredNewWorld then
                 catalogBuiltForWorld = worldKey
                 worldEnterClock = now
                 worldInitialScanDone = false
+                lastStackConfigKey = ""
+                lastHarvestConfigKey = ""
                 foliagePinCache = {}
                 noFoliageRows = {}
                 knownCatalogMeta = {}
@@ -2387,29 +2483,44 @@ local function onGameThreadTick()
                 lastStatusMessage = "正在加载世界资源与乳牙坐标..."
             end
 
-            -- 进入存档 2.5 秒后自动执行一次全量世界扫描（不使用嵌套 ExecuteWithDelay 避免并发）
+            -- 堆叠倍率仅在首次进图或堆叠配置变更时应用，避免周期重复扫描 GlobalItemData
+            local stackKey = getStackConfigKey()
+            if stackKey ~= lastStackConfigKey then
+                lastStackConfigKey = stackKey
+                applyStackSizeMultiplier()
+            end
+
+            -- 缓存句柄轻心跳维持 USurvivalGameModeSettings 原地覆写（兼顾 ADR-0001 与零 GObjects 扫描）
+            local liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost, gs)
+
+            -- 进图 2.5 秒后执行一次性初始扫描；正常游玩期彻底停用 10s 全图 LOD 扫表与 2.5s LootComponent 全扫（见 ADR-0004）
+            local harvestKey = getHarvestConfigKey()
             if (not worldInitialScanDone) and (now - worldEnterClock >= 2.5) then
                 worldInitialScanDone = true
+                lastStackConfigKey = getStackConfigKey()
+                lastHarvestConfigKey = harvestKey
                 applyStackSizeMultiplier()
-                liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost)
+                liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost, gs)
                 applyAllLootComponents()
                 refreshWorldCatalogAndPins(true, false)
                 lastStatusMessage = "已就绪！按 M 查看乳牙与追踪资源，按 Insert/F8 调节参数"
-            elseif cfgChanged or (now - lastLootSweepClock >= 2.5) then
-                lastLootSweepClock = now
+            elseif worldInitialScanDone and (harvestKey ~= lastHarvestConfigKey) then
+                lastHarvestConfigKey = harvestKey
                 applyAllLootComponents()
-                -- 每 10 秒静默同步一次目录数量，确保菜单里的“[生物/采集点 | X处]”随击杀/采集/重生动态更新
-                if worldInitialScanDone and (not lastMapOpen) and ((now - lastCatalogWriteClock) >= 10.0) then
-                    refreshWorldCatalogAndPins(true, true)
-                end
             end
 
             writeRuntimeStatus(true, isHost, diffName, liveP, liveE, liveKeepInv, liveNoDurPenalty)
         else
             -- 退出存档返回主菜单时彻底清空旧世界对象地址缓存，避免悬空地址复用
-            if catalogBuiltForWorld ~= nil then
+            if catalogBuiltForWorld ~= nil or cachedPawnAddr ~= nil then
                 catalogBuiltForWorld = nil
                 worldInitialScanDone = false
+                cachedGameState = nil
+                cachedGlobalItemData = nil
+                cachedPawnAddr = nil
+                cachedWidgetManager = nil
+                lastStackConfigKey = ""
+                lastHarvestConfigKey = ""
                 catalogList = {}
                 worldPinBuckets = {}
                 collectiblePins = {}
@@ -2421,6 +2532,7 @@ local function onGameThreadTick()
                 origLootCounts = {}
                 if lastMapOpen then
                     lastMapOpen = false
+                    lastMapLiveJson = ""
                     writeAtomicText(MAP_LIVE_PATH, json.encode({ mapOpen = false }))
                 end
             end
@@ -2431,8 +2543,8 @@ local function onGameThreadTick()
     tickInFlight = false
 end
 
--- 唯一的一个异步定时驱动器，严格保证同一时刻最多只有 1 个游戏线程回调在飞
-LoopAsync(50, function()
+-- 唯一异步定时驱动器：先在异步线程判断是否有任务到期再派发 ExecuteInGameThread，降低游戏主线程唤醒频率
+LoopAsync(100, function()
     local now = os.clock()
     if tickInFlight then
         -- 看门狗：若超过 3 秒未释放（如极罕见切换关卡丢帧），自动解锁防止调度器永久卡死
@@ -2440,10 +2552,16 @@ LoopAsync(50, function()
             return false
         end
     end
+    local mapInterval = lastMapOpen and 0.25 or 0.35
+    local needMapCheck = (catalogBuiltForWorld ~= nil) and ((now - lastMapCheckClock) >= mapInterval)
+    local needSlowTick = (now - lastSlowTickClock) >= 0.6
+    if not needMapCheck and not needSlowTick then
+        return false
+    end
     tickInFlight = true
     tickStartClock = now
     ExecuteInGameThread(onGameThreadTick)
     return false
 end)
 
-logInfo("GroundedQoL v1.2 初始化完成（单线程稳定调度 + 死亡保护与背包找回 + DX12/DX11 支持）！按 Insert 或 F8 打开中文菜单。")
+logInfo("GroundedQoL v1.3 初始化完成（混合中文输入法 + 零光标闪烁 + 空闲零开销直通与按需扫描）！按 Insert 或 F8 打开中文菜单。")

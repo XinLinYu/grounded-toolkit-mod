@@ -1,16 +1,16 @@
 /*
  * 文件：overlay/src/ipc.cpp
- * 职责：实现 IpcBridge 的原子 JSON 文件读写、时间戳去重轮询与线程安全状态快照分发。
- * 并发说明：
- *   - 渲染线程（Present）调用 PollFromLua / Get*Copy / UpdateConfigAndSave；
- *   - 窗口消息线程（WndProc）调用 PushAction；
- *   - 后台启动线程调用 Initialize。
- *   所有内存状态访问均通过 m_mutex 保护，跨进程文件交互依赖 MoveFileExW 原子替换并容忍偶发解析重试。
+ * 职责：实现 IpcBridge 的后台异步文件轮询、原子 JSON 写盘与零拷贝不可变快照分发。
+ * 并发说明（见 ADR-0004）：
+ *   - 独立后台线程 IoWorkerLoop 统一承担 map_live/status/catalog 读取解析与 config/actions 原子写盘；
+ *   - Present 渲染线程与 WndProc 消息线程仅做短暂锁内的 std::shared_ptr 拷贝或队列入队，永不阻塞于磁盘 I/O。
  */
 
 #include "ipc.h"
 
 #include <Windows.h>
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -75,11 +75,22 @@ json SerializeConfigJson(const ModConfig& cfg) {
         {"showMapLabels", cfg.showMapLabels},
         {"showMapLegend", cfg.showMapLegend},
         {"mapIconScale", cfg.mapIconScale},
+        {"imeCandidateMode", std::clamp(cfg.imeCandidateMode, 0, 2)},
         {"trackedIds", cfg.trackedIds},
     };
 }
 
 } // namespace
+
+IpcBridge::IpcBridge()
+    : m_configSnap(std::make_shared<ModConfig>()),
+      m_catalogSnap(std::make_shared<std::vector<CatalogEntry>>()),
+      m_mapLiveSnap(std::make_shared<MapLiveState>()),
+      m_statusSnap(std::make_shared<RuntimeStatus>()) {}
+
+IpcBridge::~IpcBridge() {
+    Shutdown(true);
+}
 
 IpcBridge& IpcBridge::Instance() {
     static IpcBridge inst;
@@ -87,18 +98,61 @@ IpcBridge& IpcBridge::Instance() {
 }
 
 void IpcBridge::Initialize(const std::wstring& dllDirectory) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_dataDir = dllDirectory;
-    if (!m_dataDir.empty() && m_dataDir.back() != L'\\' && m_dataDir.back() != L'/') {
-        m_dataDir.push_back(L'\\');
-    }
-    m_dataDir += L"data";
-    CreateDirectoryW(m_dataDir.c_str(), nullptr);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_dataDir = dllDirectory;
+        if (!m_dataDir.empty() && m_dataDir.back() != L'\\' && m_dataDir.back() != L'/') {
+            m_dataDir.push_back(L'\\');
+        }
+        m_dataDir += L"data";
+        CreateDirectoryW(m_dataDir.c_str(), nullptr);
 
-    if (!LoadConfigLocked()) {
-        // 首次启动或旧配置文件损坏时写出完整默认配置，确保 Lua 端立即可读取
-        AtomicWriteText(m_dataDir + L"\\config.json", SerializeConfigJson(m_config).dump(2));
+        if (!LoadConfigLocked()) {
+            // 首次启动或旧配置文件损坏时同步写出完整默认配置，确保 Lua 端与回归测试立即可读取
+            auto defaultCfg = std::make_shared<ModConfig>();
+            m_configSnap = defaultCfg;
+            AtomicWriteText(m_dataDir + L"\\config.json", SerializeConfigJson(*defaultCfg).dump(2));
+        }
     }
+
+    // 立即在初始化线程预读一次已有 IPC 文件，并拉起后台异步 I/O 轮询线程
+    PollFilesOnWorker();
+
+    std::lock_guard<std::mutex> ioLock(m_ioMutex);
+    if (!m_ioStarted) {
+        m_stopIo.store(false);
+        m_ioStarted = true;
+        m_ioThread = std::thread(&IpcBridge::IoWorkerLoop, this);
+    }
+}
+
+void IpcBridge::Shutdown(bool processTerminating) {
+    m_stopIo.store(true);
+    m_ioCv.notify_all();
+    if (!processTerminating) {
+        std::thread toJoin;
+        {
+            std::lock_guard<std::mutex> ioLock(m_ioMutex);
+            if (m_ioThread.joinable()) {
+                toJoin = std::move(m_ioThread);
+            }
+            m_ioStarted = false;
+        }
+        if (toJoin.joinable()) {
+            toJoin.join();
+        }
+    } else {
+        // 进程终止期间（DllMain DLL_PROCESS_DETACH reserved != nullptr）严禁 join 避免 Loader Lock 死锁
+        std::lock_guard<std::mutex> ioLock(m_ioMutex);
+        if (m_ioThread.joinable()) {
+            m_ioThread.detach();
+        }
+        m_ioStarted = false;
+    }
+}
+
+void IpcBridge::PollFromLua() {
+    // 全部轮询已迁移至后台异步线程 IoWorkerLoop，此处保持空实现，确保 Present 渲染线程零磁盘 I/O
 }
 
 bool IpcBridge::ReadFileIfChanged(const std::wstring& path, unsigned long long& lastMtime, std::string& outText) {
@@ -133,7 +187,7 @@ bool IpcBridge::AtomicWriteText(const std::wstring& path, const std::string& con
             return false;
         }
     }
-    // 使用 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH 确保跨线程/跨脚本不会读到未写完的半截文件
+    // 使用 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH 确保跨线程/跨脚本不会读到半截文件
     return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
@@ -145,33 +199,34 @@ bool IpcBridge::LoadConfigLocked() {
     }
     try {
         json j = json::parse(ifs);
-        ModConfig cfg;
+        auto cfg = std::make_shared<ModConfig>();
         // 对每个字段使用默认值兜底，确保旧版本升级后新增字段平滑兼容
-        cfg.stackEnabled = j.value("stackEnabled", cfg.stackEnabled);
-        cfg.stackMultiplier = j.value("stackMultiplier", cfg.stackMultiplier);
-        cfg.damageEnabled = j.value("damageEnabled", cfg.damageEnabled);
-        cfg.playerDamageMultiplier = j.value("playerDamageMultiplier", cfg.playerDamageMultiplier);
-        cfg.enemyDamageMultiplier = j.value("enemyDamageMultiplier", cfg.enemyDamageMultiplier);
-        cfg.harvestEnabled = j.value("harvestEnabled", cfg.harvestEnabled);
-        cfg.harvestMultiplier = j.value("harvestMultiplier", cfg.harvestMultiplier);
-        cfg.harvestAffectHauling = j.value("harvestAffectHauling", cfg.harvestAffectHauling);
-        cfg.harvestAffectPickup = j.value("harvestAffectPickup", cfg.harvestAffectPickup);
-        cfg.instantBuildEnabled = j.value("instantBuildEnabled", cfg.instantBuildEnabled);
-        cfg.freeCraftEnabled = j.value("freeCraftEnabled", cfg.freeCraftEnabled);
-        cfg.unlockAllRecipes = j.value("unlockAllRecipes", cfg.unlockAllRecipes);
-        cfg.keepInventoryOnDeath = j.value("keepInventoryOnDeath", cfg.keepInventoryOnDeath);
-        cfg.noDeathDurabilityPenalty = j.value("noDeathDurabilityPenalty", cfg.noDeathDurabilityPenalty);
-        cfg.showMilkMolars = j.value("showMilkMolars", cfg.showMilkMolars);
-        cfg.showMegaMilkMolars = j.value("showMegaMilkMolars", cfg.showMegaMilkMolars);
-        cfg.showScabColors = j.value("showScabColors", cfg.showScabColors);
-        cfg.showCollectedMolars = j.value("showCollectedMolars", cfg.showCollectedMolars);
-        cfg.showMapLabels = j.value("showMapLabels", cfg.showMapLabels);
-        cfg.showMapLegend = j.value("showMapLegend", cfg.showMapLegend);
-        cfg.mapIconScale = j.value("mapIconScale", cfg.mapIconScale);
+        cfg->stackEnabled = j.value("stackEnabled", cfg->stackEnabled);
+        cfg->stackMultiplier = j.value("stackMultiplier", cfg->stackMultiplier);
+        cfg->damageEnabled = j.value("damageEnabled", cfg->damageEnabled);
+        cfg->playerDamageMultiplier = j.value("playerDamageMultiplier", cfg->playerDamageMultiplier);
+        cfg->enemyDamageMultiplier = j.value("enemyDamageMultiplier", cfg->enemyDamageMultiplier);
+        cfg->harvestEnabled = j.value("harvestEnabled", cfg->harvestEnabled);
+        cfg->harvestMultiplier = j.value("harvestMultiplier", cfg->harvestMultiplier);
+        cfg->harvestAffectHauling = j.value("harvestAffectHauling", cfg->harvestAffectHauling);
+        cfg->harvestAffectPickup = j.value("harvestAffectPickup", cfg->harvestAffectPickup);
+        cfg->instantBuildEnabled = j.value("instantBuildEnabled", cfg->instantBuildEnabled);
+        cfg->freeCraftEnabled = j.value("freeCraftEnabled", cfg->freeCraftEnabled);
+        cfg->unlockAllRecipes = j.value("unlockAllRecipes", cfg->unlockAllRecipes);
+        cfg->keepInventoryOnDeath = j.value("keepInventoryOnDeath", cfg->keepInventoryOnDeath);
+        cfg->noDeathDurabilityPenalty = j.value("noDeathDurabilityPenalty", cfg->noDeathDurabilityPenalty);
+        cfg->showMilkMolars = j.value("showMilkMolars", cfg->showMilkMolars);
+        cfg->showMegaMilkMolars = j.value("showMegaMilkMolars", cfg->showMegaMilkMolars);
+        cfg->showScabColors = j.value("showScabColors", cfg->showScabColors);
+        cfg->showCollectedMolars = j.value("showCollectedMolars", cfg->showCollectedMolars);
+        cfg->showMapLabels = j.value("showMapLabels", cfg->showMapLabels);
+        cfg->showMapLegend = j.value("showMapLegend", cfg->showMapLegend);
+        cfg->mapIconScale = j.value("mapIconScale", cfg->mapIconScale);
+        cfg->imeCandidateMode = std::clamp(j.value("imeCandidateMode", cfg->imeCandidateMode), 0, 2);
         if (j.contains("trackedIds") && j["trackedIds"].is_array()) {
-            cfg.trackedIds = j["trackedIds"].get<std::vector<std::string>>();
+            cfg->trackedIds = j["trackedIds"].get<std::vector<std::string>>();
         }
-        m_config = std::move(cfg);
+        m_configSnap = std::move(cfg);
         return true;
     } catch (...) {
         return false;
@@ -179,79 +234,131 @@ bool IpcBridge::LoadConfigLocked() {
 }
 
 void IpcBridge::SaveConfig(const ModConfig& cfg) {
-    AtomicWriteText(m_dataDir + L"\\config.json", SerializeConfigJson(cfg).dump(2));
+    {
+        std::lock_guard<std::mutex> ioLock(m_ioMutex);
+        m_pendingConfigData = cfg;
+        m_pendingConfigSave = true;
+    }
+    m_ioCv.notify_one();
 }
 
 void IpcBridge::UpdateConfigAndSave(const ModConfig& cfg) {
+    auto snap = std::make_shared<ModConfig>(cfg);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_config = cfg;
+        m_configSnap = std::move(snap);
     }
     SaveConfig(cfg);
 }
 
 void IpcBridge::PushAction(const std::string& type, const std::string& payload, float x, float y, float z) {
-    int seq = 0;
+    PendingAction act;
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        seq = ++m_actionSeq;
+        std::lock_guard<std::mutex> ioLock(m_ioMutex);
+        act.seq = ++m_actionSeq;
+        act.type = type;
+        act.payload = payload;
+        act.x = x;
+        act.y = y;
+        act.z = z;
+        // 避免队列无限增长（保留最新 16 条即可）
+        if (m_pendingActions.size() >= 16) {
+            m_pendingActions.pop_front();
+        }
+        m_pendingActions.push_back(std::move(act));
     }
-    json j = {
-        {"seq", seq},
-        {"type", type},
-        {"payload", payload},
-        {"x", x},
-        {"y", y},
-        {"z", z},
-    };
-    AtomicWriteText(m_dataDir + L"\\actions.json", j.dump());
+    m_ioCv.notify_one();
 }
 
-void IpcBridge::PollFromLua() {
+void IpcBridge::FlushPendingWritesOnWorker() {
+    bool doConfig = false;
+    ModConfig cfgToWrite;
+    std::deque<PendingAction> actsToWrite;
+
+    {
+        std::lock_guard<std::mutex> ioLock(m_ioMutex);
+        if (m_pendingConfigSave) {
+            doConfig = true;
+            cfgToWrite = m_pendingConfigData;
+            m_pendingConfigSave = false;
+        }
+        if (!m_pendingActions.empty()) {
+            actsToWrite.swap(m_pendingActions);
+        }
+    }
+
+    if (doConfig && !m_dataDir.empty()) {
+        AtomicWriteText(m_dataDir + L"\\config.json", SerializeConfigJson(cfgToWrite).dump(2));
+    }
+
+    if (!actsToWrite.empty() && !m_dataDir.empty()) {
+        // 连续爆发推送时优先保留高优先级用户操作（如找回背包/放路标不被静默软刷新覆盖）
+        const PendingAction* chosen = &actsToWrite.back();
+        if (chosen->type == "refresh_catalog_soft" && actsToWrite.size() > 1) {
+            for (auto it = actsToWrite.rbegin(); it != actsToWrite.rend(); ++it) {
+                if (it->type != "refresh_catalog_soft") {
+                    chosen = &(*it);
+                    break;
+                }
+            }
+        }
+        json j = {
+            {"seq", chosen->seq},
+            {"type", chosen->type},
+            {"payload", chosen->payload},
+            {"x", chosen->x},
+            {"y", chosen->y},
+            {"z", chosen->z},
+        };
+        AtomicWriteText(m_dataDir + L"\\actions.json", j.dump());
+    }
+}
+
+void IpcBridge::PollFilesOnWorker() {
     if (m_dataDir.empty()) return;
     unsigned long long now = GetTickCount64();
 
-    // 高频通道：轮询 M 地图实时状态（约 40Hz 间隔，仅在文件修改时间戳变更时真正解析 JSON）
-    if (now - m_lastFastPollTick >= 25) {
+    // 高频通道（每 ~40ms）：仅在 map_live.json 修改时间戳变化时解析并替换不可变快照
+    if (now - m_lastFastPollTick >= 40) {
         m_lastFastPollTick = now;
         std::string txt;
         if (ReadFileIfChanged(m_dataDir + L"\\map_live.json", m_mapLiveMtime, txt)) {
             try {
                 json j = json::parse(txt);
-                MapLiveState st;
-                st.mapOpen = j.value("mapOpen", false);
-                st.hasTransform = j.value("hasTransform", false);
-                st.vpW = j.value("vpW", 0.0f);
-                st.vpH = j.value("vpH", 0.0f);
-                st.clipX0 = j.value("clipX0", 0.0f);
-                st.clipY0 = j.value("clipY0", 0.0f);
-                st.clipX1 = j.value("clipX1", 0.0f);
-                st.clipY1 = j.value("clipY1", 0.0f);
-                st.p0x = j.value("p0x", 0.0f);
-                st.p0y = j.value("p0y", 0.0f);
-                st.pxx = j.value("pxx", 0.0f);
-                st.pxy = j.value("pxy", 0.0f);
-                st.pyx = j.value("pyx", 0.0f);
-                st.pyy = j.value("pyy", 0.0f);
-                st.panelAddr = ParseAddrField(j, "panelAddr");
-                st.canvasAddr = ParseAddrField(j, "canvasAddr");
-                st.fallbackCanvasAddr = ParseAddrField(j, "fallbackCanvasAddr");
-                st.borderAddr = ParseAddrField(j, "borderAddr");
-                st.rootWinAddr = ParseAddrField(j, "rootWinAddr");
-                st.playerIconAddr = ParseAddrField(j, "playerIconAddr");
-                st.minBoundsX = j.value("minBoundsX", 0.0f);
-                st.minBoundsY = j.value("minBoundsY", 0.0f);
-                st.maxBoundsX = j.value("maxBoundsX", 0.0f);
-                st.maxBoundsY = j.value("maxBoundsY", 0.0f);
-                st.texSizeX = j.value("texSizeX", 0.0f);
-                st.texSizeY = j.value("texSizeY", 0.0f);
-                st.hasPlayerPos = j.value("hasPlayerPos", false);
-                st.playerX = j.value("playerX", 0.0f);
-                st.playerY = j.value("playerY", 0.0f);
-                st.playerZ = j.value("playerZ", 0.0f);
+                auto st = std::make_shared<MapLiveState>();
+                st->mapOpen = j.value("mapOpen", false);
+                st->hasTransform = j.value("hasTransform", false);
+                st->vpW = j.value("vpW", 0.0f);
+                st->vpH = j.value("vpH", 0.0f);
+                st->clipX0 = j.value("clipX0", 0.0f);
+                st->clipY0 = j.value("clipY0", 0.0f);
+                st->clipX1 = j.value("clipX1", 0.0f);
+                st->clipY1 = j.value("clipY1", 0.0f);
+                st->p0x = j.value("p0x", 0.0f);
+                st->p0y = j.value("p0y", 0.0f);
+                st->pxx = j.value("pxx", 0.0f);
+                st->pxy = j.value("pxy", 0.0f);
+                st->pyx = j.value("pyx", 0.0f);
+                st->pyy = j.value("pyy", 0.0f);
+                st->panelAddr = ParseAddrField(j, "panelAddr");
+                st->canvasAddr = ParseAddrField(j, "canvasAddr");
+                st->fallbackCanvasAddr = ParseAddrField(j, "fallbackCanvasAddr");
+                st->borderAddr = ParseAddrField(j, "borderAddr");
+                st->rootWinAddr = ParseAddrField(j, "rootWinAddr");
+                st->playerIconAddr = ParseAddrField(j, "playerIconAddr");
+                st->minBoundsX = j.value("minBoundsX", 0.0f);
+                st->minBoundsY = j.value("minBoundsY", 0.0f);
+                st->maxBoundsX = j.value("maxBoundsX", 0.0f);
+                st->maxBoundsY = j.value("maxBoundsY", 0.0f);
+                st->texSizeX = j.value("texSizeX", 0.0f);
+                st->texSizeY = j.value("texSizeY", 0.0f);
+                st->hasPlayerPos = j.value("hasPlayerPos", false);
+                st->playerX = j.value("playerX", 0.0f);
+                st->playerY = j.value("playerY", 0.0f);
+                st->playerZ = j.value("playerZ", 0.0f);
 
                 if (j.contains("pins") && j["pins"].is_array()) {
-                    st.pins.reserve(j["pins"].size());
+                    st->pins.reserve(j["pins"].size());
                     for (const auto& item : j["pins"]) {
                         MapPin pin;
                         pin.id = item.value("id", "");
@@ -262,53 +369,59 @@ void IpcBridge::PollFromLua() {
                         pin.wz = item.value("z", 0.0f);
                         pin.colorIndex = item.value("c", 0);
                         pin.collected = item.value("col", false);
-                        st.pins.push_back(std::move(pin));
+                        st->pins.push_back(std::move(pin));
                     }
                 }
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_mapLive = std::move(st);
+                bool isOpen = st->mapOpen;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_mapLiveSnap = std::move(st);
+                }
+                m_mapOpenFast.store(isOpen, std::memory_order_relaxed);
             } catch (...) {
-                // 忽略偶发文件替换瞬间的读取竞争，下一轮心跳会自动重试
+                // 忽略偶发文件替换瞬间的读取竞争，下轮自动重试
+                m_mapLiveMtime = 0;
             }
         }
     }
 
-    // 低频通道：轮询运行时状态摘要与全图资源目录（约 2Hz）
-    if (now - m_lastSlowPollTick >= 450) {
+    // 低频通道（每 ~350ms）：仅在 status.json 或 catalog.json 变更时解析并替换不可变快照
+    if (now - m_lastSlowPollTick >= 350) {
         m_lastSlowPollTick = now;
         std::string txt;
         if (ReadFileIfChanged(m_dataDir + L"\\status.json", m_statusMtime, txt)) {
             try {
                 json j = json::parse(txt);
-                RuntimeStatus rs;
-                rs.inWorld = j.value("inWorld", false);
-                rs.isHost = j.value("isHost", true);
-                rs.difficulty = j.value("difficulty", "未知");
-                rs.livePlayerDamage = j.value("livePlayerDamage", 1.0f);
-                rs.liveEnemyDamage = j.value("liveEnemyDamage", 1.0f);
-                rs.liveKeepInventoryOnDeath = j.value("liveKeepInventoryOnDeath", false);
-                rs.liveNoDeathDurabilityPenalty = j.value("liveNoDeathDurabilityPenalty", false);
-                rs.uncollectedMilkMolars = j.value("uncollectedMilkMolars", 0);
-                rs.uncollectedMegaMolars = j.value("uncollectedMegaMolars", 0);
-                rs.totalMilkMolars = j.value("totalMilkMolars", 0);
-                rs.totalMegaMolars = j.value("totalMegaMolars", 0);
-                rs.catalogCount = j.value("catalogCount", 0);
-                rs.lootCompCount = j.value("lootCompCount", 0);
-                rs.stackSummary = j.value("stackSummary", "");
-                rs.surveyedItemName = j.value("surveyedItemName", "");
-                rs.lastMessage = j.value("lastMessage", "");
+                auto rs = std::make_shared<RuntimeStatus>();
+                rs->inWorld = j.value("inWorld", false);
+                rs->isHost = j.value("isHost", true);
+                rs->difficulty = j.value("difficulty", "未知");
+                rs->livePlayerDamage = j.value("livePlayerDamage", 1.0f);
+                rs->liveEnemyDamage = j.value("liveEnemyDamage", 1.0f);
+                rs->liveKeepInventoryOnDeath = j.value("liveKeepInventoryOnDeath", false);
+                rs->liveNoDeathDurabilityPenalty = j.value("liveNoDeathDurabilityPenalty", false);
+                rs->uncollectedMilkMolars = j.value("uncollectedMilkMolars", 0);
+                rs->uncollectedMegaMolars = j.value("uncollectedMegaMolars", 0);
+                rs->totalMilkMolars = j.value("totalMilkMolars", 0);
+                rs->totalMegaMolars = j.value("totalMegaMolars", 0);
+                rs->catalogCount = j.value("catalogCount", 0);
+                rs->lootCompCount = j.value("lootCompCount", 0);
+                rs->stackSummary = j.value("stackSummary", "");
+                rs->surveyedItemName = j.value("surveyedItemName", "");
+                rs->lastMessage = j.value("lastMessage", "");
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_status = std::move(rs);
+                m_statusSnap = std::move(rs);
             } catch (...) {
+                m_statusMtime = 0;
             }
         }
 
         if (ReadFileIfChanged(m_dataDir + L"\\catalog.json", m_catalogMtime, txt)) {
             try {
                 json j = json::parse(txt);
-                std::vector<CatalogEntry> list;
+                auto list = std::make_shared<std::vector<CatalogEntry>>();
                 if (j.is_array()) {
-                    list.reserve(j.size());
+                    list->reserve(j.size());
                     for (const auto& item : j) {
                         CatalogEntry e;
                         e.id = item.value("id", "");
@@ -319,36 +432,70 @@ void IpcBridge::PollFromLua() {
                         e.surveyable = item.value("surveyable", false);
                         e.rowName = item.value("rowName", "");
                         if (!e.id.empty()) {
-                            list.push_back(std::move(e));
+                            list->push_back(std::move(e));
                         }
                     }
                 }
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_catalog = std::move(list);
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_catalogSnap = std::move(list);
+                }
+                m_lastCatalogUpdateTick.store(GetTickCount64(), std::memory_order_relaxed);
             } catch (...) {
+                m_catalogMtime = 0;
             }
         }
     }
 }
 
-ModConfig IpcBridge::GetConfigCopy() {
+void IpcBridge::IoWorkerLoop() {
+    while (!m_stopIo.load()) {
+        FlushPendingWritesOnWorker();
+        PollFilesOnWorker();
+
+        std::unique_lock<std::mutex> ioLock(m_ioMutex);
+        m_ioCv.wait_for(ioLock, std::chrono::milliseconds(40), [this]() {
+            return m_stopIo.load() || m_pendingConfigSave || !m_pendingActions.empty();
+        });
+    }
+    // 退出前尽量把最后一笔未落盘配置写出
+    FlushPendingWritesOnWorker();
+}
+
+std::shared_ptr<const ModConfig> IpcBridge::GetConfigSnapshot() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_config;
+    return m_configSnap;
+}
+
+std::shared_ptr<const std::vector<CatalogEntry>> IpcBridge::GetCatalogSnapshot() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_catalogSnap;
+}
+
+std::shared_ptr<const MapLiveState> IpcBridge::GetMapLiveSnapshot() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_mapLiveSnap;
+}
+
+std::shared_ptr<const RuntimeStatus> IpcBridge::GetStatusSnapshot() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_statusSnap;
+}
+
+ModConfig IpcBridge::GetConfigCopy() {
+    return *GetConfigSnapshot();
 }
 
 std::vector<CatalogEntry> IpcBridge::GetCatalogCopy() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_catalog;
+    return *GetCatalogSnapshot();
 }
 
 MapLiveState IpcBridge::GetMapLiveCopy() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_mapLive;
+    return *GetMapLiveSnapshot();
 }
 
 RuntimeStatus IpcBridge::GetStatusCopy() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_status;
+    return *GetStatusSnapshot();
 }
 
 } // namespace gqol

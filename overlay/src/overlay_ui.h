@@ -1,6 +1,6 @@
 /*
  * 文件：overlay/src/overlay_ui.h
- * 职责：声明 Dear ImGui 悬浮层的主题字体初始化、每帧渲染入口与 M 地图快捷键处理接口。
+ * 职责：声明 Dear ImGui 悬浮层的主题字体初始化、每帧渲染入口、空闲态重置与 M 地图快捷键处理接口。
  */
 
 #pragma once
@@ -9,11 +9,14 @@
 
 namespace gqol {
 
-/// 配置 ImGui 深色主题样式并按当前分辨率缩放（自动加载微软雅黑/黑体/宋体以支持全简体中文渲染）。
+/// 配置 ImGui 深色主题样式并按当前分辨率缩放（加载系统完整中文字库，1x1 像素对齐采样减少 75% 显存与构建耗时）。
 void InitOverlayStyleAndFonts(float uiScale);
 
-/// 在 DX12/DX11 Present 回调中渲染 Mod 中文悬浮菜单与 “M” 地图追踪叠加层。
+/// 在 DX12/DX11 Present 回调中渲染 Mod 中文悬浮菜单、内置自绘输入法候选条与 “M” 地图追踪叠加层。
 void RenderOverlayFrame(bool& menuOpen, float uiScale);
+
+/// 空闲零开销直通帧时快速重置 M 地图渲染计数与悬停状态（无堆分配）。
+void ResetOverlayIdleState();
 
 /// 在 M 地图打开且菜单关闭时，处理快捷放置原版路标热键（悬停标点按 G 键或 Ctrl+左键）。
 bool HandleMapQuickShortcut(UINT msg, WPARAM wParam, LPARAM lParam);

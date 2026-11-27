@@ -4,8 +4,9 @@
  * 线程与加载约束：
  *   - Windows Loader Lock 期间禁止直接加载 D3D/DXGI 模块或安装 MinHook 钩子，
  *     因此 DllMain(DLL_PROCESS_ATTACH) 仅拉起独立后台线程 InitThreadProc 执行初始化。
+ *   - DLL_PROCESS_DETACH 时根据 reserved 区分显式 FreeLibrary 与进程退出，防止进程退出阶段 join 线程死锁。
  *   - GroundedQoL_Bootstrap 供 UE4SS Lua 通过 package.loadlib 触发加载；
- *     GroundedQoL_QueryTestState 供离线自动化回归测试宿主查询后端与渲染状态。
+ *     GroundedQoL_QueryTestState 与辅助测试导出符号供离线自动化回归测试验证全部业务规则。
  */
 
 #include "dx11_hook.h"
@@ -30,7 +31,7 @@ std::wstring GetDllDirectory(HMODULE mod) {
     return (pos == std::wstring::npos) ? L"." : full.substr(0, pos);
 }
 
-/// 独立初始化线程：脱离 Windows Loader Lock 后初始化 IPC、重置当次日志并安装 DX12/DX11 钩子。
+/// 独立初始化线程：脱离 Windows Loader Lock 后初始化异步 IPC、重置当次日志并安装 DX12/DX11 钩子。
 DWORD WINAPI InitThreadProc(LPVOID) {
     std::wstring dir = GetDllDirectory(g_selfModule);
     gqol::IpcBridge::Instance().Initialize(dir);
@@ -49,19 +50,50 @@ extern "C" __declspec(dllexport) int __cdecl GroundedQoL_Bootstrap(void*) {
 }
 
 /// 供自动化回归测试查询当前激活图形后端与渲染状态的位掩码导出函数。
-/// 位定义：bit0=DX12 已激活, bit1=DX11 已激活, bit2=菜单已打开, bit3=M 地图本帧已绘制有效标点。
+/// 位定义：
+///   bit0 = DX12 已激活
+///   bit1 = DX11 已激活
+///   bit2 = 菜单已打开
+///   bit3 = M 地图本帧已绘制有效标点
+///   bit4 = 最近一帧走了空闲零开销直通路径（跳过 DX12/DX11 提交）
+///   bit5 = 当前窗口线程 IME 已启用
+///   bit6 = 当前处于中文输入法组词中
+///   bit7 = 当前自绘候选条模式生效
 extern "C" __declspec(dllexport) int __cdecl GroundedQoL_QueryTestState() {
     int flags = 0;
     const char* api = gqol::GetActiveGraphicsBackend();
-    if (api && api[0] == 'D' && api[2] == '1' && api[3] == '2') flags |= 1; // DX12
-    if (api && api[0] == 'D' && api[2] == '1' && api[3] == '1') flags |= 2; // DX11
-    if (gqol::IsMenuOpen()) flags |= 4;
-    if (gqol::GetLastRenderedMapPinCount() > 0) flags |= 8;
+    if (api && api[0] == 'D' && api[2] == '1' && api[3] == '2') flags |= (1 << 0);
+    if (api && api[0] == 'D' && api[2] == '1' && api[3] == '1') flags |= (1 << 1);
+    if (gqol::IsMenuOpen()) flags |= (1 << 2);
+    if (gqol::GetLastRenderedMapPinCount() > 0) flags |= (1 << 3);
+    if (gqol::WasLastFrameIdlePassThrough()) flags |= (1 << 4);
+    auto ime = gqol::GetImeCandidateState();
+    if (ime.active) flags |= (1 << 5);
+    if (ime.composing) flags |= (1 << 6);
+    if (ime.useSelfDrawnUi) flags |= (1 << 7);
     return flags;
 }
 
-/// DLL 生命周期入口：Attach 时保证只拉起一次初始化线程，Detach 时安全卸载图形钩子。
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
+/// 供自动化回归测试读取运行期统计指标（空闲直通帧数、完整渲染帧数、自定义测试辅助）。
+extern "C" __declspec(dllexport) void __cdecl GroundedQoL_QueryTestMetrics(
+    unsigned long long* outIdleFrames,
+    unsigned long long* outRenderedFrames,
+    int* outImeCharCount) {
+    gqol::GetTestMetrics(outIdleFrames, outRenderedFrames, outImeCharCount);
+}
+
+/// 供自动化回归测试强制跳过开场 10 秒提示条，以即时验证空闲零开销直通路径。
+extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestExpireStartupBanner() {
+    gqol::ForceExpireStartupBannerForTest();
+}
+
+/// 供自动化回归测试直接驱动输入框获焦态以验证窗口线程 IME 激活与还原行为。
+extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestSetWantTextInput(int want, float x, float y) {
+    gqol::ForceWantTextInputForTest(want != 0, x, y);
+}
+
+/// DLL 生命周期入口：Attach 时保证只拉起一次初始化线程，Detach 时安全卸载图形钩子与异步 IPC 线程。
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         g_selfModule = hModule;
@@ -72,7 +104,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
             }
         }
     } else if (reason == DLL_PROCESS_DETACH) {
-        gqol::UninstallGraphicsHook();
+        const bool processTerminating = (reserved != nullptr);
+        gqol::UninstallGraphicsHook(processTerminating);
+        gqol::IpcBridge::Instance().Shutdown(processTerminating);
     }
     return TRUE;
 }

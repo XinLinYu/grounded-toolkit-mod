@@ -1,20 +1,28 @@
 /*
  * 文件：overlay/src/ipc.h
- * 职责：定义 C++ 悬浮层与 UE4SS Lua 逻辑层之间基于原子 JSON 文件通信的数据结构与桥接类。
+ * 职责：定义 C++ 悬浮层与 UE4SS Lua 逻辑层之间基于原子 JSON 文件通信的数据结构与异步桥接类。
+ * 架构说明（见 ADR-0004）：
+ *   - 全部磁盘轮询（map_live / status / catalog）与原子写盘（config / actions）均在独立后台 I/O 线程执行，
+ *     彻底消除 DX12/DX11 Present 渲染线程与 WndProc 窗口线程上的文件 I/O 与 JSON 解析卡顿。
+ *   - 渲染线程通过 std::shared_ptr<const ...> 获取不可变只读快照（O(1) 零拷贝）与 atomic 地图开启标志。
  * 通信约定（位于 GroundedQoL/data/ 目录）：
- *   - config.json   : C++ 写 / Lua 读，保存全部可持久化开关与追踪列表
- *   - actions.json  : C++ 写 / Lua 消费后删除，传递带递增序列号的一次性指令（如找回背包、放路标）
+ *   - config.json   : C++ 写 / Lua 读，保存全部可持久化开关、输入法候选模式与追踪列表
+ *   - actions.json  : C++ 写 / Lua 消费后删除，传递带递增序列号的一次性指令
  *   - status.json   : Lua 写 / C++ 读，上报当前存档/房主权限/实时倍率与死亡保护状态
  *   - catalog.json  : Lua 写 / C++ 读，上报全图资源与生物目录
- *   - map_live.json : Lua 写 / C++ 读，M 地图打开时高频上报控件指针、地图边界与标点列表
+ *   - map_live.json : Lua 写 / C++ 读，M 地图打开时上报控件指针、地图边界与标点列表
  */
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_set>
+#include <thread>
 #include <vector>
 
 namespace gqol {
@@ -54,18 +62,24 @@ struct ModConfig {
     bool showMapLegend = true;
     float mapIconScale = 1.0f;
 
+    // 7. 中文输入法候选框显示模式（见 ADR-0003）
+    //    0 = 自动（无边框/窗口走系统原生，独占全屏自动降级 ImGui 自绘）
+    //    1 = 强制系统原生候选框
+    //    2 = 强制内置自绘候选条
+    int imeCandidateMode = 0;
+
     std::vector<std::string> trackedIds;    ///< 用户勾选的自由追踪条目 ID 列表
 };
 
 /// 单个可追踪条目（物品、资源、采集点、生物或特殊收集品）。
 struct CatalogEntry {
-    std::string id;        ///< 唯一键，如 item:MintChunk / node:BP_Rock_Clay_C / creature:BP_Spider_Wolf_C
-    std::string name;      ///< 官方简体中文显示名
-    std::string rawName;   ///< 内部英文 RowName 或蓝图类名，支持中英双语检索
-    std::string category;  ///< 分类：collectible / item / node / creature / survey / special
-    int count = 0;         ///< 世界中当前检测到的存活实例数量
+    std::string id;          ///< 唯一键，如 item:MintChunk / node:BP_Rock_Clay_C / creature:BP_Spider_Wolf_C
+    std::string name;        ///< 官方简体中文显示名
+    std::string rawName;     ///< 内部英文 RowName 或蓝图类名，支持中英双语检索
+    std::string category;    ///< 分类：collectible / item / node / creature / survey / special
+    int count = 0;           ///< 世界中当前检测到的存活实例数量
     bool surveyable = false; ///< 是否可联动游戏原版资源扫描仪热区
-    std::string rowName;   ///< 对应 AllItemsTable 的 RowName（供原版扫描仪使用）
+    std::string rowName;     ///< 对应 AllItemsTable 的 RowName（供原版扫描仪使用）
 };
 
 /// M 地图实时渲染用的单个标点。
@@ -80,7 +94,7 @@ struct MapPin {
     bool collected = false;
 };
 
-/// M 地图屏幕投影与实时状态（Lua 仅在 M 地图打开时高频更新）。
+/// M 地图屏幕投影与实时状态（Lua 仅在 M 地图打开时更新）。
 struct MapLiveState {
     bool mapOpen = false;
     bool hasTransform = false;
@@ -119,12 +133,12 @@ struct MapLiveState {
 
 /// Lua 端上报的运行时状态摘要，用于菜单顶部状态栏与权限控制展示。
 struct RuntimeStatus {
-    bool inWorld = false;                   ///< 是否已进入可游玩存档
-    bool isHost = true;                     ///< 是否具备房主权威（客机为 false）
-    std::string difficulty = "未知";        ///< 当前存档难度显示名
-    float livePlayerDamage = 1.0f;          ///< 游戏内实时生效的玩家伤害倍率
-    float liveEnemyDamage = 1.0f;           ///< 游戏内实时生效的怪物伤害倍率
-    bool liveKeepInventoryOnDeath = false;  ///< 游戏内实时生效的死亡背包保留状态
+    bool inWorld = false;                      ///< 是否已进入可游玩存档
+    bool isHost = true;                        ///< 是否具备房主权威（客机为 false）
+    std::string difficulty = "未知";            ///< 当前存档难度显示名
+    float livePlayerDamage = 1.0f;             ///< 游戏内实时生效的玩家伤害倍率
+    float liveEnemyDamage = 1.0f;              ///< 游戏内实时生效的怪物伤害倍率
+    bool liveKeepInventoryOnDeath = false;     ///< 游戏内实时生效的死亡背包保留状态
     bool liveNoDeathDurabilityPenalty = false; ///< 游戏内实时生效的死亡耐久惩罚免除状态
     int uncollectedMilkMolars = 0;
     int uncollectedMegaMolars = 0;
@@ -137,61 +151,94 @@ struct RuntimeStatus {
     std::string lastMessage;
 };
 
-/// 线程安全的单例 IPC 桥接器：在图形渲染线程、WndProc 回调与后台初始化线程间共享快照。
+/// 线程安全的异步单例 IPC 桥接器：所有文件 I/O 均由后台线程承担，渲染线程零阻塞只读共享快照。
 class IpcBridge {
 public:
     static IpcBridge& Instance();
 
-    /// 根据当前 DLL 所在目录初始化 data/ 通信目录并加载已有配置（首次启动自动写出默认 config.json）。
+    /// 初始化 data/ 通信目录、加载/写出 config.json，并启动后台异步 I/O 轮询与写盘线程。
     void Initialize(const std::wstring& dllDirectory);
 
-    /// 在 Present 帧内按高低频节流轮询来自 Lua 的 map_live / status / catalog 文件更新。
+    /// 停止后台 I/O 线程（processTerminating=true 时禁止 join，防止 DllMain 进程退出死锁）。
+    void Shutdown(bool processTerminating = false);
+
+    /// 兼容旧调用点：所有轮询已移至后台线程，此处仅做零开销空操作。
     void PollFromLua();
 
-    /// 将指定配置原子写入 data/config.json，供 Lua 立即读取并持久化。
+    /// 将指定配置入队交由后台线程原子写入 data/config.json。
     void SaveConfig(const ModConfig& cfg);
 
-    /// 向 data/actions.json 推送带递增序列号的一次性操作指令（如找回背包、放置路标、解锁扫描仪等）。
+    /// 立即更新内存配置快照，并唤醒后台线程原子落盘（非阻塞）。
+    void UpdateConfigAndSave(const ModConfig& cfg);
+
+    /// 异步向 data/actions.json 推送带递增序列号的一次性操作指令（非阻塞）。
     void PushAction(const std::string& type, const std::string& payload = "",
                     float x = 0.0f, float y = 0.0f, float z = 0.0f);
 
-    /// 获取当前内存配置的线程安全拷贝。
+    /// 无锁快速查询当前 M 地图是否打开（供 Present 空闲零开销直通路径使用）。
+    bool IsMapOpenFast() const { return m_mapOpenFast.load(std::memory_order_relaxed); }
+
+    /// 获取最近一次 catalog.json 更新的 GetTickCount64 时间戳（用于菜单打开 5 秒软刷新防抖）。
+    unsigned long long GetLastCatalogUpdateTick() const {
+        return m_lastCatalogUpdateTick.load(std::memory_order_relaxed);
+    }
+
+    /// 获取不可变共享快照（O(1) 零拷贝，供渲染线程每帧安全读取）。
+    std::shared_ptr<const ModConfig> GetConfigSnapshot();
+    std::shared_ptr<const std::vector<CatalogEntry>> GetCatalogSnapshot();
+    std::shared_ptr<const MapLiveState> GetMapLiveSnapshot();
+    std::shared_ptr<const RuntimeStatus> GetStatusSnapshot();
+
+    /// 兼容接口：返回快照值拷贝。
     ModConfig GetConfigCopy();
-
-    /// 更新内存配置并立即原子落盘。
-    void UpdateConfigAndSave(const ModConfig& cfg);
-
-    /// 获取全图资源目录快照。
     std::vector<CatalogEntry> GetCatalogCopy();
-
-    /// 获取 M 地图实时渲染状态快照。
     MapLiveState GetMapLiveCopy();
-
-    /// 获取 Lua 端上报的运行时状态快照。
     RuntimeStatus GetStatusCopy();
 
     /// 返回 data/ 通信目录的绝对宽字符路径。
     std::wstring GetDataDir() const { return m_dataDir; }
 
 private:
-    IpcBridge() = default;
+    struct PendingAction {
+        int seq = 0;
+        std::string type;
+        std::string payload;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+    };
 
-    /// 在持有 m_mutex 的前提下从 data/config.json 加载配置。
+    IpcBridge();
+    ~IpcBridge();
+
+    void IoWorkerLoop();
+    void PollFilesOnWorker();
+    void FlushPendingWritesOnWorker();
+
     bool LoadConfigLocked();
-
-    /// 仅当目标文件修改时间戳（FILETIME）发生变化时重新读取完整文本，减少无意义磁盘 I/O。
     bool ReadFileIfChanged(const std::wstring& path, unsigned long long& lastMtime, std::string& outText);
-
-    /// 通过写 .tmp 临时文件 + MoveFileExW(REPLACE_EXISTING) 原子替换目标文件。
     bool AtomicWriteText(const std::wstring& path, const std::string& content);
 
     std::wstring m_dataDir;
     std::mutex m_mutex;
 
-    ModConfig m_config;
-    std::vector<CatalogEntry> m_catalog;
-    MapLiveState m_mapLive;
-    RuntimeStatus m_status;
+    std::shared_ptr<const ModConfig> m_configSnap;
+    std::shared_ptr<const std::vector<CatalogEntry>> m_catalogSnap;
+    std::shared_ptr<const MapLiveState> m_mapLiveSnap;
+    std::shared_ptr<const RuntimeStatus> m_statusSnap;
+
+    std::atomic<bool> m_mapOpenFast{false};
+    std::atomic<unsigned long long> m_lastCatalogUpdateTick{0};
+
+    // 后台 I/O 线程状态与待落盘队列
+    std::mutex m_ioMutex;
+    std::condition_variable m_ioCv;
+    std::thread m_ioThread;
+    std::atomic<bool> m_stopIo{false};
+    bool m_ioStarted = false;
+    bool m_pendingConfigSave = false;
+    ModConfig m_pendingConfigData;
+    std::deque<PendingAction> m_pendingActions;
 
     unsigned long long m_catalogMtime = 0;
     unsigned long long m_mapLiveMtime = 0;

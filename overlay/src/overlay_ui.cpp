@@ -1,11 +1,13 @@
 /*
  * 文件：overlay/src/overlay_ui.cpp
- * 职责：实现 GroundedQoL 游戏内中文悬浮菜单（倍率/免材/死亡保护与背包找回/M 地图追踪/联机说明）
- *       以及 “M” 大地图零延迟实时标点投影层。
+ * 职责：实现 GroundedQoL 游戏内中文悬浮菜单（倍率/免材/死亡保护与背包找回/M 地图追踪/输入法模式与联机说明）、
+ *       独占全屏/手动降级下的 ImGui 内置自绘中文输入法候选条，以及 “M” 大地图零延迟实时标点投影层。
  * 关键技术说明：
- *   - 为消除 Lua 轮询带来的拖拽滞后，本文件通过纯 SEH 保护函数直接读取 UE 4.27 UWidget -> SWidget
- *     内存中的 56 字节 FGeometry 变换矩阵，以游戏原生 60~144Hz 帧率完成世界坐标到屏幕像素的零误差投影。
- *   - 菜单状态通过 IpcBridge 与 Lua 逻辑层解耦；死亡保护与一键找回背包严格遵循房主权威约束（客机端灰显禁用）。
+ *   - 渲染帧通过 IpcBridge::Get*Snapshot() 零拷贝读取不可变快照，配合无分配子串匹配与 ImGuiListClipper，
+ *     显著降低大列表与数百地图标点渲染时的 CPU 开销（见 ADR-0004）。
+ *   - 菜单关闭时 M 地图悬停改为被动只读 GetCursorPos + ScreenToClient，完全不依赖 ImGui WndProc 输入接管。
+ *   - 当命中自绘候选条模式（独占全屏自动降级或手动指定）且输入法处于组词中时，在聚焦输入框正下方悬浮绘制
+ *     拼音组词与横向编号候选字，边缘自动上翻，支持键盘原版选词与可用时的鼠标点击上屏（见 ADR-0003）。
  */
 
 #include "overlay_ui.h"
@@ -20,8 +22,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
-#include <unordered_map>
+#include <string>
+#include <string_view>
 #include <unordered_set>
+#include <vector>
 
 namespace gqol {
 
@@ -31,13 +35,7 @@ std::atomic<int> g_lastRenderedPinCount{0};
 bool g_prevMapOpenLogged = false;
 bool g_loggedNativeTransformForCurrentOpen = false;
 
-// UE 4.27 FGeometry 精确二进制布局（0x38 字节，已通过 Maine-Win64-Shipping.exe 反汇编实机验证）：
-// - UWidget::GetCachedWidget: MyWidget=(+0xF0 SWidget*, +0xF8 RefCtrl*), MyGCWidget=(+0xE0, +0xE8)
-// - SWidget::GetCachedGeometry: +0xD0 -> FGeometry
-// - USlateBlueprintLibrary::GetLocalSize: +0x00 SizeX, +0x04 SizeY
-// - USlateBlueprintLibrary::LocalToAbsolute:
-//     absX = localX * m00(+0x1C) + localY * m10(+0x24) + transX(+0x2C)
-//     absY = localX * m01(+0x20) + localY * m11(+0x28) + transY(+0x30)
+// UE 4.27 FGeometry 精确二进制布局（0x38 字节，已通过 Maine-Win64-Shipping.exe 反汇编实机验证）
 struct UeFGeometry {
     float sizeX;
     float sizeY;
@@ -57,12 +55,11 @@ struct UeFGeometry {
 };
 static_assert(sizeof(UeFGeometry) == 0x38, "UeFGeometry must match UE 4.27 0x38 byte size");
 
-/// 粗筛合法的 Windows x64 用户态 8 字节对齐指针，拦截空指针/内核态/明显野指针后再进入 SEH 解引用。
 inline bool IsLikelyUserPtr(uintptr_t p) {
     return p >= 0x0000000000010000ULL && p < 0x00007FFFFFFFFFFFULL && ((p & 0x7ULL) == 0);
 }
 
-/// 纯 SEH 保护函数：从 UWidget* 内存安全读取对应 SWidget 的 56 字节 FGeometry（不使用需要栈展开的 C++ 对象）。
+/// 纯 SEH 保护函数：从 UWidget* 内存安全读取对应 SWidget 的 56 字节 FGeometry。
 bool CopyUWidgetGeometryRawSEH(uintptr_t uwidgetAddr, UeFGeometry* outGeom) {
     if (!IsLikelyUserPtr(uwidgetAddr) || !outGeom) return false;
     __try {
@@ -100,7 +97,6 @@ bool CopyUWidgetGeometryRawSEH(uintptr_t uwidgetAddr, UeFGeometry* outGeom) {
     }
 }
 
-/// 读取并校验 UWidget 的 Slate FGeometry（验证浮点合法性与非奇异仿射矩阵）。
 bool TryReadUWidgetGeometry(uint64_t uwidgetAddr, UeFGeometry& outGeom) {
     if (uwidgetAddr == 0) return false;
     UeFGeometry g{};
@@ -124,7 +120,6 @@ bool TryReadUWidgetGeometry(uint64_t uwidgetAddr, UeFGeometry& outGeom) {
     return true;
 }
 
-/// 纯 SEH 兜底读取 UMapPanelWidget 的 MaxBounds(+0x3A0)、MinBounds(+0x3A8)、TextureSize(+0x3B0)。
 bool TryReadMapPanelBoundsSEH(uint64_t panelAddr,
                               float* outMinX, float* outMinY,
                               float* outMaxX, float* outMaxY,
@@ -145,24 +140,20 @@ bool TryReadMapPanelBoundsSEH(uint64_t panelAddr,
     }
 }
 
-/// 严格按 USlateBlueprintLibrary::LocalToAbsolute 机器码实现本地坐标到桌面绝对像素的转换。
 inline ImVec2 SlateLocalToAbsolute(const UeFGeometry& g, float lx, float ly) {
     return ImVec2(lx * g.m00 + ly * g.m10 + g.transX,
                   lx * g.m01 + ly * g.m11 + g.transY);
 }
 
-/// 实时解析后的 M 地图世界坐标 -> ImGui 屏幕像素坐标投影上下文。
 struct ResolvedMapProjection {
     bool valid = false;
     bool usingNativeSlate = false;
     ImVec2 clipMin{0.0f, 0.0f};
     ImVec2 clipMax{0.0f, 0.0f};
 
-    // 统一仿射映射：screenX = ax * wx + bx * wy + cx; screenY = ay * wx + by * wy + cy
     float ax = 0.0f, bx = 0.0f, cx = 0.0f;
     float ay = 0.0f, by = 0.0f, cy = 0.0f;
 
-    // 诊断用字段
     UeFGeometry cGeom{};
     ImVec2 vpAbsMin{0.0f, 0.0f};
     ImVec2 vpAbsSize{1.0f, 1.0f};
@@ -178,13 +169,12 @@ struct ResolvedMapProjection {
     }
 };
 
-/// 结合原生 Slate FGeometry（优先，零延迟 60~144Hz）与 Lua 仿射参数（兜底/测试），构造本帧地图投影器。
 ResolvedMapProjection BuildMapProjection(const MapLiveState& m, const ImVec2& disp) {
     ResolvedMapProjection proj;
     proj.clipMin = ImVec2(0.0f, 0.0f);
     proj.clipMax = disp;
 
-    // 路径 A：优先直接从 Grounded 进程内存读取 CollectibleCanvas / MapBorder / RootWindow 的实时 FGeometry
+    // 路径 A：直接从 Grounded 进程内存读取 CollectibleCanvas / MapBorder / RootWindow 的实时 FGeometry
     if (m.canvasAddr != 0 || m.fallbackCanvasAddr != 0) {
         UeFGeometry cGeom{};
         bool gotCanvas = TryReadUWidgetGeometry(m.canvasAddr, cGeom);
@@ -197,7 +187,6 @@ ResolvedMapProjection BuildMapProjection(const MapLiveState& m, const ImVec2& di
             float maxX = m.maxBoundsX, maxY = m.maxBoundsY;
             float texW = m.texSizeX, texH = m.texSizeY;
 
-            // 若 Lua 未读到边界，直接从 UMapPanelWidget 内存兜底读取
             if (std::fabs(maxX - minX) < 1.0f || std::fabs(maxY - minY) < 1.0f || texW < 1.0f || texH < 1.0f) {
                 float rMinX = 0, rMinY = 0, rMaxX = 0, rMaxY = 0, rTexW = 0, rTexH = 0;
                 if (TryReadMapPanelBoundsSEH(m.panelAddr, &rMinX, &rMinY, &rMaxX, &rMaxY, &rTexW, &rTexH) &&
@@ -211,7 +200,6 @@ ResolvedMapProjection BuildMapProjection(const MapLiveState& m, const ImVec2& di
             const float spanX = maxX - minX;
             const float spanY = maxY - minY;
             if (std::fabs(spanX) > 1.0f && std::fabs(spanY) > 1.0f && texW > 1.0f && texH > 1.0f) {
-                // 确定桌面绝对坐标 -> ImGui DisplaySize 的精确线性换算（自动抵消 DPI、窗口位置与多屏偏移）
                 bool gotVp = false;
                 UeFGeometry winGeom{};
                 if (TryReadUWidgetGeometry(m.rootWinAddr, winGeom) && winGeom.sizeX > 50.0f && winGeom.sizeY > 50.0f) {
@@ -242,9 +230,6 @@ ResolvedMapProjection BuildMapProjection(const MapLiveState& m, const ImVec2& di
                 }
 
                 if (gotVp) {
-                    // 复刻 Grounded 原生 UMapPanelWidget::AddWidgetToCanvas (0x141ABEEF0 + 0x141AD0CF0)：
-                    //   localX = cGeom.sizeX * 0.5 + ((wx - minX) / spanX - 0.5) * texW
-                    //   localY = cGeom.sizeY * 0.5 + ((wy - minY) / spanY - 0.5) * texH
                     const float kx = texW / spanX;
                     const float ky = texH / spanY;
                     const float l0x = cGeom.sizeX * 0.5f - (minX / spanX + 0.5f) * texW;
@@ -264,7 +249,6 @@ ResolvedMapProjection BuildMapProjection(const MapLiveState& m, const ImVec2& di
                     proj.by = (ky * cGeom.m11) * syScale;
                     proj.cy = (abs0y - proj.vpAbsMin.y) * syScale;
 
-                    // 计算 MapBorder 裁剪矩形（避免标点越过顶部菜单栏）
                     UeFGeometry bGeom{};
                     if (TryReadUWidgetGeometry(m.borderAddr, bGeom) && bGeom.sizeX > 50.0f && bGeom.sizeY > 50.0f) {
                         ImVec2 corners[4] = {
@@ -324,23 +308,21 @@ ResolvedMapProjection BuildMapProjection(const MapLiveState& m, const ImVec2& di
     return proj;
 }
 
-// 自由追踪资源的高对比度 12 色调色板（确保在绿草/黄沙/暗色洞穴地图上都清晰醒目）
 constexpr ImU32 kTrackPalette[12] = {
-    IM_COL32(255, 82, 82, 255),    // 鲜红
-    IM_COL32(76, 235, 120, 255),   // 翠绿
-    IM_COL32(255, 165, 38, 255),   // 亮橙
-    IM_COL32(64, 224, 255, 255),   // 青蓝
-    IM_COL32(255, 105, 210, 255),  // 粉红
-    IM_COL32(210, 255, 70, 255),   // 柠檬黄
-    IM_COL32(180, 130, 255, 255),  // 亮紫
-    IM_COL32(255, 235, 120, 255),  // 淡金
-    IM_COL32(0, 255, 195, 255),    // 薄荷青
-    IM_COL32(255, 125, 125, 255),  // 珊瑚粉
-    IM_COL32(120, 185, 255, 255),  // 钴蓝
-    IM_COL32(255, 255, 255, 255),  // 纯白
+    IM_COL32(255, 82, 82, 255),
+    IM_COL32(76, 235, 120, 255),
+    IM_COL32(255, 165, 38, 255),
+    IM_COL32(64, 224, 255, 255),
+    IM_COL32(255, 105, 210, 255),
+    IM_COL32(210, 255, 70, 255),
+    IM_COL32(180, 130, 255, 255),
+    IM_COL32(255, 235, 120, 255),
+    IM_COL32(0, 255, 195, 255),
+    IM_COL32(255, 125, 125, 255),
+    IM_COL32(120, 185, 255, 255),
+    IM_COL32(255, 255, 255, 255),
 };
 
-// 记录 M 地图下当前鼠标悬停到的标点，供快捷键放原版路标使用
 struct HoveredPinState {
     bool valid = false;
     float wx = 0.0f;
@@ -352,22 +334,53 @@ struct HoveredPinState {
 std::mutex g_hoverMutex;
 HoveredPinState g_hoveredPin;
 
-/// 仅转换 ASCII 大写字母为小写，避免破坏 UTF-8 多字节中文编码。
-std::string ToLowerAscii(const std::string& s) {
-    std::string out = s;
-    for (char& c : out) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
+/// 仅转换单个 ASCII 大写字母为小写，不破坏 UTF-8 多字节中文。
+inline char LowerAsciiChar(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+std::string ToLowerAscii(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) c = LowerAsciiChar(c);
     return out;
 }
 
-/// 大小写不敏感的子串匹配（兼容中英文混合检索关键词）。
-bool ContainsCaseInsensitive(const std::string& haystack, const std::string& needle) {
-    if (needle.empty()) return true;
-    return ToLowerAscii(haystack).find(ToLowerAscii(needle)) != std::string::npos;
+/// 零堆分配的 ASCII 大小写不敏感子串匹配（needle 需提前转为 ASCII 小写，UTF-8 中文按字节精确匹配）。
+bool ContainsLowerNeedleNoAlloc(std::string_view haystack, std::string_view lowerNeedle) {
+    if (lowerNeedle.empty()) return true;
+    if (haystack.size() < lowerNeedle.size()) return false;
+    const size_t limit = haystack.size() - lowerNeedle.size();
+    const char first = lowerNeedle[0];
+    for (size_t i = 0; i <= limit; ++i) {
+        if (LowerAsciiChar(haystack[i]) != first) continue;
+        size_t j = 1;
+        for (; j < lowerNeedle.size(); ++j) {
+            if (LowerAsciiChar(haystack[i + j]) != lowerNeedle[j]) break;
+        }
+        if (j == lowerNeedle.size()) return true;
+    }
+    return false;
 }
 
-/// 将资源目录内部分类键映射为菜单展示用的简体中文分类标签。
+/// 被动只读当前鼠标在游戏客户区内的坐标（菜单关闭时 M 地图悬停专用，不触碰任何光标状态）。
+bool TryGetPassiveMousePos(const ImVec2& disp, ImVec2& outPos) {
+    HWND hwnd = GetGameHwnd();
+    if (!hwnd) return false;
+    POINT pt{};
+    RECT rc{};
+    if (!::GetCursorPos(&pt) || !::ScreenToClient(hwnd, &pt) || !::GetClientRect(hwnd, &rc)) {
+        return false;
+    }
+    const float cw = static_cast<float>(rc.right - rc.left);
+    const float ch = static_cast<float>(rc.bottom - rc.top);
+    if (cw > 1.0f && ch > 1.0f) {
+        outPos.x = (static_cast<float>(pt.x) / cw) * disp.x;
+        outPos.y = (static_cast<float>(pt.y) / ch) * disp.y;
+        return true;
+    }
+    return false;
+}
+
 const char* CategoryLabelZh(const std::string& cat) {
     if (cat == "item") return "散落物品";
     if (cat == "node") return "采集点/矿石";
@@ -378,7 +391,6 @@ const char* CategoryLabelZh(const std::string& cat) {
     return "其他";
 }
 
-/// 绘制菱形图标（用于高级乳牙 / 特殊标记，与圆形普通乳牙明显区分）。
 void DrawDiamond(ImDrawList* dl, const ImVec2& c, float r, ImU32 fill, ImU32 border, float borderThick) {
     ImVec2 pts[4] = {
         ImVec2(c.x, c.y - r),
@@ -420,7 +432,6 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
         return;
     }
 
-    // 每次打开 M 地图记录一次实时投影诊断与原版玩家图标 0 像素误差自检
     if (!g_loggedNativeTransformForCurrentOpen) {
         g_loggedNativeTransformForCurrentOpen = true;
         g_prevMapOpenLogged = true;
@@ -459,7 +470,15 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
 
     const float baseR = 6.5f * uiScale * std::clamp(cfg.mapIconScale, 0.5f, 2.0f);
     const float borderT = std::max(1.6f, 1.5f * uiScale);
-    const ImVec2 mouse = io.MousePos;
+
+    // 菜单关闭时通过只读 GetCursorPos 获取鼠标位置，彻底与 ImGui WndProc 解耦（见 ADR-0004）
+    ImVec2 mouse = io.MousePos;
+    if (!menuOpen) {
+        ImVec2 passivePos{};
+        if (TryGetPassiveMousePos(disp, passivePos)) {
+            mouse = passivePos;
+        }
+    }
     const bool mouseInMap = (!menuOpen) &&
         mouse.x >= clipMin.x && mouse.x <= clipMax.x &&
         mouse.y >= clipMin.y && mouse.y <= clipMax.y;
@@ -469,24 +488,25 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
     ImVec2 hoveredScreen{};
     int drawnCount = 0;
 
-    // 统计图例计数
+    // 复用静态图例缓冲区，避免每帧构造 unordered_map 与频繁 string 堆分配
     struct LegendStat {
-        std::string label;
+        std::string_view key;
+        const char* label;
         ImU32 color;
         bool isDiamond;
         int count;
     };
-    std::vector<LegendStat> legendOrder;
-    std::unordered_map<std::string, size_t> legendIdx;
+    static std::vector<LegendStat> s_legendOrder;
+    s_legendOrder.clear();
 
-    auto addLegend = [&](const std::string& key, const std::string& label, ImU32 color, bool isDiamond) {
-        auto it = legendIdx.find(key);
-        if (it == legendIdx.end()) {
-            legendIdx[key] = legendOrder.size();
-            legendOrder.push_back({label, color, isDiamond, 1});
-        } else {
-            legendOrder[it->second].count++;
+    auto addLegend = [&](std::string_view key, const char* label, ImU32 color, bool isDiamond) {
+        for (auto& lg : s_legendOrder) {
+            if (lg.key == key) {
+                lg.count++;
+                return;
+            }
         }
+        s_legendOrder.push_back({key, label, color, isDiamond, 1});
     };
 
     for (const auto& pin : mapLive.pins) {
@@ -498,27 +518,23 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
         float r = baseR;
 
         if (pin.colorIndex == -1) {
-            // 未采集普通乳牙：亮天蓝圆点 + 纯白描边
             fillCol = IM_COL32(56, 220, 255, 250);
             borderCol = IM_COL32(255, 255, 255, 255);
             r = baseR * 1.15f;
             addLegend("__molar", "普通乳牙", fillCol, false);
         } else if (pin.colorIndex == -2) {
-            // 未采集高级乳牙：耀眼金色菱形 + 纯白描边
             fillCol = IM_COL32(255, 212, 38, 255);
             borderCol = IM_COL32(255, 255, 255, 255);
             diamond = true;
             r = baseR * 1.48f;
             addLegend("__megamolar", "高级乳牙", fillCol, true);
         } else if (pin.colorIndex == -3) {
-            // SCA.B 配色：亮紫色菱形
             fillCol = IM_COL32(204, 110, 255, 245);
             borderCol = IM_COL32(255, 255, 255, 245);
             diamond = true;
             r = baseR * 1.12f;
             addLegend("__scab", "SCA.B 配色", fillCol, true);
         } else if (pin.colorIndex == -4) {
-            // 已采集乳牙：半透明灰显
             fillCol = IM_COL32(150, 155, 165, 130);
             borderCol = IM_COL32(40, 45, 50, 160);
             r = baseR * 0.85f;
@@ -526,17 +542,15 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
         } else {
             fillCol = kTrackPalette[pin.colorIndex % 12];
             borderCol = IM_COL32(10, 12, 16, 245);
-            addLegend(pin.id, pin.name, fillCol, false);
+            addLegend(pin.id, pin.name.c_str(), fillCol, false);
         }
 
-        // 粗略视口剔除，提升缩放放大后的绘制效率（图例计数保持全图总数不变）
         if (sp.x < clipMin.x - 40.0f || sp.x > clipMax.x + 40.0f ||
             sp.y < clipMin.y - 40.0f || sp.y > clipMax.y + 40.0f) {
             continue;
         }
         drawnCount++;
 
-        // 外阴影提升在深棕/蓝湖地图上的对比度
         if (diamond) {
             DrawDiamond(dl, ImVec2(sp.x, sp.y + 1.2f * uiScale), r + 1.4f * uiScale, IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 0), 0.0f);
             DrawDiamond(dl, sp, r, fillCol, borderCol, borderT);
@@ -566,23 +580,21 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
 
     g_lastRenderedPinCount.store(drawnCount);
 
-    // 悬停高亮圈
     if (hovered) {
         dl->AddCircle(hoveredScreen, baseR * 1.95f, IM_COL32(255, 255, 255, 255), 0, 2.2f * uiScale);
     }
 
-    // 在 M 地图右侧（原版 W/0.5x/S 缩放条下方）绘制简洁图例栏，避免遮挡缩放按钮与左侧原版图例
-    if (cfg.showMapLegend && !legendOrder.empty()) {
+    if (cfg.showMapLegend && !s_legendOrder.empty()) {
         const float pad = 10.0f * uiScale;
         const float lineH = ImGui::GetFontSize() + 5.0f * uiScale;
         float maxW = 155.0f * uiScale;
-        for (const auto& lg : legendOrder) {
+        for (const auto& lg : s_legendOrder) {
             char buf[192];
-            std::snprintf(buf, sizeof(buf), "%s (%d)", lg.label.c_str(), lg.count);
+            std::snprintf(buf, sizeof(buf), "%s (%d)", lg.label, lg.count);
             float w = ImGui::CalcTextSize(buf).x + 28.0f * uiScale;
             if (w > maxW) maxW = w;
         }
-        const int maxItems = std::min<int>(static_cast<int>(legendOrder.size()), 12);
+        const int maxItems = std::min<int>(static_cast<int>(s_legendOrder.size()), 12);
         const float boxW = maxW + pad * 2.0f;
         const float boxH = (maxItems + 1) * lineH + pad * 1.8f;
         float boxY = std::min(clipMin.y + 215.0f * uiScale, std::max(clipMin.y + 14.0f * uiScale, clipMax.y - boxH - 120.0f * uiScale));
@@ -597,7 +609,7 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
         cur.y += lineH;
 
         for (int i = 0; i < maxItems; ++i) {
-            const auto& lg = legendOrder[i];
+            const auto& lg = s_legendOrder[i];
             ImVec2 iconC(cur.x + 6.0f * uiScale, cur.y + ImGui::GetFontSize() * 0.5f);
             if (lg.isDiamond) {
                 DrawDiamond(dl, iconC, 5.5f * uiScale, lg.color, IM_COL32(255, 255, 255, 220), 1.0f * uiScale);
@@ -606,7 +618,7 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
                 dl->AddCircle(iconC, 4.8f * uiScale, IM_COL32(255, 255, 255, 220), 0, 1.0f * uiScale);
             }
             char buf[192];
-            std::snprintf(buf, sizeof(buf), "%s (%d)", lg.label.c_str(), lg.count);
+            std::snprintf(buf, sizeof(buf), "%s (%d)", lg.label, lg.count);
             dl->AddText(ImVec2(cur.x + 18.0f * uiScale, cur.y), IM_COL32(238, 244, 250, 255), buf);
             cur.y += lineH;
         }
@@ -614,7 +626,6 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
 
     dl->PopClipRect();
 
-    // 更新悬停状态并渲染悬停气泡（放在 ClipRect 之外防止边缘文字被裁切）
     if (hovered) {
         {
             std::lock_guard<std::mutex> lk(g_hoverMutex);
@@ -669,10 +680,92 @@ void RenderMapOverlay(const ModConfig& cfg, const MapLiveState& mapLive, bool me
     }
 }
 
+/// 渲染内置自绘输入法候选条（仅在独占全屏自动降级或手动选择内置自绘、且处于组词/候选展示时显示，见 Q7）。
+void RenderImeCandidateBar(float uiScale) {
+    const ImeCandidateState ime = GetImeCandidateState();
+    if (!ime.useSelfDrawnUi) return;
+    if (!ime.composing && ime.compositionUtf8.empty() && ime.candidates.empty()) return;
+
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    const float estHeight = (!ime.candidates.empty() ? 66.0f : 36.0f) * uiScale;
+    float posX = std::clamp(ime.inputPosX, 8.0f * uiScale, std::max(8.0f * uiScale, disp.x - 360.0f * uiScale));
+    float posY = ime.inputPosY + ime.inputLineHeight + 6.0f * uiScale;
+    if (posY + estHeight > disp.y - 8.0f * uiScale) {
+        // 靠近屏幕底边时自动翻到输入框上方防裁切
+        posY = std::max(8.0f * uiScale, ime.inputPosY - estHeight - 6.0f * uiScale);
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.96f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * uiScale, 7.0f * uiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f * uiScale);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.32f, 0.78f, 0.98f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.14f, 0.97f));
+
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav;
+
+    if (ImGui::Begin("##GQOL_ImeCandidateBar", nullptr, flags)) {
+        // 上行：当前拼音组词串 + 插入点标记 + Esc 取消提示
+        if (!ime.compositionUtf8.empty()) {
+            const size_t split = std::min(static_cast<size_t>(std::max(0, ime.cursorByteOffset)), ime.compositionUtf8.size());
+            std::string displayComp = ime.compositionUtf8.substr(0, split) + "|" + ime.compositionUtf8.substr(split);
+            ImGui::TextColored(ImVec4(0.45f, 0.90f, 1.0f, 1.0f), "%s", displayComp.c_str());
+        } else {
+            ImGui::TextColored(ImVec4(0.45f, 0.90f, 1.0f, 1.0f), "中文组词中...");
+        }
+        ImGui::SameLine(0.0f, 14.0f * uiScale);
+        ImGui::TextDisabled("空格/1~9选词 | Esc取消");
+
+        // 下行：横向编号候选字（高亮当前选中项，支持鼠标直接点选上屏）
+        if (!ime.candidates.empty()) {
+            ImGui::Separator();
+            for (size_t i = 0; i < ime.candidates.size(); ++i) {
+                if (i > 0) ImGui::SameLine(0.0f, 6.0f * uiScale);
+                const bool isSel = (static_cast<int>(i) == ime.selectedIndex);
+                char btnLabel[160];
+                std::snprintf(btnLabel, sizeof(btnLabel), "%d.%s##imecand%zu",
+                              static_cast<int>(i + 1), ime.candidates[i].c_str(), i);
+                if (isSel) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.48f, 0.68f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.58f, 0.80f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.96f, 0.72f, 1.0f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.16f, 0.22f, 0.90f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.30f, 0.42f, 0.95f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.95f, 0.98f, 1.0f));
+                }
+                if (ImGui::SmallButton(btnLabel)) {
+                    SelectImeCandidateByPageIndex(static_cast<int>(i));
+                }
+                ImGui::PopStyleColor(3);
+            }
+            if (ime.totalCandidates > static_cast<int>(ime.candidates.size())) {
+                ImGui::SameLine(0.0f, 10.0f * uiScale);
+                ImGui::TextDisabled("(%d/%d)",
+                                    ime.pageStart + ime.selectedIndex + 1,
+                                    ime.totalCandidates);
+            }
+        }
+    }
+    ImGui::End();
+
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
 /// 渲染游戏内 Mod 主配置菜单。
-void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float uiScale) {
-    const RuntimeStatus status = IpcBridge::Instance().GetStatusCopy();
-    const auto catalog = IpcBridge::Instance().GetCatalogCopy();
+void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float uiScale) {
+    const auto statusPtr = IpcBridge::Instance().GetStatusSnapshot();
+    const auto catalogPtr = IpcBridge::Instance().GetCatalogSnapshot();
+    const RuntimeStatus& status = *statusPtr;
+    const auto& catalog = *catalogPtr;
 
     ImGui::SetNextWindowSize(ImVec2(800.0f * uiScale, 700.0f * uiScale), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(
@@ -705,7 +798,7 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
 
     if (ImGui::BeginTabBar("MainTabs")) {
         // ============================================================
-        // Tab 1: 堆叠 / 伤害 / 采集倍率
+        // Tab 1: 堆叠 / 伤害 / 采集倍率 / 无材料 / 死亡保护
         // ============================================================
         if (ImGui::BeginTabItem("核心倍率与免材设置")) {
             ImGui::BeginChild("CoreSettingsScroll", ImVec2(0, 0), false);
@@ -830,7 +923,7 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
             ImGui::Separator();
             ImGui::Spacing();
 
-            // 5. 死亡背包保留、耐久保护与一键找回背包（遵循房主权威约束，不影响 Steam 成就）
+            // 5. 死亡背包保留、耐久保护与一键找回背包
             ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.78f, 1.0f), "5. 死亡保护与一键找回背包（房主设置全队生效，不影响成就）");
             const bool isClientBlocked = status.inWorld && !status.isHost;
             ImGui::BeginDisabled(isClientBlocked);
@@ -907,10 +1000,10 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
                                static_cast<int>(catalog.size()));
 
             static char searchBuf[128] = "";
-            static int catFilter = 0; // 0=全部 1=已勾选 2=采集点 3=散落物品 4=生物 5=可扫描全图资源 6=特殊
+            static int catFilter = 0;
 
             ImGui::SetNextItemWidth(280.0f * uiScale);
-            ImGui::InputTextWithHint("##search", "搜索中文或英文名（如: 薄荷 / 狼蛛 / 橡果 / 石英）", searchBuf, sizeof(searchBuf));
+            ImGui::InputTextWithHint("##search", "搜索中文或英文名（支持中文输入法：薄荷 / 狼蛛 / 橡果）", searchBuf, sizeof(searchBuf));
             ImGui::SameLine();
             const char* catNames[] = {"全部", "仅看已追踪", "采集点/矿石", "散落物品", "生物/昆虫", "全图可扫描物品", "特殊/宝箱"};
             ImGui::SetNextItemWidth(160.0f * uiScale);
@@ -921,72 +1014,83 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
                 cfgDirty = true;
             }
 
-            std::unordered_set<std::string> trackedSet(cfg.trackedIds.begin(), cfg.trackedIds.end());
-            std::string query(searchBuf);
+            // 预构建已追踪集合（视图指向本帧不可变的 immutableCfg.trackedIds，绝不会因勾选修改 cfg.trackedIds 而悬空）
+            static std::vector<size_t> s_filteredIndices;
+            s_filteredIndices.clear();
+            std::unordered_set<std::string_view> trackedSet;
+            trackedSet.reserve(immutableCfg.trackedIds.size() * 2 + 4);
+            for (const auto& tid : immutableCfg.trackedIds) {
+                trackedSet.insert(tid);
+            }
+            const std::string lowerQuery = ToLowerAscii(searchBuf);
+
+            for (size_t i = 0; i < catalog.size(); ++i) {
+                const auto& e = catalog[i];
+                const bool isTracked = trackedSet.count(e.id) > 0;
+                if (catFilter == 1 && !isTracked) continue;
+                if (catFilter == 2 && e.category != "node") continue;
+                if (catFilter == 3 && e.category != "item") continue;
+                if (catFilter == 4 && e.category != "creature") continue;
+                if (catFilter == 5 && !e.surveyable) continue;
+                if (catFilter == 6 && e.category != "special") continue;
+
+                if (!lowerQuery.empty() &&
+                    !ContainsLowerNeedleNoAlloc(e.name, lowerQuery) &&
+                    !ContainsLowerNeedleNoAlloc(e.rawName, lowerQuery) &&
+                    !ContainsLowerNeedleNoAlloc(e.rowName, lowerQuery)) {
+                    continue;
+                }
+                s_filteredIndices.push_back(i);
+            }
 
             ImGui::BeginChild("CatalogScroll", ImVec2(0, 0), true);
             if (catalog.empty()) {
                 ImGui::TextDisabled("尚未获取到世界资源目录。请先进入游戏存档，或点击上方“立即刷新世界资源”。");
+            } else if (s_filteredIndices.empty()) {
+                ImGui::TextDisabled("没有匹配当前搜索条件或分类的资源。");
             } else {
-                int shown = 0;
-                for (size_t i = 0; i < catalog.size(); ++i) {
-                    const auto& e = catalog[i];
-                    bool isTracked = trackedSet.count(e.id) > 0;
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(s_filteredIndices.size()));
+                while (clipper.Step()) {
+                    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                        const size_t i = s_filteredIndices[static_cast<size_t>(row)];
+                        const auto& e = catalog[i];
+                        bool checked = trackedSet.count(e.id) > 0;
 
-                    if (catFilter == 1 && !isTracked) continue;
-                    if (catFilter == 2 && e.category != "node") continue;
-                    if (catFilter == 3 && e.category != "item") continue;
-                    if (catFilter == 4 && e.category != "creature") continue;
-                    if (catFilter == 5 && !e.surveyable) continue;
-                    if (catFilter == 6 && e.category != "special") continue;
+                        ImGui::PushID(static_cast<int>(i));
 
-                    if (!query.empty() &&
-                        !ContainsCaseInsensitive(e.name, query) &&
-                        !ContainsCaseInsensitive(e.rawName, query) &&
-                        !ContainsCaseInsensitive(e.rowName, query)) {
-                        continue;
-                    }
+                        char label[256];
+                        if (e.count > 0) {
+                            std::snprintf(label, sizeof(label), "%s  [%s | %d处]",
+                                          e.name.c_str(), CategoryLabelZh(e.category), e.count);
+                        } else {
+                            std::snprintf(label, sizeof(label), "%s  [%s]",
+                                          e.name.c_str(), CategoryLabelZh(e.category));
+                        }
 
-                    shown++;
-                    ImGui::PushID(static_cast<int>(i));
-
-                    bool checked = isTracked;
-                    char label[256];
-                    if (e.count > 0) {
-                        std::snprintf(label, sizeof(label), "%s  [%s | %d处]",
-                                      e.name.c_str(), CategoryLabelZh(e.category), e.count);
-                    } else {
-                        std::snprintf(label, sizeof(label), "%s  [%s]",
-                                      e.name.c_str(), CategoryLabelZh(e.category));
-                    }
-
-                    if (ImGui::Checkbox(label, &checked)) {
-                        if (checked) {
-                            if (trackedSet.insert(e.id).second) {
-                                cfg.trackedIds.push_back(e.id);
+                        if (ImGui::Checkbox(label, &checked)) {
+                            if (checked) {
+                                if (trackedSet.count(e.id) == 0) {
+                                    cfg.trackedIds.push_back(e.id);
+                                    cfgDirty = true;
+                                }
+                            } else {
+                                cfg.trackedIds.erase(
+                                    std::remove(cfg.trackedIds.begin(), cfg.trackedIds.end(), e.id),
+                                    cfg.trackedIds.end());
                                 cfgDirty = true;
                             }
-                        } else {
-                            trackedSet.erase(e.id);
-                            cfg.trackedIds.erase(
-                                std::remove(cfg.trackedIds.begin(), cfg.trackedIds.end(), e.id),
-                                cfg.trackedIds.end());
-                            cfgDirty = true;
                         }
-                    }
 
-                    if (e.surveyable && !e.rowName.empty()) {
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("原版热区(全队)")) {
-                            IpcBridge::Instance().PushAction("survey_item", e.rowName);
+                        if (e.surveyable && !e.rowName.empty()) {
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton("原版热区(全队)")) {
+                                IpcBridge::Instance().PushAction("survey_item", e.rowName);
+                            }
                         }
+
+                        ImGui::PopID();
                     }
-
-                    ImGui::PopID();
-                }
-
-                if (shown == 0) {
-                    ImGui::TextDisabled("没有匹配当前搜索条件或分类的资源。");
                 }
             }
             ImGui::EndChild();
@@ -995,15 +1099,34 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
         }
 
         // ============================================================
-        // Tab 3: 使用说明与多人联机提示
+        // Tab 3: 使用说明、输入法模式设置与多人联机提示
         // ============================================================
         if (ImGui::BeginTabItem("快捷键与联机说明")) {
             ImGui::Spacing();
-            ImGui::BulletText("按 Insert 或 F8：随时打开 / 关闭本 Mod 菜单（Esc 也可关闭）。");
+            ImGui::BulletText("按 Insert 或 F8：随时打开 / 关闭本 Mod 菜单（Esc 也可关闭，中文组词期间按 Esc 优先取消拼音组词）。");
             ImGui::BulletText("按 M 打开游戏原生大地图后，所有乳牙、高级乳牙与已勾选的追踪资源将自动显示在地图内，支持拖动与缩放。");
             ImGui::BulletText("在 M 地图上将鼠标移到任意标点上，可查看中文名称、直线距离与上下高度差（寻找地下洞穴乳牙非常实用）。");
             ImGui::BulletText("在 M 地图上悬停任意标点时，按 G 键或 Ctrl+左键，可一键放置游戏原版路标（3D 导航且联机队友可见）。");
             ImGui::BulletText("勾选列表右侧的 [原版热区(全队)] 按钮可直接调用游戏原版资源扫描仪，把该物品的全图红热区同步给联机队友。");
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.45f, 0.88f, 1.0f, 1.0f), "中文输入法候选框显示设置：");
+            const char* imeModes[] = {
+                "自动（推荐：无边框走系统原生，独占全屏切内置自绘）",
+                "强制使用系统原生候选框",
+                "强制使用内置自绘候选条（原生窗被遮挡时可选）",
+            };
+            int imeMode = std::clamp(cfg.imeCandidateMode, 0, 2);
+            ImGui::SetNextItemWidth(420.0f * uiScale);
+            if (ImGui::Combo("输入法候选框模式##imemode", &imeMode, imeModes, IM_ARRAYSIZE(imeModes))) {
+                cfg.imeCandidateMode = imeMode;
+                cfgDirty = true;
+            }
+            const ImeCandidateState imeInfo = GetImeCandidateState();
+            ImGui::TextDisabled("当前检测：%s | 实际候选框方式：%s（仅点击输入框时按需唤醒，不干扰跑图按键）",
+                                imeInfo.isExclusiveFullscreen ? "独占全屏模式" : "无边框/窗口模式",
+                                imeInfo.useSelfDrawnUi ? "ImGui 内置自绘候选条" : "Windows 系统原生候选框");
+
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.40f, 1.0f), "多人联机（房主模式）注意事项：");
             ImGui::BulletText("玩家伤害倍率、怪物伤害倍率、采集数量倍率、原版路标与原版热区扫描：仅房主安装即可全队生效。");
@@ -1021,7 +1144,6 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
 
 } // namespace
 
-/// 初始化 Dear ImGui 深色圆角主题、按分辨率缩放控件尺寸，并加载系统自带中文字体。
 void InitOverlayStyleAndFonts(float uiScale) {
     ImGuiStyle& style = ImGui::GetStyle();
     ImGui::StyleColorsDark(&style);
@@ -1048,9 +1170,10 @@ void InitOverlayStyleAndFonts(float uiScale) {
         "C:\\Windows\\Fonts\\simsun.ttc",
     };
 
+    // 保留完整中文字库（覆盖蚜/蛹/螯/藓等冷门昆虫植物字），将采样从 2x2 降至 1x1 像素对齐，减少 75% 显存与首帧烘焙耗时
     ImFontConfig fc;
-    fc.OversampleH = 2;
-    fc.OversampleV = 2;
+    fc.OversampleH = 1;
+    fc.OversampleV = 1;
     fc.PixelSnapH = true;
 
     bool loaded = false;
@@ -1067,25 +1190,33 @@ void InitOverlayStyleAndFonts(float uiScale) {
     }
 }
 
-/// 单帧渲染总入口：按需绘制 M 地图标点叠加层，并在菜单开启时渲染配置窗口及自动落盘修改。
+void ResetOverlayIdleState() {
+    g_prevMapOpenLogged = false;
+    g_loggedNativeTransformForCurrentOpen = false;
+    g_lastRenderedPinCount.store(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_hoverMutex);
+    g_hoveredPin.valid = false;
+}
+
 void RenderOverlayFrame(bool& menuOpen, float uiScale) {
-    ModConfig cfg = IpcBridge::Instance().GetConfigCopy();
-    const MapLiveState mapLive = IpcBridge::Instance().GetMapLiveCopy();
+    const auto cfgSnap = IpcBridge::Instance().GetConfigSnapshot();
+    const auto mapSnap = IpcBridge::Instance().GetMapLiveSnapshot();
 
-    // 1. M 地图追踪标点层（M 地图打开时始终渲染）
-    RenderMapOverlay(cfg, mapLive, menuOpen, uiScale);
+    // 1. M 地图追踪标点层（M 地图打开时渲染）
+    RenderMapOverlay(*cfgSnap, *mapSnap, menuOpen, uiScale);
 
-    // 2. 游戏内 Mod 配置菜单（按 Insert / F8 呼出）
+    // 2. 游戏内 Mod 配置菜单（按 Insert / F8 呼出）与内置自绘中文候选条
     if (menuOpen) {
+        ModConfig editableCfg = *cfgSnap;
         bool dirty = false;
-        RenderModMenuWindow(cfg, dirty, menuOpen, uiScale);
+        RenderModMenuWindow(*cfgSnap, editableCfg, dirty, menuOpen, uiScale);
         if (dirty) {
-            IpcBridge::Instance().UpdateConfigAndSave(cfg);
+            IpcBridge::Instance().UpdateConfigAndSave(editableCfg);
         }
+        RenderImeCandidateBar(uiScale);
     }
 }
 
-/// 在 M 地图打开且鼠标悬停到追踪标点时，响应 G 键或 Ctrl+左键向 Lua 发送原版路标放置指令。
 bool HandleMapQuickShortcut(UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
     bool trigger = false;
     if (msg == WM_KEYDOWN && wParam == 'G') {
@@ -1106,9 +1237,8 @@ bool HandleMapQuickShortcut(UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
     return true;
 }
 
-/// 返回最近一帧 M 地图层实际落入裁剪视口并绘制的标点数量。
 int GetLastRenderedMapPinCount() {
-    return g_lastRenderedPinCount.load();
+    return g_lastRenderedPinCount.load(std::memory_order_relaxed);
 }
 
 } // namespace gqol

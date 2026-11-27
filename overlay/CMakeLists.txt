@@ -80,6 +80,8 @@ target_link_libraries(GroundedQoLOverlay PRIVATE
     dxgi
     user32
     gdi32
+    imm32
+    ole32
 )
 
 # 目标二：DX12/DX11 自动化回归测试宿主程序
@@ -102,4 +104,6 @@ target_link_libraries(overlay_regression_test PRIVATE
     dxgi
     user32
     gdi32
+    imm32
+    ole32
 )

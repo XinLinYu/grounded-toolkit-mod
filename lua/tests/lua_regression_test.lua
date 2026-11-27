@@ -13,6 +13,9 @@
       - L7: 本人无背包但存在队友背包时的友好中文引导提示
       - L8: 退出存档切换世界时清空基准值缓存，进入新难度存档正确读取新基准值
       - L9: 原有核心功能无回归（物品堆叠保护单件装备、伤害倍率、采集倍率排除背包/乳牙且搬运物封顶 12）
+      - L10: 游玩期性能不变量（ADR-0004：30 秒内 0 次周期全图 LOD/LootComponent 扫表、0 次重复 FindFirstOf、0 次无效写盘）
+      - L11: SpawnLoot 实时 Hook 接管新掉落组件并在关闭采集倍率时无损还原
+      - L12: 打开菜单 5 秒冷却静默软刷新（refresh_catalog_soft）与 M 地图 1.8 秒刷新节流
 ]]
 
 -- ============================================================
@@ -333,6 +336,23 @@ os.clock = function() return mockClock end
 package.loadlib = function() return function() return 0 end end
 
 local capturedLoopCallback = nil
+local capturedHooks = {}
+local perfCounters = {
+    findFirst = {},
+    findAll = {},
+    fileWrites = {},
+    gameThreadTicks = 0,
+}
+
+local origIoOpen = io.open
+io.open = function(path, mode)
+    if type(mode) == "string" and mode:find("w") and type(path) == "string" then
+        local base = path:match("([^\\]+)$") or path
+        perfCounters.fileWrites[base] = (perfCounters.fileWrites[base] or 0) + 1
+    end
+    return origIoOpen(path, mode)
+end
+
 local gameInstanceMock = makeUObject("SurvivalGameInstance", "GI", {
     GlobalTableData = nil,
     WidgetManager = nil,
@@ -345,9 +365,14 @@ package.loaded["UEHelpers"] = {
 }
 
 _G.FName = makeFName
-_G.RegisterHook = function() end
+_G.RegisterHook = function(funcPath, preFn, postFn)
+    capturedHooks[funcPath] = { pre = preFn, post = postFn }
+end
 _G.LoopAsync = function(_intervalMs, fn) capturedLoopCallback = fn end
-_G.ExecuteInGameThread = function(fn) fn() end
+_G.ExecuteInGameThread = function(fn)
+    perfCounters.gameThreadTicks = perfCounters.gameThreadTicks + 1
+    fn()
+end
 
 _G.StaticFindObject = function(path)
     if path == "/Script/Maine.Default__SurvivalGameplayStatics" then
@@ -367,6 +392,7 @@ _G.StaticFindObject = function(path)
 end
 
 _G.FindFirstOf = function(cls)
+    perfCounters.findFirst[cls] = (perfCounters.findFirst[cls] or 0) + 1
     if cls == "GlobalItemData" then return world.globalItemData end
     if not world.inWorld then return nil end
     if cls == "SurvivalGameState" then return world.gs end
@@ -375,6 +401,7 @@ _G.FindFirstOf = function(cls)
 end
 
 _G.FindAllOf = function(cls)
+    perfCounters.findAll[cls] = (perfCounters.findAll[cls] or 0) + 1
     if not world.inWorld then return {} end
     if cls == "SurvivalPlayerCharacter" then return world.teammates end
     if cls == "LootBag" then return world.loadedBags end
@@ -753,6 +780,139 @@ runCase("L9: 原有核心功能无回归（堆叠保护装备 + 伤害倍率 + �
     assertEq(grassEntry.Count, 12, "草板搬运物放大后必须封顶 12 根防物理卡顿")
     assertEq(oreEntry.Count, 10, "普通矿石 2 x5 应放大为 10")
     assertEq(bagLootEntry.Count, 2, "玩家死亡背包所属 LootComponent 严禁被采集倍率放大")
+end)
+
+runCase("L10: 正常游玩期 30 秒性能不变量（0 次周期全图扫描、0 次重复 FindFirstOf、0 次无效写盘）", function()
+    -- 稳态再推进 1 秒让首次 status.json 稳定落盘
+    stepTick(1.0)
+    local ffGsBefore = perfCounters.findFirst["SurvivalGameState"] or 0
+    local ffGidBefore = perfCounters.findFirst["GlobalItemData"] or 0
+    local faLootBefore = perfCounters.findAll["LootComponent"] or 0
+    local statusWritesBefore = perfCounters.fileWrites["status.json.tmp"] or 0
+    local catWritesBefore = perfCounters.fileWrites["catalog.json.tmp"] or 0
+
+    -- 模拟玩家关闭菜单和 M 地图持续跑图 30 秒（含高频 0.1s 定时器步进验证自适应调度）
+    local ticksBefore = perfCounters.gameThreadTicks
+    for _ = 1, 300 do
+        stepTick(0.1)
+    end
+    local ticksDelta = perfCounters.gameThreadTicks - ticksBefore
+
+    assertEq((perfCounters.findFirst["SurvivalGameState"] or 0) - ffGsBefore, 0,
+        "稳态游玩期间严禁重复 FindFirstOf(SurvivalGameState)")
+    assertEq((perfCounters.findFirst["GlobalItemData"] or 0) - ffGidBefore, 0,
+        "稳态游玩期间严禁重复 FindFirstOf(GlobalItemData)")
+    assertEq((perfCounters.findAll["LootComponent"] or 0) - faLootBefore, 0,
+        "稳态游玩期间严禁周期性 FindAllOf(LootComponent) 扫表")
+    assertEq((perfCounters.fileWrites["status.json.tmp"] or 0) - statusWritesBefore, 0,
+        "状态无变化时严禁每 0.6s 无效重写 status.json")
+    assertEq((perfCounters.fileWrites["catalog.json.tmp"] or 0) - catWritesBefore, 0,
+        "游玩期严禁每 10s 后台全图扫描并重写 catalog.json")
+    assertTrue(ticksDelta < 120,
+        "30 秒内自适应调度应大幅减少 GameThread 唤醒次数（实际=" .. tostring(ticksDelta) .. "）")
+end)
+
+runCase("L11: SpawnLoot 实时 Hook 接管新流式掉落组件，且关闭采集倍率时精准还原", function()
+    local spawnHook = capturedHooks["/Script/Maine.LootComponent:SpawnLoot"]
+    assertTrue(spawnHook ~= nil and type(spawnHook.pre) == "function", "必须注册 LootComponent:SpawnLoot 实时 Hook")
+
+    local lateOre = { Type = 0, Count = 3, ItemData = { RowName = makeFName("Marble") } }
+    local lateLc = makeUObject("LootComponent", "LC_LateStreamed", {
+        GetOuter = function() return makeUObject("HarvestNode", "BP_Rock_ArmorStone1_C") end,
+        Items = { lateOre },
+    })
+
+    -- 未经过全图扫表的新组件在 SpawnLoot 触发瞬间即可放大（当前倍率 5x -> 3*5=15）
+    spawnHook.pre({ get = function() return lateLc end })
+    assertEq(lateOre.Count, 15, "SpawnLoot 实时 Hook 应在掉落瞬间把新组件放大 5 倍")
+
+    -- 关闭采集倍率配置，验证触发一次全扫还原且 SpawnLoot 也能还原已缓存的新组件
+    writeJsonFile(modDataDir .. "\\config.json", {
+        stackEnabled = true, stackMultiplier = 10,
+        damageEnabled = true, playerDamageMultiplier = 2.5, enemyDamageMultiplier = 0.5,
+        harvestEnabled = false, harvestMultiplier = 5,
+        harvestAffectHauling = true, harvestAffectPickup = true,
+        keepInventoryOnDeath = false, noDeathDurabilityPenalty = false,
+    })
+    stepTick(1.0)
+    spawnHook.pre({ get = function() return lateLc end })
+    assertEq(lateOre.Count, 3, "关闭采集倍率后 SpawnLoot 应将已放大的掉落组件还原为原版 3")
+end)
+
+runCase("L12: 打开菜单静默软刷新（5 秒冷却 + 不覆盖状态提示）与 M 地图 1.8 秒刷新节流", function()
+    -- 1. 先执行一次手动刷新设定基准时间与状态提示
+    sendAction("refresh_catalog")
+    stepTick(1.0)
+    local stManual = readJsonFile(modDataDir .. "\\status.json")
+    assertContains(stManual.lastMessage, "已重新扫描世界", "手动刷新应更新顶部提示")
+
+    -- 2. 冷却期内（仅过 2 秒）收到 refresh_catalog_soft 不应触发重复写盘
+    local catWrites1 = perfCounters.fileWrites["catalog.json.tmp"] or 0
+    sendAction("refresh_catalog_soft")
+    stepTick(2.0)
+    assertEq((perfCounters.fileWrites["catalog.json.tmp"] or 0) - catWrites1, 0,
+        "5 秒冷却期内收到 refresh_catalog_soft 不应重复扫表写 catalog.json")
+
+    -- 3. 超过 5 秒后新增一颗未采集乳牙再触发 refresh_catalog_soft -> 静默更新乳牙计数且保留原提示文字
+    table.insert(world.gs.TrackedCollectibles, {
+        Type = 2, State = 0, bHiddenForThisNewGameLoop = 0,
+        WorldPos = { X = 1200, Y = 3400, Z = 100 },
+    })
+    sendAction("refresh_catalog_soft")
+    stepTick(6.0)
+    assertEq((perfCounters.fileWrites["catalog.json.tmp"] or 0) - catWrites1, 1,
+        "超过 5 秒后 refresh_catalog_soft 应静默更新 catalog.json")
+    local stSoft = readJsonFile(modDataDir .. "\\status.json")
+    assertEq(stSoft.uncollectedMilkMolars, 1, "静默软刷新后应同步最新未采集普通乳牙计数")
+    assertEq(stSoft.lastMessage, stManual.lastMessage, "静默软刷新不得覆盖状态栏提示文案")
+
+    -- 4. 模拟 M 地图打开，验证 1.8 秒刷新节流（打开瞬间立刻写 map_live.json，1.0s 内不再重扫，2.0s 后刷新）
+    local lodReadCount = 0
+    local mapPanelMock = makeUObject("MapPanelWidget", "MapPanel", {
+        MinBounds = { X = -80000, Y = -80000 },
+        MaxBounds = { X = 80000, Y = 80000 },
+        TextureSize = { X = 2048, Y = 2048 },
+        CollectibleCanvas = makeUObject("CanvasPanel", "CollectibleCanvas"),
+        MapBorder = makeUObject("Border", "MapBorder"),
+        PlayerCanvas = makeUObject("CanvasPanel", "PlayerCanvas", {
+            GetChildrenCount = function() return 0 end,
+        }),
+    })
+    local rootWinMock = makeUObject("InGameMenuWidget", "UI_InGameMenu", {
+        Map = makeUObject("UI_Map", "UI_Map_C", {
+            Active = true,
+            MapPanel = mapPanelMock,
+        }),
+    })
+    gameInstanceMock.WidgetManager = makeUObject("WidgetManager", "WM", {
+        GetTopWindow = function() return rootWinMock end,
+        WindowStack = { rootWinMock },
+    })
+    local trackedLod = makeUObject("ScienceCollectableLODActor", "RawSci_1", {
+        GetActorLocation = function()
+            lodReadCount = lodReadCount + 1
+            return { X = 1000, Y = 2000, Z = 100 }
+        end,
+    })
+    world.lods = { trackedLod }
+    world.gs.LODActorManagerComponent.LODActors = world.lods
+
+    stepTick(0.5) -- M 地图刚打开：立刻扫描一次
+    local readsAfterOpen = lodReadCount
+    assertEq(readsAfterOpen, 1, "M 地图刚打开瞬间应立刻扫描一次 LODActors")
+
+    stepTick(1.0) -- 仅过去 1.0 秒（< 1.8 秒）：严禁重复全图扫 LODActors
+    assertEq(lodReadCount, readsAfterOpen, "M 地图打开后 1.8 秒节流期内不应重复扫描 LODActors")
+
+    stepTick(1.0) -- 累计过去 2.0 秒（>= 1.8 秒）：触发一次节流刷新
+    assertEq(lodReadCount, readsAfterOpen + 1, "M 地图打开满 1.8 秒后应触发一次生物/状态刷新")
+
+    -- 关闭 M 地图，确认立刻写出 mapOpen=false 并停止刷新
+    rootWinMock.Map.Active = false
+    stepTick(0.5)
+    local mapClosed = readJsonFile(modDataDir .. "\\map_live.json")
+    assertEq(mapClosed.mapOpen, false, "关闭 M 地图后应立刻写出 mapOpen=false")
+    gameInstanceMock.WidgetManager = nil
 end)
 
 -- 清理本次测试在 lua/GroundedQoL/data 下产生的临时 JSON 文件

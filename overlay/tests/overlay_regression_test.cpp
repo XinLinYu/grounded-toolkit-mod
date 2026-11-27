@@ -2,17 +2,29 @@
  * 文件：overlay/tests/overlay_regression_test.cpp
  * 职责：GroundedQoLOverlay.dll 离线自动化回归测试宿主程序（真实 DX12 / DX11 SwapChain）。
  * 验证项：
- *   1. DLL 加载后自动写出默认 data/config.json，且包含 keepInventoryOnDeath=false / noDeathDurabilityPenalty=false；
+ *   1. DLL 加载后自动写出默认 data/config.json，包含死亡保护字段与 imeCandidateMode=0；
  *   2. MinHook 正确拦截 Present / Present1 / ResizeBuffers / ExecuteCommandLists 并自动识别 DX12 / DX11；
  *   3. 模拟 UE 4.27 精确内存布局的 UWidget->SWidget->FGeometry，验证旋转/缩放下 M 地图标点 0.00px 投影误差；
- *   4. Insert / F8 菜单切换在房主与联机客机两种 status.json 状态下均能无崩溃渲染（覆盖死亡保护禁用/启用分支）；
- *   5. ResizeBuffers（模拟 Alt+Tab / 改分辨率）安全重建后缓冲无崩溃。
+ *   4. 光标零干扰不变量（ADR-0004 / Q3 / Q8）：
+ *      - 菜单关闭时 WM_SETCURSOR / 鼠标事件原样透传给 UE4，绝不被 ImGui 篡改光标或 SetCapture 引发闪烁；
+ *      - 菜单打开时托管单一系统原生光标并吞掉游戏鼠标事件；Alt+Tab 失焦不关菜单但临时让出光标/IME；
+ *      - 菜单关闭瞬间主动派发 WM_SETCURSOR 交还 UE4 隐藏光标。
+ *   5. 窗口主线程混合中文输入法（ADR-0003 / Q1 / Q2 / Q6）：
+ *      - 模拟 UE4 启动禁用窗口 HIMC；开菜单未聚焦文本框时保持禁用；聚焦输入框后在窗口线程按需恢复 HIMC；
+ *      - 组词期按 Esc 仅取消组词不关菜单；WM_IME_CHAR 中文字符正确进入 ImGui 不被吞；失焦后精确还原禁用态；
+ *      - DX11 用例验证预置 imeCandidateMode=2（强制内置自绘）持久化加载与生效标志。
+ *   6. 空闲零开销直通与打开菜单自动软刷新（ADR-0004 / Q5 / Q9）：
+ *      - 菜单关闭 + M 地图关闭 + 开场横幅过期后 Present 走零开销直通路径，不增加完整渲染帧数；
+ *      - 打开菜单超过冷却后自动推送 refresh_catalog_soft 指令。
+ *   7. ResizeBuffers（Alt+Tab / 分辨率切换）安全重建后缓冲无崩溃，房主与联机客机 UI 渲染正常。
  */
 
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <imm.h>
+#include <msctf.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -20,14 +32,40 @@
 #include <sstream>
 #include <string>
 
-using QueryStateFn = int(__cdecl*)();
+#pragma comment(lib, "imm32")
+#pragma comment(lib, "ole32")
 
-/// 测试宿主窗口的默认消息回调（后续会被 DLL 的 HookedWndProc 子类化接管）。
+using QueryStateFn = int(__cdecl*)();
+using QueryMetricsFn = void(__cdecl*)(unsigned long long*, unsigned long long*, int*);
+using VoidTestFn = void(__cdecl*)();
+using SetWantTextFn = void(__cdecl*)(int, float, float);
+
+static int g_origSetCursorCalls = 0;
+static int g_origMouseDownCalls = 0;
+static int g_origMouseMoveCalls = 0;
+static bool g_simUe4HideCursor = true;
+
+/// 模拟 UE4 游戏主窗口消息回调（在游玩状态下于 WM_SETCURSOR 调用 SetCursor(NULL) 隐藏光标）。
 static LRESULT CALLBACK TestWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_SETCURSOR) {
+        g_origSetCursorCalls++;
+        if (g_simUe4HideCursor && LOWORD(lParam) == HTCLIENT) {
+            ::SetCursor(nullptr);
+            return TRUE;
+        }
+    } else if (msg == WM_LBUTTONDOWN) {
+        g_origMouseDownCalls++;
+        return 0;
+    } else if (msg == WM_MOUSEMOVE) {
+        g_origMouseMoveCalls++;
+        return 0;
+    } else if (msg == WM_IME_CHAR) {
+        // 模拟 UE4 原窗口过程会吞掉 WM_IME_CHAR（若 HookedWndProc 漏拦截并透传下来，中文输入会彻底丢失）
+        return 0;
+    }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// 在进程内存中构造与 Maine-Win64-Shipping.exe 100% 相同偏移的模拟 UWidget / SWidget / FGeometry / UMapPanelWidget
 struct MockRefCtrl {
     uint64_t vtable = 0;
     int32_t strongCount = 2;
@@ -54,10 +92,10 @@ static_assert(offsetof(MockSWidget, cachedGeom) == 0xD0, "cachedGeom offset must
 
 struct alignas(16) MockUWidget {
     uint8_t pad0[0xE0]{};
-    MockSWidget* gcWidget = nullptr;   // +0xE0（UUserWidget::MyGCWidget 路径）
-    MockRefCtrl* gcRefCtrl = nullptr;  // +0xE8
-    MockSWidget* myWidget = nullptr;   // +0xF0（UWidget::MyWidget 路径）
-    MockRefCtrl* myRefCtrl = nullptr;  // +0xF8
+    MockSWidget* gcWidget = nullptr;
+    MockRefCtrl* gcRefCtrl = nullptr;
+    MockSWidget* myWidget = nullptr;
+    MockRefCtrl* myRefCtrl = nullptr;
     uint8_t pad1[0x10]{};
 };
 static_assert(offsetof(MockUWidget, gcWidget) == 0xE0, "gcWidget offset must be 0xE0");
@@ -65,19 +103,15 @@ static_assert(offsetof(MockUWidget, myWidget) == 0xF0, "myWidget offset must be 
 
 struct alignas(16) MockMapPanel {
     uint8_t pad0[0x3A0]{};
-    float maxBoundsX = 80000.0f;  // +0x3A0
-    float maxBoundsY = 80000.0f;  // +0x3A4
-    float minBoundsX = -80000.0f; // +0x3A8
-    float minBoundsY = -80000.0f; // +0x3AC
-    float texSizeX = 2048.0f;     // +0x3B0
-    float texSizeY = 2048.0f;     // +0x3B4
+    float maxBoundsX = 80000.0f;
+    float maxBoundsY = 80000.0f;
+    float minBoundsX = -80000.0f;
+    float minBoundsY = -80000.0f;
+    float texSizeX = 2048.0f;
+    float texSizeY = 2048.0f;
     uint8_t pad1[0x90]{};
 };
-static_assert(offsetof(MockMapPanel, maxBoundsX) == 0x3A0, "maxBoundsX offset must be 0x3A0");
-static_assert(offsetof(MockMapPanel, minBoundsX) == 0x3A8, "minBoundsX offset must be 0x3A8");
-static_assert(offsetof(MockMapPanel, texSizeX) == 0x3B0, "texSizeX offset must be 0x3B0");
 
-/// 构造包含窗口偏移、裁剪边框、带 90 度旋转与 0.5x 缩放的画布及玩家图标的完整模拟夹具。
 struct NativeMapMockFixture {
     MockRefCtrl refCtrl;
     MockSWidget sCanvas, sBorder, sRootWin, sPlayerIcon;
@@ -85,17 +119,15 @@ struct NativeMapMockFixture {
     MockMapPanel panel;
 
     NativeMapMockFixture() {
-        // 模拟 1280x720 窗口全屏 UI_InGameMenu（走 UUserWidget::MyGCWidget 路径 +0xE0/+0xE8）
         sRootWin.cachedGeom.sizeX = 1280.0f;
         sRootWin.cachedGeom.sizeY = 720.0f;
         sRootWin.cachedGeom.m00 = 1.0f;
         sRootWin.cachedGeom.m11 = 1.0f;
-        sRootWin.cachedGeom.transX = 100.0f; // 模拟窗口位于桌面 (100, 50)
+        sRootWin.cachedGeom.transX = 100.0f;
         sRootWin.cachedGeom.transY = 50.0f;
         uRootWin.gcWidget = &sRootWin;
         uRootWin.gcRefCtrl = &refCtrl;
 
-        // 模拟 MapBorder（顶部保留 60px 标题栏）
         sBorder.cachedGeom.sizeX = 1280.0f;
         sBorder.cachedGeom.sizeY = 660.0f;
         sBorder.cachedGeom.m00 = 1.0f;
@@ -105,25 +137,17 @@ struct NativeMapMockFixture {
         uBorder.myWidget = &sBorder;
         uBorder.myRefCtrl = &refCtrl;
 
-        // 模拟 CollectibleCanvas：2048x2048，带 0.5x 缩放 + 90 度旋转（验证任意旋转与缩放！）
-        // 旋转 90 度：m00=0, m01=0.5, m10=-0.5, m11=0，中心平移到窗口中心 (100+640, 50+360)
         sCanvas.cachedGeom.sizeX = 2048.0f;
         sCanvas.cachedGeom.sizeY = 2048.0f;
         sCanvas.cachedGeom.m00 = 0.0f;
         sCanvas.cachedGeom.m01 = 0.5f;
         sCanvas.cachedGeom.m10 = -0.5f;
         sCanvas.cachedGeom.m11 = 0.0f;
-        // local=(1024,1024) 映射到桌面 (740, 410) => transX = 740 - (-0.5*1024) = 1252, transY = 410 - (0.5*1024) = -102
         sCanvas.cachedGeom.transX = 1252.0f;
         sCanvas.cachedGeom.transY = -102.0f;
         uCanvas.myWidget = &sCanvas;
         uCanvas.myRefCtrl = &refCtrl;
 
-        // 模拟玩家在世界坐标 (16000, -16000)：
-        // normX = (16000 - (-80000)) / 160000 = 0.6 => localX = 1024 + 0.1*2048 = 1228.8
-        // normY = (-16000 - (-80000)) / 160000 = 0.4 => localY = 1024 - 0.1*2048 = 819.2
-        // absX = 1228.8*0 + 819.2*(-0.5) + 1252 = 842.4 => dispX = 742.4
-        // absY = 1228.8*0.5 + 819.2*0 - 102 = 512.4 => dispY = 462.4
         sPlayerIcon.cachedGeom.sizeX = 24.0f;
         sPlayerIcon.cachedGeom.sizeY = 24.0f;
         sPlayerIcon.cachedGeom.m00 = 1.0f;
@@ -135,7 +159,6 @@ struct NativeMapMockFixture {
     }
 };
 
-/// 将模拟控件的进程内真实地址写入 data/map_live.json，供 DLL 走 NativeSlateFGeometry 路径读取。
 static void WriteNativeSlateMapData(const std::wstring& dataDir, const NativeMapMockFixture& fx) {
     CreateDirectoryW(dataDir.c_str(), nullptr);
     char buf[2048];
@@ -171,7 +194,12 @@ static void WriteNativeSlateMapData(const std::wstring& dataDir, const NativeMap
     ofs << buf;
 }
 
-/// 写入模拟的 data/status.json，用于回归测试房主与联机客机两种角色下的死亡保护 UI 分支。
+static void WriteMapClosedData(const std::wstring& dataDir) {
+    CreateDirectoryW(dataDir.c_str(), nullptr);
+    std::ofstream ofs(dataDir + L"\\map_live.json", std::ios::binary | std::ios::trunc);
+    ofs << "{\"mapOpen\":false}\n";
+}
+
 static void WriteMockStatusData(const std::wstring& dataDir, bool isHost, bool liveKeepInv, bool liveNoDurPen) {
     CreateDirectoryW(dataDir.c_str(), nullptr);
     char buf[1024];
@@ -202,7 +230,6 @@ static void WriteMockStatusData(const std::wstring& dataDir, bool isHost, bool l
     ofs << buf;
 }
 
-/// 读取文本文件全部内容，用于断言 config.json 与 overlay.log 关键字段。
 static std::string ReadTextFile(const std::wstring& path) {
     std::ifstream ifs(path, std::ios::binary);
     std::ostringstream ss;
@@ -210,12 +237,20 @@ static std::string ReadTextFile(const std::wstring& path) {
     return ss.str();
 }
 
-/// DX12 全流程回归测试：配置初始化 + 图形挂钩 + 0 像素误差地图投影 + 房主/客机菜单渲染 + ResizeBuffers。
+static void PumpMessages() {
+    MSG m{};
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+}
+
+/// DX12 全流程回归测试：配置初始化 + 图形挂钩 + 0 像素误差地图投影 + 光标零干扰 + 窗口线程混合 IME + 空闲零开销直通 + ResizeBuffers。
 static int RunDx12Test(const std::wstring& dllPath) {
     size_t slash = dllPath.find_last_of(L"\\/");
     std::wstring dataDir = dllPath.substr(0, slash) + L"\\data";
-    // 先清理旧测试 config.json，确保本次能验证 DLL 首次初始化自动落盘的新字段默认值
     DeleteFileW((dataDir + L"\\config.json").c_str());
+    DeleteFileW((dataDir + L"\\actions.json").c_str());
 
     std::printf("[TEST-DX12] Loading DLL...\n");
     HMODULE mod = LoadLibraryW(dllPath.c_str());
@@ -224,28 +259,30 @@ static int RunDx12Test(const std::wstring& dllPath) {
         return 1;
     }
     auto queryState = reinterpret_cast<QueryStateFn>(GetProcAddress(mod, "GroundedQoL_QueryTestState"));
-    if (!queryState) {
-        std::printf("[FAIL] GroundedQoL_QueryTestState not found\n");
+    auto queryMetrics = reinterpret_cast<QueryMetricsFn>(GetProcAddress(mod, "GroundedQoL_QueryTestMetrics"));
+    auto expireBanner = reinterpret_cast<VoidTestFn>(GetProcAddress(mod, "GroundedQoL_TestExpireStartupBanner"));
+    auto setWantText = reinterpret_cast<SetWantTextFn>(GetProcAddress(mod, "GroundedQoL_TestSetWantTextInput"));
+    if (!queryState || !queryMetrics || !expireBanner || !setWantText) {
+        std::printf("[FAIL] Missing test exports in DLL\n");
         return 2;
     }
 
-    // 构造真实 UE4 偏移的内存模拟控件，验证 NativeSlateFGeometry 零误差投影与标点绘制
     NativeMapMockFixture fixture;
     WriteNativeSlateMapData(dataDir, fixture);
     WriteMockStatusData(dataDir, true, true, false);
 
-    // 等待 DLL 后台线程完成 IpcBridge::Initialize 与 MinHook 挂钩
     Sleep(800);
 
-    // 断言新配置字段（死亡背包保留、免除死亡耐久惩罚）已正确写入 config.json 且默认为 false
+    // 1. 断言默认配置包含死亡保护与 imeCandidateMode=0
     {
         std::string cfgText = ReadTextFile(dataDir + L"\\config.json");
         if (cfgText.find("\"keepInventoryOnDeath\": false") == std::string::npos ||
-            cfgText.find("\"noDeathDurabilityPenalty\": false") == std::string::npos) {
-            std::printf("[FAIL] Default config.json missing expected death protection fields!\nContent:\n%s\n", cfgText.c_str());
+            cfgText.find("\"noDeathDurabilityPenalty\": false") == std::string::npos ||
+            cfgText.find("\"imeCandidateMode\": 0") == std::string::npos) {
+            std::printf("[FAIL] Default config.json missing expected fields!\nContent:\n%s\n", cfgText.c_str());
             return 20;
         }
-        std::printf("[TEST-DX12] Verified default death protection config fields in config.json!\n");
+        std::printf("[TEST-DX12] Verified default config fields (death protection + imeCandidateMode=0)\n");
     }
 
     WNDCLASSEXW wc{};
@@ -259,6 +296,25 @@ static int RunDx12Test(const std::wstring& dllPath) {
                                 WS_OVERLAPPEDWINDOW, 100, 100, 1280, 720,
                                 nullptr, nullptr, wc.hInstance, nullptr);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    // 模拟 UE4 FWindowsTextInputMethodSystem 同时通过 TSF 空禁用文档管理器 + IMM 禁用窗口输入法
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    ITfThreadMgr* tsfMgr = nullptr;
+    ITfDocumentMgr* ue4DisabledDoc = nullptr;
+    ITfDocumentMgr* origCuasDoc = nullptr;
+    TfClientId tsfClientId = TF_CLIENTID_NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&tsfMgr))) && tsfMgr) {
+        tsfMgr->Activate(&tsfClientId);
+        if (SUCCEEDED(tsfMgr->CreateDocumentMgr(&ue4DisabledDoc)) && ue4DisabledDoc) {
+            tsfMgr->AssociateFocus(hwnd, ue4DisabledDoc, &origCuasDoc);
+        }
+    }
+    ::ImmAssociateContextEx(hwnd, nullptr, 0);
+    if (HIMC initCheck = ::ImmGetContext(hwnd)) {
+        ::ImmReleaseContext(hwnd, initCheck);
+        std::printf("[FAIL] Failed to simulate UE4 IME detach before test!\n");
+        return 21;
+    }
 
     IDXGIFactory4* factory = nullptr;
     ID3D12Device* dev = nullptr;
@@ -300,11 +356,7 @@ static int RunDx12Test(const std::wstring& dllPath) {
     UINT64 fval = 0;
     auto pumpAndPresent = [&](int frames) -> bool {
         for (int i = 0; i < frames; ++i) {
-            MSG m{};
-            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&m);
-                DispatchMessageW(&m);
-            }
+            PumpMessages();
             alloc->Reset();
             cmdList->Reset(alloc, nullptr);
             cmdList->Close();
@@ -340,36 +392,230 @@ static int RunDx12Test(const std::wstring& dllPath) {
         return 18;
     }
 
-    // 读取 overlay.log 验证 NativeSlateFGeometry 激活且玩家 0 像素误差自检通过
+    // 2. 验证 0.00px 投影精度
     {
-        std::ifstream logFile(dataDir + L"\\overlay.log");
-        std::ostringstream ss;
-        ss << logFile.rdbuf();
-        std::string logText = ss.str();
+        std::string logText = ReadTextFile(dataDir + L"\\overlay.log");
         if (logText.find("NativeSlateFGeometry") == std::string::npos ||
             logText.find("playerErr=0.00px") == std::string::npos) {
             std::printf("[FAIL] overlay.log did not confirm 0.00px NativeSlateFGeometry accuracy!\nLog:\n%s\n", logText.c_str());
             return 19;
         }
-        std::printf("[TEST-DX12] Verified NativeSlateFGeometry playerErr=0.00px in overlay.log!\n");
+        std::printf("[TEST-DX12] Verified NativeSlateFGeometry playerErr=0.00px\n");
     }
 
-    // 模拟按下 Insert 打开中文 Mod 菜单并渲染 6 帧（房主模式）
+    // 3. 验证菜单关闭时的零光标干扰不变量（ADR-0004 / Issue #2）
+    {
+        int prevSetCur = g_origSetCursorCalls;
+        int prevMouseDown = g_origMouseDownCalls;
+        int prevMouseMove = g_origMouseMoveCalls;
+        ::SetCursor(::LoadCursorW(nullptr, IDC_IBEAM)); // 故意先设一个非空光标
+        SendMessageW(hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+        SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(300, 300));
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(300, 300));
+
+        if (g_origSetCursorCalls != prevSetCur + 1 || ::GetCursor() != nullptr) {
+            std::printf("[FAIL] Menu-closed WM_SETCURSOR was interfered with! origCalls=%d->%d cursor=%p\n",
+                        prevSetCur, g_origSetCursorCalls, ::GetCursor());
+            return 30;
+        }
+        if (g_origMouseDownCalls != prevMouseDown + 1 || g_origMouseMoveCalls != prevMouseMove + 1 || ::GetCapture() != nullptr) {
+            std::printf("[FAIL] Menu-closed mouse events or capture were interfered with! down=%d->%d move=%d->%d cap=%p\n",
+                        prevMouseDown, g_origMouseDownCalls, prevMouseMove, g_origMouseMoveCalls, ::GetCapture());
+            return 31;
+        }
+        std::printf("[TEST-DX12] Verified menu-closed ZERO cursor/capture interference!\n");
+    }
+
+    // 4. 验证空闲零开销直通路径（ADR-0004 / Issue #3）
+    {
+        WriteMapClosedData(dataDir);
+        expireBanner();
+        Sleep(150); // 等待后台异步 IPC 线程同步 mapOpen=false
+        if (!pumpAndPresent(3)) return 32;
+
+        unsigned long long idleBefore = 0, renderedBefore = 0;
+        int imeChars0 = 0;
+        queryMetrics(&idleBefore, &renderedBefore, &imeChars0);
+
+        if (!pumpAndPresent(8)) return 33;
+
+        unsigned long long idleAfter = 0, renderedAfter = 0;
+        queryMetrics(&idleAfter, &renderedAfter, &imeChars0);
+        int stIdle = queryState();
+        std::printf("[TEST-DX12] Idle pass-through check: state=0x%X idle=%llu->%llu rendered=%llu->%llu\n",
+                    stIdle, idleBefore, idleAfter, renderedBefore, renderedAfter);
+        if ((stIdle & (1 << 4)) == 0 || (idleAfter - idleBefore) < 8 || renderedAfter != renderedBefore) {
+            std::printf("[FAIL] Idle zero-overhead pass-through did NOT skip DX12 rendering!\n");
+            return 34;
+        }
+        std::printf("[TEST-DX12] Verified DX12 idle zero-overhead pass-through!\n");
+    }
+
+    // 5. 按 Insert 打开 Mod 菜单：验证单系统光标接管、游戏鼠标屏蔽与自动软刷新指令（Q3 / Q9）
     SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
     if (!pumpAndPresent(6)) return 12;
     int st2 = queryState();
-    std::printf("[TEST-DX12] After Insert key state=0x%X (expect bit2=MenuOpen)\n", st2);
     if ((st2 & 4) == 0) {
         std::printf("[FAIL] Insert key did NOT open Mod menu!\n");
         return 13;
     }
 
-    // 切换为联机客机状态并等待低频轮询周期，验证死亡保护区域灰显禁用分支渲染正常
-    Sleep(500);
+    {
+        int prevSetCur = g_origSetCursorCalls;
+        int prevMouseDown = g_origMouseDownCalls;
+        SendMessageW(hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+        // 连续模拟完整鼠标点击（按下 -> SetCapture -> 抬起 -> ReleaseCapture 同步重入 WM_CAPTURECHANGED），
+        // 严格回归防复发：此前非递归 mutex 会在此处同步重入并抛 std::system_error 闪退！
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(300, 300));
+        SendMessageW(hwnd, WM_CAPTURECHANGED, 0, 0);
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(300, 300));
+        if (g_origSetCursorCalls != prevSetCur || ::GetCursor() == nullptr) {
+            std::printf("[FAIL] Menu-open did NOT take over single OS cursor cleanly! origCalls=%d->%d cur=%p\n",
+                        prevSetCur, g_origSetCursorCalls, ::GetCursor());
+            return 35;
+        }
+        if (g_origMouseDownCalls != prevMouseDown) {
+            std::printf("[FAIL] Menu-open leaked WM_LBUTTONDOWN to game!\n");
+            return 36;
+        }
+
+        // 写入模拟大目录并模拟点击 Tab 2 区域，验证 Tab 2 渲染 + ImGuiListClipper + 完整点击链路无崩溃
+        {
+            std::ofstream catOfs(dataDir + L"\\catalog.json", std::ios::binary | std::ios::trunc);
+            catOfs << "[";
+            for (int ci = 0; ci < 200; ++ci) {
+                if (ci > 0) catOfs << ",";
+                catOfs << "{\"id\":\"item:TestItem" << ci << "\",\"name\":\"测试物品" << ci
+                       << "\",\"rawName\":\"TestItem" << ci << "\",\"category\":\"item\",\"count\":"
+                       << (ci + 1) << ",\"surveyable\":true,\"rowName\":\"TestItem" << ci << "\"}";
+            }
+            catOfs << "]";
+        }
+        Sleep(420); // 等待后台异步 IPC 线程加载 catalog.json
+        // 点击菜单顶部第二标签页大约位置（窗口居中 1280x720，宽 800 高 700 -> 左上角 (240,10)，TabBar 约在 y=105, Tab2 x≈470）
+        SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(470, 105));
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(470, 105));
+        if (!pumpAndPresent(2)) return 36;
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(470, 105));
+        if (!pumpAndPresent(4)) return 36;
+
+        // 等待后台异步写盘线程写出 refresh_catalog_soft
+        Sleep(150);
+        std::string actText = ReadTextFile(dataDir + L"\\actions.json");
+        if (actText.find("refresh_catalog_soft") == std::string::npos) {
+            std::printf("[FAIL] Opening menu did NOT trigger refresh_catalog_soft action! actions.json=%s\n", actText.c_str());
+            return 37;
+        }
+        std::printf("[TEST-DX12] Verified menu-open OS cursor takeover, re-entrant click/capture safety, Tab 2 catalog render, and refresh_catalog_soft!\n");
+    }
+
+    // 6. 验证窗口主线程按需 IME 激活、组词期 Esc 防误关、WM_IME_CHAR 中文输入与失焦还原（ADR-0003 / Issue #1）
+    {
+        // 6a. 打开菜单但未点击输入框前，IME 仍保持 UE4 的禁用态（防跑图误触）
+        if (HIMC beforeFocus = ::ImmGetContext(hwnd)) {
+            ::ImmReleaseContext(hwnd, beforeFocus);
+            std::printf("[FAIL] IME should remain detached before any textbox gets focus!\n");
+            return 38;
+        }
+
+        // 6b. 模拟点击搜索框获焦 -> 窗口线程自动解绑 UE4 的 TSFDisabledDocumentManager 并恢复 CUAS/HIMC
+        setWantText(1, 220.0f, 340.0f);
+        PumpMessages();
+        HIMC activeHimc = ::ImmGetContext(hwnd);
+        int stIme = queryState();
+        if (!activeHimc || (stIme & (1 << 5)) == 0) {
+            if (activeHimc) ::ImmReleaseContext(hwnd, activeHimc);
+            std::printf("[FAIL] Window-thread IME failed to activate on textbox focus! himc=%p state=0x%X\n",
+                        activeHimc, stIme);
+            return 39;
+        }
+        ::ImmReleaseContext(hwnd, activeHimc);
+        if (tsfMgr && ue4DisabledDoc) {
+            ITfDocumentMgr* curDoc = nullptr;
+            ITfDocumentMgr* tmpDoc = nullptr;
+            tsfMgr->AssociateFocus(hwnd, nullptr, &curDoc);
+            if (curDoc) tsfMgr->AssociateFocus(hwnd, curDoc, &tmpDoc);
+            if (tmpDoc) tmpDoc->Release();
+            bool stillDisabled = (curDoc == ue4DisabledDoc);
+            bool missingCuasWhenHadOrig = (origCuasDoc != nullptr && curDoc == nullptr);
+            if (curDoc) curDoc->Release();
+            if (stillDisabled || missingCuasWhenHadOrig) {
+                std::printf("[FAIL] UE4 TSFDisabledDocumentManager was NOT detached cleanly! curDoc=%p disabled=%p origCuas=%p\n",
+                            curDoc, ue4DisabledDoc, origCuasDoc);
+                return 47;
+            }
+        }
+
+        // 6c. 模拟拼音组词期间按 Esc -> 仅取消组词，绝不关掉 Mod 菜单
+        SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+        if ((queryState() & (1 << 6)) == 0) {
+            std::printf("[FAIL] WM_IME_STARTCOMPOSITION did NOT set composing state!\n");
+            return 40;
+        }
+        SendMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+        int stAfterEsc = queryState();
+        if ((stAfterEsc & (1 << 2)) == 0 || (stAfterEsc & (1 << 6)) != 0) {
+            std::printf("[FAIL] Esc during IME composition closed menu or failed to cancel composition! state=0x%X\n",
+                        stAfterEsc);
+            return 41;
+        }
+
+        // 6d. 模拟中文字符经 WM_IME_CHAR 提交（"薄荷" U+8584 U+8377），验证经 DefWindowProcW -> WM_CHAR 进入 ImGui 而不被 UE4 吞掉
+        unsigned long long d1 = 0, d2 = 0;
+        int imeBefore = 0, imeAfter = 0;
+        queryMetrics(&d1, &d2, &imeBefore);
+        SendMessageW(hwnd, WM_IME_CHAR, 0x8584, 0);
+        SendMessageW(hwnd, WM_IME_CHAR, 0x8377, 0);
+        PumpMessages();
+        queryMetrics(&d1, &d2, &imeAfter);
+        if ((imeAfter - imeBefore) < 2) {
+            std::printf("[FAIL] Chinese WM_IME_CHAR characters did NOT reach ImGui! delta=%d\n", imeAfter - imeBefore);
+            return 42;
+        }
+
+        // 6e. Alt+Tab 切窗（WM_KILLFOCUS -> WM_SETFOCUS）：保持菜单打开但临时释放 IME，切回后自动恢复
+        SendMessageW(hwnd, WM_KILLFOCUS, 0, 0);
+        if ((queryState() & (1 << 2)) == 0) {
+            std::printf("[FAIL] Alt+Tab (WM_KILLFOCUS) unexpectedly closed Mod menu!\n");
+            return 43;
+        }
+        if (HIMC duringKill = ::ImmGetContext(hwnd)) {
+            ::ImmReleaseContext(hwnd, duringKill);
+            std::printf("[FAIL] Alt+Tab (WM_KILLFOCUS) did NOT detach IME!\n");
+            return 44;
+        }
+        SendMessageW(hwnd, WM_SETFOCUS, 0, 0);
+        PumpMessages();
+
+        // 6f. 文本框失焦 -> 窗口线程精确还原 UE4 禁用 IME 与 TSFDisabledDocumentManager 状态
+        setWantText(0, 0.0f, 0.0f);
+        PumpMessages();
+        if (HIMC afterBlur = ::ImmGetContext(hwnd)) {
+            ::ImmReleaseContext(hwnd, afterBlur);
+            std::printf("[FAIL] IME was NOT detached back to UE4 state after textbox blur!\n");
+            return 45;
+        }
+        if (tsfMgr && ue4DisabledDoc) {
+            ITfDocumentMgr* restoredDoc = nullptr;
+            ITfDocumentMgr* tmpDoc = nullptr;
+            tsfMgr->AssociateFocus(hwnd, nullptr, &restoredDoc);
+            if (restoredDoc) tsfMgr->AssociateFocus(hwnd, restoredDoc, &tmpDoc);
+            if (tmpDoc) tmpDoc->Release();
+            bool restoredOk = (restoredDoc == ue4DisabledDoc);
+            if (restoredDoc) restoredDoc->Release();
+            if (!restoredOk) {
+                std::printf("[FAIL] UE4 TSFDisabledDocumentManager was NOT restored after textbox blur!\n");
+                return 48;
+            }
+        }
+        std::printf("[TEST-DX12] Verified window-thread TSF+IMM unlock/restore, Esc composition guard, Chinese WM_IME_CHAR, and Alt+Tab!\n");
+    }
+
+    // 7. 切换联机客机状态 + ResizeBuffers 稳定性验证
+    Sleep(450);
     WriteMockStatusData(dataDir, false, false, false);
     if (!pumpAndPresent(6)) return 13;
 
-    // 模拟 ResizeBuffers（Alt+Tab / 分辨率切换）
     HRESULT hrResize = swap3->ResizeBuffers(2, 1024, 600, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
     if (FAILED(hrResize)) {
         std::printf("[FAIL] DX12 ResizeBuffers failed: 0x%08lX\n", hrResize);
@@ -377,21 +623,28 @@ static int RunDx12Test(const std::wstring& dllPath) {
     }
     if (!pumpAndPresent(5)) return 15;
 
-    // 模拟按 F8 关闭菜单
+    // 8. 按 F8 关闭菜单 -> 验证立即向 UE4 归还隐藏光标
     Sleep(220);
+    int prevSetCurBeforeClose = g_origSetCursorCalls;
     SendMessageW(hwnd, WM_KEYDOWN, VK_F8, 0);
     if (!pumpAndPresent(4)) return 16;
     int st3 = queryState();
-    std::printf("[TEST-DX12] After F8 key state=0x%X (expect bit2=0 MenuClosed)\n", st3);
     if ((st3 & 4) != 0) {
         std::printf("[FAIL] F8 key did NOT close Mod menu!\n");
         return 17;
     }
+    if (g_origSetCursorCalls <= prevSetCurBeforeClose || ::GetCursor() != nullptr) {
+        std::printf("[FAIL] Closing menu did NOT immediately hand cursor back to UE4! origCalls=%d->%d cur=%p\n",
+                    prevSetCurBeforeClose, g_origSetCursorCalls, ::GetCursor());
+        return 46;
+    }
+    std::printf("[TEST-DX12] Verified F8 close immediately restored UE4 hidden cursor!\n");
 
-    // 清理测试生成的临时 IPC 数据文件
     DeleteFileW((dataDir + L"\\map_live.json").c_str());
     DeleteFileW((dataDir + L"\\status.json").c_str());
     DeleteFileW((dataDir + L"\\config.json").c_str());
+    DeleteFileW((dataDir + L"\\actions.json").c_str());
+    DeleteFileW((dataDir + L"\\catalog.json").c_str());
 
     std::printf("[PASS] DX12 full regression test PASSED!\n");
     std::fflush(stdout);
@@ -399,18 +652,18 @@ static int RunDx12Test(const std::wstring& dllPath) {
     return 0;
 }
 
-/// DX11 回退后端回归测试：验证预置启用配置的持久化加载、DX11 SwapChain 初始化、菜单打开与无崩溃渲染。
+/// DX11 回退后端回归测试：验证预置死亡保护与强制内置自绘候选条配置持久化加载、DX11 初始化、菜单与空闲直通。
 static int RunDx11Test(const std::wstring& dllPath) {
     size_t slash = dllPath.find_last_of(L"\\/");
     std::wstring dataDir = dllPath.substr(0, slash) + L"\\data";
     CreateDirectoryW(dataDir.c_str(), nullptr);
 
-    // 预置开启死亡保护的 config.json，验证 DLL 启动加载已有配置时不覆盖用户的开启状态
     {
         std::ofstream ofs(dataDir + L"\\config.json", std::ios::binary | std::ios::trunc);
         ofs << "{\n"
                "  \"keepInventoryOnDeath\": true,\n"
                "  \"noDeathDurabilityPenalty\": true,\n"
+               "  \"imeCandidateMode\": 2,\n"
                "  \"stackEnabled\": true,\n"
                "  \"stackMultiplier\": 15\n"
                "}\n";
@@ -420,19 +673,20 @@ static int RunDx11Test(const std::wstring& dllPath) {
     HMODULE mod = LoadLibraryW(dllPath.c_str());
     if (!mod) return 21;
     auto queryState = reinterpret_cast<QueryStateFn>(GetProcAddress(mod, "GroundedQoL_QueryTestState"));
-    if (!queryState) return 22;
+    auto expireBanner = reinterpret_cast<VoidTestFn>(GetProcAddress(mod, "GroundedQoL_TestExpireStartupBanner"));
+    if (!queryState || !expireBanner) return 22;
 
     Sleep(800);
 
-    // 确认预置配置被保留而未被默认值覆盖
     {
         std::string cfgText = ReadTextFile(dataDir + L"\\config.json");
         if (cfgText.find("\"keepInventoryOnDeath\": true") == std::string::npos ||
-            cfgText.find("\"noDeathDurabilityPenalty\": true") == std::string::npos) {
-            std::printf("[FAIL] Pre-existing death protection config was unexpectedly overwritten!\n");
+            cfgText.find("\"noDeathDurabilityPenalty\": true") == std::string::npos ||
+            cfgText.find("\"imeCandidateMode\": 2") == std::string::npos) {
+            std::printf("[FAIL] Pre-existing config was unexpectedly overwritten!\n");
             return 27;
         }
-        std::printf("[TEST-DX11] Verified pre-existing death protection config preserved!\n");
+        std::printf("[TEST-DX11] Verified pre-existing config (including imeCandidateMode=2) preserved!\n");
     }
 
     WNDCLASSEXW wc{};
@@ -470,23 +724,37 @@ static int RunDx11Test(const std::wstring& dllPath) {
     }
 
     for (int i = 0; i < 6; ++i) {
+        PumpMessages();
         if (FAILED(swap->Present(0, 0))) return 24;
         Sleep(16);
     }
     int st1 = queryState();
-    std::printf("[TEST-DX11] After 6 frames state=0x%X (expect bit1=DX11)\n", st1);
-    if ((st1 & 2) == 0) {
-        std::printf("[FAIL] Overlay did NOT initialize DX11 backend!\n");
+    std::printf("[TEST-DX11] After 6 frames state=0x%X (expect bit1=DX11, bit7=SelfDrawnIme)\n", st1);
+    if ((st1 & 2) == 0 || (st1 & (1 << 7)) == 0) {
+        std::printf("[FAIL] DX11 backend or imeCandidateMode=2 self-drawn mode NOT active!\n");
         return 25;
     }
 
+    // 验证 DX11 空闲直通路径
+    expireBanner();
+    for (int i = 0; i < 4; ++i) {
+        PumpMessages();
+        if (FAILED(swap->Present(0, 0))) return 28;
+        Sleep(16);
+    }
+    if ((queryState() & (1 << 4)) == 0) {
+        std::printf("[FAIL] DX11 idle zero-overhead pass-through NOT active!\n");
+        return 29;
+    }
+
     SendMessageW(hwnd, WM_KEYDOWN, VK_F8, 0);
-    for (int i = 0; i < 4; ++i) { swap->Present(0, 0); Sleep(16); }
+    for (int i = 0; i < 4; ++i) { PumpMessages(); swap->Present(0, 0); Sleep(16); }
     int st2 = queryState();
     std::printf("[TEST-DX11] After F8 state=0x%X (expect bit2=MenuOpen)\n", st2);
     if ((st2 & 4) == 0) return 26;
 
     DeleteFileW((dataDir + L"\\config.json").c_str());
+    DeleteFileW((dataDir + L"\\actions.json").c_str());
 
     std::printf("[PASS] DX11 full regression test PASSED!\n");
     std::fflush(stdout);
@@ -494,9 +762,7 @@ static int RunDx11Test(const std::wstring& dllPath) {
     return 0;
 }
 
-/// 回归测试命令行入口：根据参数执行 dx12 或 dx11 完整验证流程。
 int wmain(int argc, wchar_t** argv) {
-    // 关闭 stdout 行/块缓冲，确保在管道重定向场景下 TerminateProcess 前所有日志完整落出
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
         std::printf("Usage: overlay_regression_test <dx12|dx11> <path_to_GroundedQoLOverlay.dll>\n");
