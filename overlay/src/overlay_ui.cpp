@@ -1,3 +1,13 @@
+/*
+ * 文件：overlay/src/overlay_ui.cpp
+ * 职责：实现 GroundedQoL 游戏内中文悬浮菜单（倍率/免材/死亡保护与背包找回/M 地图追踪/联机说明）
+ *       以及 “M” 大地图零延迟实时标点投影层。
+ * 关键技术说明：
+ *   - 为消除 Lua 轮询带来的拖拽滞后，本文件通过纯 SEH 保护函数直接读取 UE 4.27 UWidget -> SWidget
+ *     内存中的 56 字节 FGeometry 变换矩阵，以游戏原生 60~144Hz 帧率完成世界坐标到屏幕像素的零误差投影。
+ *   - 菜单状态通过 IpcBridge 与 Lua 逻辑层解耦；死亡保护与一键找回背包严格遵循房主权威约束（客机端灰显禁用）。
+ */
+
 #include "overlay_ui.h"
 #include "dx11_hook.h"
 #include "ipc.h"
@@ -47,6 +57,7 @@ struct UeFGeometry {
 };
 static_assert(sizeof(UeFGeometry) == 0x38, "UeFGeometry must match UE 4.27 0x38 byte size");
 
+/// 粗筛合法的 Windows x64 用户态 8 字节对齐指针，拦截空指针/内核态/明显野指针后再进入 SEH 解引用。
 inline bool IsLikelyUserPtr(uintptr_t p) {
     return p >= 0x0000000000010000ULL && p < 0x00007FFFFFFFFFFFULL && ((p & 0x7ULL) == 0);
 }
@@ -341,6 +352,7 @@ struct HoveredPinState {
 std::mutex g_hoverMutex;
 HoveredPinState g_hoveredPin;
 
+/// 仅转换 ASCII 大写字母为小写，避免破坏 UTF-8 多字节中文编码。
 std::string ToLowerAscii(const std::string& s) {
     std::string out = s;
     for (char& c : out) {
@@ -349,11 +361,13 @@ std::string ToLowerAscii(const std::string& s) {
     return out;
 }
 
+/// 大小写不敏感的子串匹配（兼容中英文混合检索关键词）。
 bool ContainsCaseInsensitive(const std::string& haystack, const std::string& needle) {
     if (needle.empty()) return true;
     return ToLowerAscii(haystack).find(ToLowerAscii(needle)) != std::string::npos;
 }
 
+/// 将资源目录内部分类键映射为菜单展示用的简体中文分类标签。
 const char* CategoryLabelZh(const std::string& cat) {
     if (cat == "item") return "散落物品";
     if (cat == "node") return "采集点/矿石";
@@ -812,6 +826,42 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
             }
             ImGui::TextDisabled("说明：秒建对全队放置的蓝图即时生效；无材料制作在房主端立刻生效，队友安装分享包后亦可同步使用。");
 
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // 5. 死亡背包保留、耐久保护与一键找回背包（遵循房主权威约束，不影响 Steam 成就）
+            ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.78f, 1.0f), "5. 死亡保护与一键找回背包（房主设置全队生效，不影响成就）");
+            const bool isClientBlocked = status.inWorld && !status.isHost;
+            ImGui::BeginDisabled(isClientBlocked);
+            if (ImGui::Checkbox("死亡时保留背包内全部物品（不生成掉落背包）##keepinv", &cfg.keepInventoryOnDeath)) {
+                cfgDirty = true;
+            }
+            if (ImGui::Checkbox("同时免除死亡装备耐久度惩罚（独立可选）##nodurpen", &cfg.noDeathDurabilityPenalty)) {
+                cfgDirty = true;
+            }
+            if (ImGui::Button("一键找回我的背包（瞬移到脚边）")) {
+                IpcBridge::Instance().PushAction("recover_my_backpacks");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("找回全队背包（各回本人脚边）")) {
+                IpcBridge::Instance().PushAction("recover_all_backpacks");
+            }
+            ImGui::EndDisabled();
+
+            if (isClientBlocked) {
+                ImGui::TextColored(
+                    ImVec4(1.0f, 0.72f, 0.32f, 1.0f),
+                    "当前为联机客机，仅房主可操作：由房主开启死亡保留或点击“找回全队背包”即可生效。");
+            } else {
+                ImGui::TextDisabled(
+                    "当前游戏实时状态：死亡背包保留 [%s] | 死亡装备耐久惩罚 [%s]",
+                    status.liveKeepInventoryOnDeath ? "已开启" : "原版掉落",
+                    status.liveNoDeathDurabilityPenalty ? "已免除" : "原版惩罚");
+                ImGui::TextDisabled(
+                    "说明：仅瞬移玩家死亡掉落的非空背包（排除建筑战利品袋），自动唤醒远距背包并在前方扇形错开摆放。");
+            }
+
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
@@ -957,6 +1007,7 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.40f, 1.0f), "多人联机（房主模式）注意事项：");
             ImGui::BulletText("玩家伤害倍率、怪物伤害倍率、采集数量倍率、原版路标与原版热区扫描：仅房主安装即可全队生效。");
+            ImGui::BulletText("死亡背包保留、免除死亡耐久惩罚与一键找回背包：仅限房主操作，开启死亡保留后全队共享；房主点击“找回全队背包”可将在线队友的掉落背包送至各自脚边（离线玩家背包送至房主脚边）。");
             ImGui::BulletText("物品堆叠上限倍率：房主可直接享受大堆叠；队友如不安装，手动拆分/拖动超量物品时客户端 UI 可能按原版上限截断，建议把生成的绿色分享包发给队友解压使用。");
             ImGui::BulletText("本插件不会将存档切换为“自定义模式”，不影响 Steam 成就解锁。");
             ImGui::EndTabItem();
@@ -970,6 +1021,7 @@ void RenderModMenuWindow(ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float u
 
 } // namespace
 
+/// 初始化 Dear ImGui 深色圆角主题、按分辨率缩放控件尺寸，并加载系统自带中文字体。
 void InitOverlayStyleAndFonts(float uiScale) {
     ImGuiStyle& style = ImGui::GetStyle();
     ImGui::StyleColorsDark(&style);
@@ -1015,6 +1067,7 @@ void InitOverlayStyleAndFonts(float uiScale) {
     }
 }
 
+/// 单帧渲染总入口：按需绘制 M 地图标点叠加层，并在菜单开启时渲染配置窗口及自动落盘修改。
 void RenderOverlayFrame(bool& menuOpen, float uiScale) {
     ModConfig cfg = IpcBridge::Instance().GetConfigCopy();
     const MapLiveState mapLive = IpcBridge::Instance().GetMapLiveCopy();
@@ -1032,8 +1085,8 @@ void RenderOverlayFrame(bool& menuOpen, float uiScale) {
     }
 }
 
+/// 在 M 地图打开且鼠标悬停到追踪标点时，响应 G 键或 Ctrl+左键向 Lua 发送原版路标放置指令。
 bool HandleMapQuickShortcut(UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
-    // 悬停在 M 地图的追踪标点上时，按 G 键或 Ctrl+左键快速放置原版路标
     bool trigger = false;
     if (msg == WM_KEYDOWN && wParam == 'G') {
         trigger = true;
@@ -1053,6 +1106,7 @@ bool HandleMapQuickShortcut(UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
     return true;
 }
 
+/// 返回最近一帧 M 地图层实际落入裁剪视口并绘制的标点数量。
 int GetLastRenderedMapPinCount() {
     return g_lastRenderedPinCount.load();
 }

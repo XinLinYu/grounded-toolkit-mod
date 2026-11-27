@@ -1,3 +1,13 @@
+/*
+ * 文件：overlay/src/ipc.cpp
+ * 职责：实现 IpcBridge 的原子 JSON 文件读写、时间戳去重轮询与线程安全状态快照分发。
+ * 并发说明：
+ *   - 渲染线程（Present）调用 PollFromLua / Get*Copy / UpdateConfigAndSave；
+ *   - 窗口消息线程（WndProc）调用 PushAction；
+ *   - 后台启动线程调用 Initialize。
+ *   所有内存状态访问均通过 m_mutex 保护，跨进程文件交互依赖 MoveFileExW 原子替换并容忍偶发解析重试。
+ */
+
 #include "ipc.h"
 
 #include <Windows.h>
@@ -12,7 +22,7 @@ namespace gqol {
 
 namespace {
 
-/// 无损解析 JSON 中的 64 位内存地址字段（兼容 "0x..." 十六进制字符串与整数）。
+/// 无损解析 JSON 中的 64 位内存地址字段（兼容 "0x..." 十六进制字符串与无符号/有符号整数）。
 uint64_t ParseAddrField(const json& j, const char* key) {
     auto it = j.find(key);
     if (it == j.end() || it->is_null()) return 0;
@@ -29,7 +39,7 @@ uint64_t ParseAddrField(const json& j, const char* key) {
     return 0;
 }
 
-/// 获取文件最后修改时间（64 位 FILETIME），失败返回 0。
+/// 获取文件最后修改时间（64 位 FILETIME），文件不存在或查询失败时返回 0。
 unsigned long long GetFileMtime64(const std::wstring& path) {
     WIN32_FILE_ATTRIBUTE_DATA fad{};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
@@ -39,6 +49,34 @@ unsigned long long GetFileMtime64(const std::wstring& path) {
     ui.LowPart = fad.ftLastWriteTime.dwLowDateTime;
     ui.HighPart = fad.ftLastWriteTime.dwHighDateTime;
     return ui.QuadPart;
+}
+
+/// 将 ModConfig 统一序列化为 JSON 对象（供首次初始化落盘与用户修改保存复用，防止字段漂移）。
+json SerializeConfigJson(const ModConfig& cfg) {
+    return json{
+        {"stackEnabled", cfg.stackEnabled},
+        {"stackMultiplier", cfg.stackMultiplier},
+        {"damageEnabled", cfg.damageEnabled},
+        {"playerDamageMultiplier", cfg.playerDamageMultiplier},
+        {"enemyDamageMultiplier", cfg.enemyDamageMultiplier},
+        {"harvestEnabled", cfg.harvestEnabled},
+        {"harvestMultiplier", cfg.harvestMultiplier},
+        {"harvestAffectHauling", cfg.harvestAffectHauling},
+        {"harvestAffectPickup", cfg.harvestAffectPickup},
+        {"instantBuildEnabled", cfg.instantBuildEnabled},
+        {"freeCraftEnabled", cfg.freeCraftEnabled},
+        {"unlockAllRecipes", cfg.unlockAllRecipes},
+        {"keepInventoryOnDeath", cfg.keepInventoryOnDeath},
+        {"noDeathDurabilityPenalty", cfg.noDeathDurabilityPenalty},
+        {"showMilkMolars", cfg.showMilkMolars},
+        {"showMegaMilkMolars", cfg.showMegaMilkMolars},
+        {"showScabColors", cfg.showScabColors},
+        {"showCollectedMolars", cfg.showCollectedMolars},
+        {"showMapLabels", cfg.showMapLabels},
+        {"showMapLegend", cfg.showMapLegend},
+        {"mapIconScale", cfg.mapIconScale},
+        {"trackedIds", cfg.trackedIds},
+    };
 }
 
 } // namespace
@@ -58,31 +96,8 @@ void IpcBridge::Initialize(const std::wstring& dllDirectory) {
     CreateDirectoryW(m_dataDir.c_str(), nullptr);
 
     if (!LoadConfigLocked()) {
-        // 首次启动时写出默认配置，确保 Lua 端立即可读取
-        ModConfig def = m_config;
-        json j = {
-            {"stackEnabled", def.stackEnabled},
-            {"stackMultiplier", def.stackMultiplier},
-            {"damageEnabled", def.damageEnabled},
-            {"playerDamageMultiplier", def.playerDamageMultiplier},
-            {"enemyDamageMultiplier", def.enemyDamageMultiplier},
-            {"harvestEnabled", def.harvestEnabled},
-            {"harvestMultiplier", def.harvestMultiplier},
-            {"harvestAffectHauling", def.harvestAffectHauling},
-            {"harvestAffectPickup", def.harvestAffectPickup},
-            {"instantBuildEnabled", def.instantBuildEnabled},
-            {"freeCraftEnabled", def.freeCraftEnabled},
-            {"unlockAllRecipes", def.unlockAllRecipes},
-            {"showMilkMolars", def.showMilkMolars},
-            {"showMegaMilkMolars", def.showMegaMilkMolars},
-            {"showScabColors", def.showScabColors},
-            {"showCollectedMolars", def.showCollectedMolars},
-            {"showMapLabels", def.showMapLabels},
-            {"showMapLegend", def.showMapLegend},
-            {"mapIconScale", def.mapIconScale},
-            {"trackedIds", def.trackedIds},
-        };
-        AtomicWriteText(m_dataDir + L"\\config.json", j.dump(2));
+        // 首次启动或旧配置文件损坏时写出完整默认配置，确保 Lua 端立即可读取
+        AtomicWriteText(m_dataDir + L"\\config.json", SerializeConfigJson(m_config).dump(2));
     }
 }
 
@@ -118,6 +133,7 @@ bool IpcBridge::AtomicWriteText(const std::wstring& path, const std::string& con
             return false;
         }
     }
+    // 使用 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH 确保跨线程/跨脚本不会读到未写完的半截文件
     return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
@@ -130,6 +146,7 @@ bool IpcBridge::LoadConfigLocked() {
     try {
         json j = json::parse(ifs);
         ModConfig cfg;
+        // 对每个字段使用默认值兜底，确保旧版本升级后新增字段平滑兼容
         cfg.stackEnabled = j.value("stackEnabled", cfg.stackEnabled);
         cfg.stackMultiplier = j.value("stackMultiplier", cfg.stackMultiplier);
         cfg.damageEnabled = j.value("damageEnabled", cfg.damageEnabled);
@@ -142,6 +159,8 @@ bool IpcBridge::LoadConfigLocked() {
         cfg.instantBuildEnabled = j.value("instantBuildEnabled", cfg.instantBuildEnabled);
         cfg.freeCraftEnabled = j.value("freeCraftEnabled", cfg.freeCraftEnabled);
         cfg.unlockAllRecipes = j.value("unlockAllRecipes", cfg.unlockAllRecipes);
+        cfg.keepInventoryOnDeath = j.value("keepInventoryOnDeath", cfg.keepInventoryOnDeath);
+        cfg.noDeathDurabilityPenalty = j.value("noDeathDurabilityPenalty", cfg.noDeathDurabilityPenalty);
         cfg.showMilkMolars = j.value("showMilkMolars", cfg.showMilkMolars);
         cfg.showMegaMilkMolars = j.value("showMegaMilkMolars", cfg.showMegaMilkMolars);
         cfg.showScabColors = j.value("showScabColors", cfg.showScabColors);
@@ -160,29 +179,7 @@ bool IpcBridge::LoadConfigLocked() {
 }
 
 void IpcBridge::SaveConfig(const ModConfig& cfg) {
-    json j = {
-        {"stackEnabled", cfg.stackEnabled},
-        {"stackMultiplier", cfg.stackMultiplier},
-        {"damageEnabled", cfg.damageEnabled},
-        {"playerDamageMultiplier", cfg.playerDamageMultiplier},
-        {"enemyDamageMultiplier", cfg.enemyDamageMultiplier},
-        {"harvestEnabled", cfg.harvestEnabled},
-        {"harvestMultiplier", cfg.harvestMultiplier},
-        {"harvestAffectHauling", cfg.harvestAffectHauling},
-        {"harvestAffectPickup", cfg.harvestAffectPickup},
-        {"instantBuildEnabled", cfg.instantBuildEnabled},
-        {"freeCraftEnabled", cfg.freeCraftEnabled},
-        {"unlockAllRecipes", cfg.unlockAllRecipes},
-        {"showMilkMolars", cfg.showMilkMolars},
-        {"showMegaMilkMolars", cfg.showMegaMilkMolars},
-        {"showScabColors", cfg.showScabColors},
-        {"showCollectedMolars", cfg.showCollectedMolars},
-        {"showMapLabels", cfg.showMapLabels},
-        {"showMapLegend", cfg.showMapLegend},
-        {"mapIconScale", cfg.mapIconScale},
-        {"trackedIds", cfg.trackedIds},
-    };
-    AtomicWriteText(m_dataDir + L"\\config.json", j.dump(2));
+    AtomicWriteText(m_dataDir + L"\\config.json", SerializeConfigJson(cfg).dump(2));
 }
 
 void IpcBridge::UpdateConfigAndSave(const ModConfig& cfg) {
@@ -214,7 +211,7 @@ void IpcBridge::PollFromLua() {
     if (m_dataDir.empty()) return;
     unsigned long long now = GetTickCount64();
 
-    // 高频轮询 M 地图实时状态（约 30Hz，仅在文件时间戳变更时解析）
+    // 高频通道：轮询 M 地图实时状态（约 40Hz 间隔，仅在文件修改时间戳变更时真正解析 JSON）
     if (now - m_lastFastPollTick >= 25) {
         m_lastFastPollTick = now;
         std::string txt;
@@ -271,12 +268,12 @@ void IpcBridge::PollFromLua() {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_mapLive = std::move(st);
             } catch (...) {
-                // 忽略偶发读写竞争，下一轮自动重试
+                // 忽略偶发文件替换瞬间的读取竞争，下一轮心跳会自动重试
             }
         }
     }
 
-    // 低频轮询资源目录与运行状态（约 2Hz）
+    // 低频通道：轮询运行时状态摘要与全图资源目录（约 2Hz）
     if (now - m_lastSlowPollTick >= 450) {
         m_lastSlowPollTick = now;
         std::string txt;
@@ -289,6 +286,8 @@ void IpcBridge::PollFromLua() {
                 rs.difficulty = j.value("difficulty", "未知");
                 rs.livePlayerDamage = j.value("livePlayerDamage", 1.0f);
                 rs.liveEnemyDamage = j.value("liveEnemyDamage", 1.0f);
+                rs.liveKeepInventoryOnDeath = j.value("liveKeepInventoryOnDeath", false);
+                rs.liveNoDeathDurabilityPenalty = j.value("liveNoDeathDurabilityPenalty", false);
                 rs.uncollectedMilkMolars = j.value("uncollectedMilkMolars", 0);
                 rs.uncollectedMegaMolars = j.value("uncollectedMegaMolars", 0);
                 rs.totalMilkMolars = j.value("totalMilkMolars", 0);

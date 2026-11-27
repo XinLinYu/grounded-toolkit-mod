@@ -1,7 +1,13 @@
-// 真实 DX12 / DX11 渲染宿主自动化回归测试：
-// 加载编译好的 GroundedQoLOverlay.dll，创建真实 DX12（或 DX11）SwapChain，
-// 验证 Present Hook、ImGui 中文初始化、Insert/F8 菜单切换、
-// 原生 UE4 UWidget->SWidget->FGeometry 内存读取与 M 地图标点零误差绘制，及 ResizeBuffers 无崩溃。
+/*
+ * 文件：overlay/tests/overlay_regression_test.cpp
+ * 职责：GroundedQoLOverlay.dll 离线自动化回归测试宿主程序（真实 DX12 / DX11 SwapChain）。
+ * 验证项：
+ *   1. DLL 加载后自动写出默认 data/config.json，且包含 keepInventoryOnDeath=false / noDeathDurabilityPenalty=false；
+ *   2. MinHook 正确拦截 Present / Present1 / ResizeBuffers / ExecuteCommandLists 并自动识别 DX12 / DX11；
+ *   3. 模拟 UE 4.27 精确内存布局的 UWidget->SWidget->FGeometry，验证旋转/缩放下 M 地图标点 0.00px 投影误差；
+ *   4. Insert / F8 菜单切换在房主与联机客机两种 status.json 状态下均能无崩溃渲染（覆盖死亡保护禁用/启用分支）；
+ *   5. ResizeBuffers（模拟 Alt+Tab / 改分辨率）安全重建后缓冲无崩溃。
+ */
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -16,6 +22,7 @@
 
 using QueryStateFn = int(__cdecl*)();
 
+/// 测试宿主窗口的默认消息回调（后续会被 DLL 的 HookedWndProc 子类化接管）。
 static LRESULT CALLBACK TestWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -47,9 +54,9 @@ static_assert(offsetof(MockSWidget, cachedGeom) == 0xD0, "cachedGeom offset must
 
 struct alignas(16) MockUWidget {
     uint8_t pad0[0xE0]{};
-    MockSWidget* gcWidget = nullptr;   // +0xE0
+    MockSWidget* gcWidget = nullptr;   // +0xE0（UUserWidget::MyGCWidget 路径）
     MockRefCtrl* gcRefCtrl = nullptr;  // +0xE8
-    MockSWidget* myWidget = nullptr;   // +0xF0
+    MockSWidget* myWidget = nullptr;   // +0xF0（UWidget::MyWidget 路径）
     MockRefCtrl* myRefCtrl = nullptr;  // +0xF8
     uint8_t pad1[0x10]{};
 };
@@ -70,6 +77,7 @@ static_assert(offsetof(MockMapPanel, maxBoundsX) == 0x3A0, "maxBoundsX offset mu
 static_assert(offsetof(MockMapPanel, minBoundsX) == 0x3A8, "minBoundsX offset must be 0x3A8");
 static_assert(offsetof(MockMapPanel, texSizeX) == 0x3B0, "texSizeX offset must be 0x3B0");
 
+/// 构造包含窗口偏移、裁剪边框、带 90 度旋转与 0.5x 缩放的画布及玩家图标的完整模拟夹具。
 struct NativeMapMockFixture {
     MockRefCtrl refCtrl;
     MockSWidget sCanvas, sBorder, sRootWin, sPlayerIcon;
@@ -127,6 +135,7 @@ struct NativeMapMockFixture {
     }
 };
 
+/// 将模拟控件的进程内真实地址写入 data/map_live.json，供 DLL 走 NativeSlateFGeometry 路径读取。
 static void WriteNativeSlateMapData(const std::wstring& dataDir, const NativeMapMockFixture& fx) {
     CreateDirectoryW(dataDir.c_str(), nullptr);
     char buf[2048];
@@ -162,7 +171,52 @@ static void WriteNativeSlateMapData(const std::wstring& dataDir, const NativeMap
     ofs << buf;
 }
 
+/// 写入模拟的 data/status.json，用于回归测试房主与联机客机两种角色下的死亡保护 UI 分支。
+static void WriteMockStatusData(const std::wstring& dataDir, bool isHost, bool liveKeepInv, bool liveNoDurPen) {
+    CreateDirectoryW(dataDir.c_str(), nullptr);
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf),
+        "{\n"
+        "  \"inWorld\": true,\n"
+        "  \"isHost\": %s,\n"
+        "  \"difficulty\": \"中等 (Medium)\",\n"
+        "  \"livePlayerDamage\": 1.5,\n"
+        "  \"liveEnemyDamage\": 1.0,\n"
+        "  \"liveKeepInventoryOnDeath\": %s,\n"
+        "  \"liveNoDeathDurabilityPenalty\": %s,\n"
+        "  \"uncollectedMilkMolars\": 40,\n"
+        "  \"uncollectedMegaMolars\": 20,\n"
+        "  \"totalMilkMolars\": 74,\n"
+        "  \"totalMegaMolars\": 45,\n"
+        "  \"catalogCount\": 120,\n"
+        "  \"lootCompCount\": 85,\n"
+        "  \"stackSummary\": \"Resource:10->100\",\n"
+        "  \"surveyedItemName\": \"\",\n"
+        "  \"lastMessage\": \"回归测试模拟状态\"\n"
+        "}\n",
+        isHost ? "true" : "false",
+        liveKeepInv ? "true" : "false",
+        liveNoDurPen ? "true" : "false");
+
+    std::ofstream ofs(dataDir + L"\\status.json", std::ios::binary | std::ios::trunc);
+    ofs << buf;
+}
+
+/// 读取文本文件全部内容，用于断言 config.json 与 overlay.log 关键字段。
+static std::string ReadTextFile(const std::wstring& path) {
+    std::ifstream ifs(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    return ss.str();
+}
+
+/// DX12 全流程回归测试：配置初始化 + 图形挂钩 + 0 像素误差地图投影 + 房主/客机菜单渲染 + ResizeBuffers。
 static int RunDx12Test(const std::wstring& dllPath) {
+    size_t slash = dllPath.find_last_of(L"\\/");
+    std::wstring dataDir = dllPath.substr(0, slash) + L"\\data";
+    // 先清理旧测试 config.json，确保本次能验证 DLL 首次初始化自动落盘的新字段默认值
+    DeleteFileW((dataDir + L"\\config.json").c_str());
+
     std::printf("[TEST-DX12] Loading DLL...\n");
     HMODULE mod = LoadLibraryW(dllPath.c_str());
     if (!mod) {
@@ -177,12 +231,22 @@ static int RunDx12Test(const std::wstring& dllPath) {
 
     // 构造真实 UE4 偏移的内存模拟控件，验证 NativeSlateFGeometry 零误差投影与标点绘制
     NativeMapMockFixture fixture;
-    size_t slash = dllPath.find_last_of(L"\\/");
-    std::wstring dataDir = dllPath.substr(0, slash) + L"\\data";
     WriteNativeSlateMapData(dataDir, fixture);
+    WriteMockStatusData(dataDir, true, true, false);
 
-    // 等待 DLL 后台线程完成 MinHook 挂钩
+    // 等待 DLL 后台线程完成 IpcBridge::Initialize 与 MinHook 挂钩
     Sleep(800);
+
+    // 断言新配置字段（死亡背包保留、免除死亡耐久惩罚）已正确写入 config.json 且默认为 false
+    {
+        std::string cfgText = ReadTextFile(dataDir + L"\\config.json");
+        if (cfgText.find("\"keepInventoryOnDeath\": false") == std::string::npos ||
+            cfgText.find("\"noDeathDurabilityPenalty\": false") == std::string::npos) {
+            std::printf("[FAIL] Default config.json missing expected death protection fields!\nContent:\n%s\n", cfgText.c_str());
+            return 20;
+        }
+        std::printf("[TEST-DX12] Verified default death protection config fields in config.json!\n");
+    }
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -290,7 +354,7 @@ static int RunDx12Test(const std::wstring& dllPath) {
         std::printf("[TEST-DX12] Verified NativeSlateFGeometry playerErr=0.00px in overlay.log!\n");
     }
 
-    // 模拟按下 Insert 打开中文 Mod 菜单并渲染 6 帧
+    // 模拟按下 Insert 打开中文 Mod 菜单并渲染 6 帧（房主模式）
     SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
     if (!pumpAndPresent(6)) return 12;
     int st2 = queryState();
@@ -299,6 +363,11 @@ static int RunDx12Test(const std::wstring& dllPath) {
         std::printf("[FAIL] Insert key did NOT open Mod menu!\n");
         return 13;
     }
+
+    // 切换为联机客机状态并等待低频轮询周期，验证死亡保护区域灰显禁用分支渲染正常
+    Sleep(500);
+    WriteMockStatusData(dataDir, false, false, false);
+    if (!pumpAndPresent(6)) return 13;
 
     // 模拟 ResizeBuffers（Alt+Tab / 分辨率切换）
     HRESULT hrResize = swap3->ResizeBuffers(2, 1024, 600, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
@@ -319,15 +388,34 @@ static int RunDx12Test(const std::wstring& dllPath) {
         return 17;
     }
 
-    // 清理测试用的 map_live.json
+    // 清理测试生成的临时 IPC 数据文件
     DeleteFileW((dataDir + L"\\map_live.json").c_str());
+    DeleteFileW((dataDir + L"\\status.json").c_str());
+    DeleteFileW((dataDir + L"\\config.json").c_str());
 
     std::printf("[PASS] DX12 full regression test PASSED!\n");
+    std::fflush(stdout);
     TerminateProcess(GetCurrentProcess(), 0);
     return 0;
 }
 
+/// DX11 回退后端回归测试：验证预置启用配置的持久化加载、DX11 SwapChain 初始化、菜单打开与无崩溃渲染。
 static int RunDx11Test(const std::wstring& dllPath) {
+    size_t slash = dllPath.find_last_of(L"\\/");
+    std::wstring dataDir = dllPath.substr(0, slash) + L"\\data";
+    CreateDirectoryW(dataDir.c_str(), nullptr);
+
+    // 预置开启死亡保护的 config.json，验证 DLL 启动加载已有配置时不覆盖用户的开启状态
+    {
+        std::ofstream ofs(dataDir + L"\\config.json", std::ios::binary | std::ios::trunc);
+        ofs << "{\n"
+               "  \"keepInventoryOnDeath\": true,\n"
+               "  \"noDeathDurabilityPenalty\": true,\n"
+               "  \"stackEnabled\": true,\n"
+               "  \"stackMultiplier\": 15\n"
+               "}\n";
+    }
+
     std::printf("[TEST-DX11] Loading DLL...\n");
     HMODULE mod = LoadLibraryW(dllPath.c_str());
     if (!mod) return 21;
@@ -335,6 +423,17 @@ static int RunDx11Test(const std::wstring& dllPath) {
     if (!queryState) return 22;
 
     Sleep(800);
+
+    // 确认预置配置被保留而未被默认值覆盖
+    {
+        std::string cfgText = ReadTextFile(dataDir + L"\\config.json");
+        if (cfgText.find("\"keepInventoryOnDeath\": true") == std::string::npos ||
+            cfgText.find("\"noDeathDurabilityPenalty\": true") == std::string::npos) {
+            std::printf("[FAIL] Pre-existing death protection config was unexpectedly overwritten!\n");
+            return 27;
+        }
+        std::printf("[TEST-DX11] Verified pre-existing death protection config preserved!\n");
+    }
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -387,12 +486,18 @@ static int RunDx11Test(const std::wstring& dllPath) {
     std::printf("[TEST-DX11] After F8 state=0x%X (expect bit2=MenuOpen)\n", st2);
     if ((st2 & 4) == 0) return 26;
 
+    DeleteFileW((dataDir + L"\\config.json").c_str());
+
     std::printf("[PASS] DX11 full regression test PASSED!\n");
+    std::fflush(stdout);
     TerminateProcess(GetCurrentProcess(), 0);
     return 0;
 }
 
+/// 回归测试命令行入口：根据参数执行 dx12 或 dx11 完整验证流程。
 int wmain(int argc, wchar_t** argv) {
+    // 关闭 stdout 行/块缓冲，确保在管道重定向场景下 TerminateProcess 前所有日志完整落出
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
         std::printf("Usage: overlay_regression_test <dx12|dx11> <path_to_GroundedQoLOverlay.dll>\n");
         return 99;

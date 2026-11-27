@@ -1,3 +1,15 @@
+/*
+ * 文件：overlay/src/dx11_hook.cpp
+ * 职责：实现自适应 DirectX 12 / DirectX 11 图形钩子与 Win32 WndProc 输入接管。
+ * 关键架构说明：
+ *   1. 通过临时隐藏窗口创建虚拟 DX12/DX11 SwapChain 解析 DXGI Present / Present1 / ResizeBuffers
+ *      与 ID3D12CommandQueue::ExecuteCommandLists 真实虚表地址，并用 MinHook 注入钩子。
+ *   2. DX12 下通过捕获游戏主 DIRECT 命令队列、独立维护每帧 CommandAllocator + Fence 围栏同步
+ *      与 64 槽位 SRV 描述符堆，在不破坏游戏渲染管线的前提下将 Dear ImGui 合成到当前 BackBuffer。
+ *   3. 使用 thread_local t_inPresent 防止 Present1 内部转发到 Present 造成的重入双绘；
+ *      同时提供 WndProc 与 GetAsyncKeyState 双通道热键检测，兼容 Steam Overlay 与 RawInput。
+ */
+
 #include "dx11_hook.h"
 #include "ipc.h"
 #include "overlay_ui.h"
@@ -25,6 +37,7 @@ namespace gqol {
 
 namespace {
 
+/// 当前已绑定并激活的图形 API 类型。
 enum class GraphicsApi {
     None,
     DX11,
@@ -36,6 +49,7 @@ using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, con
 using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
+// MinHook 保存的原函数蹦床指针与原窗口过程
 PresentFn g_origPresent = nullptr;
 Present1Fn g_origPresent1 = nullptr;
 ResizeBuffersFn g_origResizeBuffers = nullptr;
@@ -46,6 +60,7 @@ std::mutex g_logMutex;
 std::mutex g_queueMutex;
 std::mutex g_srvAllocMutex;
 
+// 全局运行期状态（涉及渲染线程与消息线程共享的标志使用 atomic）
 GraphicsApi g_activeApi = GraphicsApi::None;
 HWND g_gameHwnd = nullptr;
 IDXGISwapChain* g_boundSwapChain = nullptr;
@@ -57,6 +72,7 @@ bool g_prevInsertDown = false;
 bool g_prevF8Down = false;
 std::atomic<bool> g_menuOpen{false};
 std::atomic<bool> g_shuttingDown{false};
+// 防止 DXGI Present1 内部调用 Present 或第三方叠加层转发导致同一帧重复渲染 ImGui
 thread_local bool t_inPresent = false;
 
 // ==================== DX11 状态 ====================
@@ -65,6 +81,7 @@ ID3D11DeviceContext* g_d3d11Context = nullptr;
 ID3D11RenderTargetView* g_d3d11Rtv = nullptr;
 
 // ==================== DX12 状态 ====================
+/// 从 ExecuteCommandLists 捕获到的候选 DIRECT 命令队列，初始化时按 Device 指针精准匹配 SwapChain。
 struct Dx12CandidateQueue {
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
@@ -72,6 +89,7 @@ struct Dx12CandidateQueue {
 std::vector<Dx12CandidateQueue> g_candidateQueues;
 std::atomic<bool> g_dx12QueueLocked{false};
 
+/// DX12 每个交换链缓冲槽位的独立帧上下文（避免 GPU 尚未执行完时重置 CommandAllocator）。
 struct Dx12FrameContext {
     ID3D12CommandAllocator* cmdAllocator = nullptr;
     ID3D12Resource* backBuffer = nullptr;
@@ -92,6 +110,7 @@ HANDLE g_d3d12FenceEvent = nullptr;
 UINT64 g_d3d12FenceValue = 0;
 std::vector<Dx12FrameContext> g_dx12Frames;
 
+/// ImGui DX12 后端纹理 SRV 描述符分配回调（从 64 槽位位图中线程安全分配空闲句柄）。
 void SrvDescriptorAllocCallback(ImGui_ImplDX12_InitInfo* /*info*/,
                                 D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
                                 D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
@@ -112,6 +131,7 @@ void SrvDescriptorAllocCallback(ImGui_ImplDX12_InitInfo* /*info*/,
     *outGpu = gpu;
 }
 
+/// ImGui DX12 后端纹理 SRV 描述符归还回调（根据 CPU 句柄偏移回收槽位）。
 void SrvDescriptorFreeCallback(ImGui_ImplDX12_InitInfo* /*info*/,
                                D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle,
                                D3D12_GPU_DESCRIPTOR_HANDLE /*gpuHandle*/) {
@@ -126,6 +146,7 @@ void SrvDescriptorFreeCallback(ImGui_ImplDX12_InitInfo* /*info*/,
     }
 }
 
+/// 带 180ms 防抖的菜单开关切换（防止 WndProc 与 AsyncKey 双通道同帧触发两次导致闪关）。
 void ToggleMenuWithDebounce(const char* source) {
     unsigned long long now = GetTickCount64();
     if (now - g_lastToggleTick < 180) return;
@@ -136,6 +157,8 @@ void ToggleMenuWithDebounce(const char* source) {
 }
 
 // ==================== DX11 辅助函数 ====================
+
+/// 安全释放 DX11 渲染目标视图（在 ResizeBuffers 与卸载阶段必须先释放，否则重置交换链会失败）。
 void ReleaseDx11Rtv() {
     if (g_d3d11Rtv) {
         g_d3d11Rtv->Release();
@@ -143,6 +166,7 @@ void ReleaseDx11Rtv() {
     }
 }
 
+/// 从当前 DX11 SwapChain 后缓冲重建 RenderTargetView。
 void CreateDx11Rtv(IDXGISwapChain* swapChain) {
     ReleaseDx11Rtv();
     ID3D11Texture2D* backBuffer = nullptr;
@@ -153,6 +177,8 @@ void CreateDx11Rtv(IDXGISwapChain* swapChain) {
 }
 
 // ==================== DX12 辅助函数 ====================
+
+/// 向 DX12 命令队列发射围栏信号并阻塞等待 GPU 完成，用于 ResizeBuffers 与关闭前的资源安全释放。
 void WaitForDx12GpuIdle() {
     if (!g_d3d12CommandQueue || !g_d3d12Fence || !g_d3d12FenceEvent) return;
     const UINT64 target = ++g_d3d12FenceValue;
@@ -164,6 +190,7 @@ void WaitForDx12GpuIdle() {
     }
 }
 
+/// 释放全部 DX12 后缓冲引用（ResizeBuffers 前必须将所有 BackBuffer 引用计数归零）。
 void ReleaseDx12BackBuffers() {
     for (auto& f : g_dx12Frames) {
         if (f.backBuffer) {
@@ -173,6 +200,7 @@ void ReleaseDx12BackBuffers() {
     }
 }
 
+/// 按 SwapChain 当前缓冲数量创建或重建 DX12 RTV 描述符堆、后缓冲绑定与各帧 CommandAllocator。
 bool CreateDx12BackBuffers(IDXGISwapChain* swapChain) {
     DXGI_SWAP_CHAIN_DESC sd{};
     if (FAILED(swapChain->GetDesc(&sd)) || sd.BufferCount == 0) return false;
@@ -226,6 +254,7 @@ bool CreateDx12BackBuffers(IDXGISwapChain* swapChain) {
     return true;
 }
 
+/// 按 Device 指针查找匹配的 DIRECT 类型 DX12 命令队列。
 ID3D12CommandQueue* FindDirectQueueForDevice(ID3D12Device* dev) {
     std::lock_guard<std::mutex> lk(g_queueMutex);
     for (const auto& c : g_candidateQueues) {
@@ -237,6 +266,8 @@ ID3D12CommandQueue* FindDirectQueueForDevice(ID3D12Device* dev) {
 }
 
 // ==================== WndProc 钩子 ====================
+
+/// 游戏主窗口消息钩子：处理菜单开关热键、打开菜单时吞掉键鼠输入（放行中文 IME）以及 M 地图快捷放路标。
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_shuttingDown.load()) {
         return CallWindowProcW(g_origWndProc, hWnd, msg, wParam, lParam);
@@ -264,6 +295,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
                 return DefWindowProcW(hWnd, msg, wParam, lParam);
             }
 
+            // 菜单打开期间拦截游戏本体鼠标与键盘事件，防止点菜单按钮时角色同时挥武器或旋转视角
             switch (msg) {
                 case WM_MOUSEMOVE:
                 case WM_LBUTTONDOWN:
@@ -292,6 +324,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
                     break;
             }
         } else {
+            // 菜单关闭且处于 M 地图悬停状态时，优先交给地图快捷键（G / Ctrl+左键）放原版路标
             if (HandleMapQuickShortcut(msg, wParam, lParam)) {
                 return 0;
             }
@@ -302,6 +335,8 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
 }
 
 // ==================== 初始化逻辑（自动区分 DX12 / DX11） ====================
+
+/// 首次拦截到有效游戏主 SwapChain 时执行懒初始化，自动适配 DX12（优先）或 DX11 并挂接 WndProc。
 bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
     DXGI_SWAP_CHAIN_DESC sd{};
     if (FAILED(swapChain->GetDesc(&sd))) return false;
@@ -485,6 +520,7 @@ void DrawStartupBanner() {
     dl->AddText(ImVec2(p0.x + pad, p0.y + pad * 0.7f), fg, text);
 }
 
+/// 在单次 Present 周期内驱动热键兜底、IPC 轮询与 DX12/DX11 ImGui 帧提交。
 void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
     if (!g_imguiInitialized) {
         if (!TryInitImGuiForSwapChain(swapChain)) {
@@ -587,6 +623,8 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
 }
 
 // ==================== 图形钩子回调 ====================
+
+/// DX12 ExecuteCommandLists 钩子：在初始化锁定前捕获游戏主 DIRECT 命令队列供 Present 复用。
 void STDMETHODCALLTYPE HookedExecuteCommandLists(
     ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* ppCommandLists) {
     if (!g_shuttingDown.load() && !g_dx12QueueLocked.load() && queue) {
@@ -613,6 +651,7 @@ void STDMETHODCALLTYPE HookedExecuteCommandLists(
     g_origExecuteCommandLists(queue, numCommandLists, ppCommandLists);
 }
 
+/// IDXGISwapChain::Present 钩子：带线程局部重入锁保护渲染悬浮层后再转交原 Present。
 HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
     if (!g_shuttingDown.load() && !t_inPresent && swapChain) {
         t_inPresent = true;
@@ -622,6 +661,7 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInte
     return g_origPresent(swapChain, syncInterval, flags);
 }
 
+/// IDXGISwapChain1::Present1 钩子：兼容 UE4 DX12 Flip-Model 直接调用 Present1 的路径。
 HRESULT STDMETHODCALLTYPE HookedPresent1(
     IDXGISwapChain1* swapChain, UINT syncInterval, UINT presentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters) {
     if (!g_shuttingDown.load() && !t_inPresent && swapChain) {
@@ -632,6 +672,7 @@ HRESULT STDMETHODCALLTYPE HookedPresent1(
     return g_origPresent1(swapChain, syncInterval, presentFlags, pPresentParameters);
 }
 
+/// IDXGISwapChain::ResizeBuffers 钩子：响应 Alt+Tab 或分辨率切换，先等 GPU 空闲并释放旧后缓冲，再重建。
 HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     IDXGISwapChain* swapChain, UINT bufferCount, UINT width, UINT height,
     DXGI_FORMAT newFormat, UINT swapChainFlags) {
@@ -759,6 +800,7 @@ bool ResolveGraphicsVTables(ResolvedVTableAddrs& out) {
 
 } // namespace
 
+/// 追加一条带本地毫秒时间戳的诊断日志到 data/overlay.log（线程安全）。
 void OverlayLog(const char* fmt, ...) {
     std::lock_guard<std::mutex> lk(g_logMutex);
     std::wstring dir = IpcBridge::Instance().GetDataDir();
@@ -784,6 +826,7 @@ void OverlayLog(const char* fmt, ...) {
     }
 }
 
+/// 等待 dxgi.dll 就绪、解析虚拟交换链虚表地址并通过 MinHook 挂接全部图形回调。
 bool InstallGraphicsHook() {
     OverlayLog("InstallGraphicsHook() starting...");
 
@@ -835,6 +878,7 @@ bool InstallGraphicsHook() {
     return st == MH_OK;
 }
 
+/// 安全卸载窗口与图形钩子，等待 GPU 空闲并按序释放 ImGui 与 DX12/DX11 全部 COM 资源。
 void UninstallGraphicsHook() {
     g_shuttingDown.store(true);
     if (g_gameHwnd && g_origWndProc) {

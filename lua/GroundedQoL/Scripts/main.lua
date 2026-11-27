@@ -1,6 +1,17 @@
--- GroundedQoL: 禁闭求生 体验增强插件（UE4SS v4.0.0 Lua 引擎逻辑层）
--- 架构：单调度器线程安全循环 + 原生 DX12/DX11 4K 简体中文悬浮菜单
--- 功能：物品堆叠倍率、玩家/怪物伤害倍率、采集与掉落倍率、“M”地图乳牙与全游戏资源自由追踪
+--[[
+    文件：lua/GroundedQoL/Scripts/main.lua
+    职责：GroundedQoL（禁闭求生体验增强工具箱）UE4SS v4.0.0 Lua 引擎逻辑层。
+    核心架构：
+      1. 单异步定时器 + ExecuteInGameThread 单飞调度器，彻底规避 UE4SS 多 LoopAsync 并发访问 UObject 导致的崩溃。
+      2. 通过原子文件 IPC（data/*.json）与原生 C++ DX12/DX11 Dear ImGui 悬浮层解耦通信。
+      3. 原地覆写运行时 USurvivalGameModeSettings（绝不切换为自定义模式），100% 保留 Steam 成就。
+    核心功能：
+      - 物品堆叠上限倍率（自动保护基础堆叠为 1 的装备）
+      - 战斗伤害倍率、无材料秒建、免费制作、死亡背包保留与免除死亡耐久惩罚
+      - 采集与掉落数量倍率（含草板搬运上限保护与自然拾取增量 Hook）
+      - 一键找回掉落背包（唤醒远距 LOD、跳过空包与建筑战利品袋、前方扇形错开落地并同步联机坐标）
+      - “M” 地图乳牙/高级乳牙/全游戏资源实时追踪、原版路标放置与全队资源扫描联动
+]]
 
 local UEHelpers = require("UEHelpers")
 local json = require("json")
@@ -8,6 +19,8 @@ local json = require("json")
 -- ============================================================
 -- 1. 路径初始化与原生 DX12/DX11 悬浮菜单 DLL 加载
 -- ============================================================
+
+--- 从当前脚本路径推导出 Mod 根目录（...\ue4ss\Mods\GroundedQoL），用于定位 DLL 与 data/ 通信目录。
 local function getModRootDir()
     local src = debug.getinfo(1, "S").source or ""
     if src:sub(1, 1) == "@" then src = src:sub(2) end
@@ -26,11 +39,12 @@ local ACTIONS_PATH = DATA_DIR .. "\\actions.json"
 
 os.execute('mkdir "' .. DATA_DIR .. '" >nul 2>&1')
 
+--- 统一带前缀的 UE4SS 控制台日志输出函数。
 local function logInfo(msg)
     print("[GroundedQoL] " .. tostring(msg) .. "\n")
 end
 
--- 加载原生 DX12/DX11 ImGui 悬浮菜单 DLL（仅通过 package.loadlib 触发 LoadLibraryA 与 DllMain）
+-- 加载原生 DX12/DX11 ImGui 悬浮菜单 DLL（仅通过 package.loadlib 触发 LoadLibraryA 与 DllMain 后台挂钩）
 do
     local dllPath = MOD_DIR .. "\\GroundedQoLOverlay.dll"
     local f = io.open(dllPath, "rb")
@@ -50,6 +64,8 @@ end
 -- ============================================================
 -- 2. 文件原子读写与默认配置
 -- ============================================================
+
+--- 以二进制模式读取文件全部内容，文件不存在或无法打开时返回 nil。
 local function readAllText(path)
     local f = io.open(path, "rb")
     if not f then return nil end
@@ -58,6 +74,7 @@ local function readAllText(path)
     return content
 end
 
+--- 通过“写临时文件 + 替换重命名”原子写入文本，防止 C++ 悬浮层读到半截 JSON。
 local function writeAtomicText(path, content)
     local tmp = path .. ".tmp"
     local f = io.open(tmp, "wb")
@@ -67,6 +84,7 @@ local function writeAtomicText(path, content)
     os.remove(path)
     local ok = os.rename(tmp, path)
     if not ok then
+        -- 若目标文件瞬时被 C++ 端占用导致 rename 失败，降级为直接覆写
         local f2 = io.open(path, "wb")
         if f2 then
             f2:write(content)
@@ -79,6 +97,7 @@ local function writeAtomicText(path, content)
     return true
 end
 
+--- 与 data/config.json 双向同步的运行时配置表（所有新开关默认偏向保守/不破坏原版规则）。
 local cfg = {
     stackEnabled = true,
     stackMultiplier = 10,
@@ -92,6 +111,9 @@ local cfg = {
     instantBuildEnabled = false,
     freeCraftEnabled = false,
     unlockAllRecipes = false,
+    -- 死亡保护（默认关闭，按需开启；仅原地修改运行时设置，不影响 Steam 成就）
+    keepInventoryOnDeath = false,
+    noDeathDurabilityPenalty = false,
     showMilkMolars = true,
     showMegaMilkMolars = true,
     showScabColors = false,
@@ -109,15 +131,17 @@ local lastStatusMessage = "插件已就绪，按 Insert 或 F8 打开中文菜�
 -- ============================================================
 -- 3. 缓存状态与辅助工具
 -- ============================================================
+-- 原版基准值缓存（用于关闭开关时精确还原原版难度设置，切换世界时会重置）
 local origStackSizes = {}
 local origStackBonusPerTier = nil
 local origMaxDropStackSize = nil
 local lastStackSummary = ""
 
-local origDamageMap = {}
-local origLootCounts = {}
+local origDamageMap = {}   -- key=USurvivalGameModeSettings 地址，保存伤害/免材/死亡行为等原版基准值
+local origLootCounts = {}  -- key=ULootComponent 地址，保存各掉落槽位的原版数量
 local managedLootCount = 0
 
+-- 引擎单件与静态数据表句柄缓存
 local cachedOEITextLib = nil
 local cachedSlateLib = nil
 local cachedLayoutLib = nil
@@ -126,6 +150,7 @@ local cachedAllItemsTable = nil
 local cachedHarvestNodesTable = nil
 local cachedCharactersTable = nil
 
+-- 世界资源目录、本地化映射与乳牙统计缓存
 local itemRowToZhName = {}
 local surveyableRows = {}
 local harvestTableByHint = {}
@@ -143,6 +168,7 @@ local molarStats = { unMilk = 0, totMilk = 0, unMega = 0, totMega = 0 }
 local lastSurveyedName = ""
 local foliagePinCache = {}
 
+-- 记录 ServerHandleInteract 执行前的背包快照（用于计算按 E 拾取自然物品的增量）
 local interactSnapshot = {}
 
 -- 常见未加载代理采集点的简体中文友好兜底名称（当远距离蓝图尚未流式加载时使用）
@@ -189,6 +215,7 @@ local NODE_FALLBACK_ZH = {
     weed = "杂草/蒲公英茎",
 }
 
+--- 判断物品 RowName 是否属于需要肩扛的搬运物（草板、杂草茎等），用于采集倍率上限防卡顿控制。
 local function isHaulingRowName(rowName)
     if not rowName then return false end
     local low = rowName:lower()
@@ -199,12 +226,37 @@ local function isHaulingRowName(rowName)
         or low == "log"
 end
 
+--- 安全检查 UE4SS UObject 代理是否仍然存活有效（避免 GC 回收后访问引发异常）。
 local function safeValid(obj)
     if not obj then return false end
     local ok, v = pcall(function() return obj:IsValid() end)
     return ok and v == true
 end
 
+--- 将 UE4SS 返回的字符串/FString/FName/FText 统一安全转换为纯 Lua 字符串。
+local function ueStringToLua(v)
+    if not v then return "" end
+    if type(v) == "string" then return v end
+    local ok, s = pcall(function()
+        if v.ToString then return v:ToString() end
+        return tostring(v)
+    end)
+    if ok and type(s) == "string" then return s end
+    return ""
+end
+
+--- 将 UE4 的 FGuid（A/B/C/D 四个 int32）归一化为可比较的字符串键；全零或无效返回空串。
+local function guidToKey(g)
+    if not g then return "" end
+    local ok, a, b, c, d = pcall(function()
+        return g.A or 0, g.B or 0, g.C or 0, g.D or 0
+    end)
+    if not ok then return "" end
+    if a == 0 and b == 0 and c == 0 and d == 0 then return "" end
+    return string.format("%d_%d_%d_%d", a, b, c, d)
+end
+
+--- 获取 OEITextLibrary 静态默认对象（用于把游戏内 FLocString 翻译为当前简体中文显示名）。
 local function getOEITextLib()
     if safeValid(cachedOEITextLib) then return cachedOEITextLib end
     local ok, obj = pcall(StaticFindObject, "/Script/OEIText.Default__OEITextLibrary")
@@ -212,6 +264,7 @@ local function getOEITextLib()
     return nil
 end
 
+--- 获取 SlateBlueprintLibrary 静态默认对象。
 local function getSlateLib()
     if safeValid(cachedSlateLib) then return cachedSlateLib end
     local ok, obj = pcall(StaticFindObject, "/Script/UMG.Default__SlateBlueprintLibrary")
@@ -219,6 +272,7 @@ local function getSlateLib()
     return nil
 end
 
+--- 获取 WidgetLayoutLibrary 静态默认对象（用于读取当前游戏视口分辨率）。
 local function getWidgetLayoutLib()
     if safeValid(cachedLayoutLib) then return cachedLayoutLib end
     local ok, obj = pcall(StaticFindObject, "/Script/UMG.Default__WidgetLayoutLibrary")
@@ -226,6 +280,7 @@ local function getWidgetLayoutLib()
     return nil
 end
 
+--- 获取 SurvivalGameplayStatics 静态默认对象（用于资源扫描判定、玩家 GUID 查表等）。
 local function getSurvivalStatics()
     if safeValid(cachedStatics) then return cachedStatics end
     local ok, obj = pcall(StaticFindObject, "/Script/Maine.Default__SurvivalGameplayStatics")
@@ -233,7 +288,7 @@ local function getSurvivalStatics()
     return nil
 end
 
---- 将 Grounded 的 FLocString 转为当前语言（简体中文）字符串。
+--- 将 Grounded 的 FLocString 转为当前语言（简体中文）字符串；缺失词条返回空串。
 local function locStringToZh(locStr)
     if not locStr then return "" end
     local lib = getOEITextLib()
@@ -249,6 +304,7 @@ local function locStringToZh(locStr)
     return ""
 end
 
+--- 清洗蓝图类名（剥离包路径前缀、BP_ 前缀与 _C 后缀），便于展示和模糊匹配。
 local function cleanClassName(fullOrShort)
     if not fullOrShort or fullOrShort == "" then return "" end
     local s = fullOrShort
@@ -258,10 +314,12 @@ local function cleanClassName(fullOrShort)
     return s
 end
 
+--- 将英文名称归一为纯小写字母数字串，用于与 DataTable RowName 做容错匹配。
 local function normalizeKey(s)
     return (s or ""):lower():gsub("[^a-z0-9]", "")
 end
 
+--- 为尚未流式加载完整实体的远距采集点提供简体中文兜底名称。
 local function fallbackNodeZh(actorClsShort)
     local low = (actorClsShort or ""):lower()
     for pat, zh in pairs(NODE_FALLBACK_ZH) do
@@ -279,6 +337,9 @@ end
 -- ============================================================
 -- 4. 功能一：物品堆叠上限倍率（GlobalItemData.StackSizes）
 -- ============================================================
+
+--- 按配置倍率原地调整 GlobalItemData 的各类物品堆叠上限。
+-- 自动跳过基础堆叠 <= 1 的武器/防具/工具，避免耐久或强化词条异常合并。
 local function applyStackSizeMultiplier()
     local ok, gid = pcall(FindFirstOf, "GlobalItemData")
     if not ok or not safeValid(gid) then return end
@@ -338,29 +399,43 @@ local function applyStackSizeMultiplier()
 end
 
 -- ============================================================
--- 5. 功能二 & 功能五：伤害倍率 + 无材料秒建与免费合成（USurvivalGameModeSettings）
+-- 5. 功能二 & 功能五 & 死亡保护：原地覆写运行时 USurvivalGameModeSettings
 -- ============================================================
-local function applyGameModeSettings()
+
+--- 原地覆写运行时游戏模式设置（伤害倍率、无材料建造/制作、死亡背包保留与免除死亡耐久惩罚）。
+-- 设计约束（见 ADR-0001）：只直接修改活跃 USurvivalGameModeSettings 字段并缓存原版基准值用于还原，
+-- 绝不调用 SwapToCustom / SetGameMode / UpdateCustomSettings，从而保持原版生存模式、100% 不影响 Steam 成就。
+-- @param isHost 当前端是否具备房主权威；死亡保护类设置仅在房主端写入，由主机自然同步给全队。
+-- @return livePlayerDmg, liveEnemyDmg, diffName, liveKeepInv, liveNoDurPenalty
+local function applyGameModeSettings(isHost)
     local livePlayerDmg = 1.0
     local liveEnemyDmg = 1.0
     local diffName = "未知"
+    local liveKeepInv = false
+    local liveNoDurPenalty = false
     local appliedAny = false
 
     local function applyToSettings(gms)
         if not safeValid(gms) then return end
         local addr = gms:GetAddress()
         if not origDamageMap[addr] then
+            local baseDeathBehavior = 0
+            local baseDurPenalty = 0.1
+            pcall(function() baseDeathBehavior = gms.DeathBehavior or 0 end)
+            pcall(function() baseDurPenalty = gms.ItemDurabilityPenaltyOnDeathPercentage or 0.1 end)
             origDamageMap[addr] = {
                 player = gms.PlayerDamageMultiplier or 1.0,
                 enemy = gms.EnemyDamageMultiplier or 1.0,
                 autoComplete = (gms.bAutoCompleteBuildings == true),
                 requireIngredients = (gms.bRecipesRequireIngredients ~= false),
                 unlockAll = (gms.bUnlockAllRecipes == true),
+                deathBehavior = baseDeathBehavior,
+                deathDurabilityPenalty = baseDurPenalty,
             }
         end
         local base = origDamageMap[addr]
 
-        -- 伤害倍率
+        -- 1. 伤害倍率（以原版难度基准值按比例缩放，关闭时无损还原）
         local targetP = cfg.damageEnabled and (base.player * (cfg.playerDamageMultiplier or 1.0)) or base.player
         local targetE = cfg.damageEnabled and (base.enemy * (cfg.enemyDamageMultiplier or 1.0)) or base.enemy
         if math.abs((gms.PlayerDamageMultiplier or 1.0) - targetP) > 0.001 then
@@ -370,7 +445,7 @@ local function applyGameModeSettings()
             gms.EnemyDamageMultiplier = targetE
         end
 
-        -- 建筑建设无材料立刻建成 / 工作台与背包合成制作无需材料 / 可选解锁全部配方
+        -- 2. 建筑建设无材料立刻建成 / 工作台与背包合成制作无需材料 / 可选解锁全部配方
         local targetAutoBuild = cfg.instantBuildEnabled and true or base.autoComplete
         local targetReqIngr = cfg.freeCraftEnabled and false or base.requireIngredients
         local targetUnlock = cfg.unlockAllRecipes and true or base.unlockAll
@@ -385,8 +460,28 @@ local function applyGameModeSettings()
             gms.bUnlockAllRecipes = targetUnlock
         end
 
+        -- 3. 死亡背包保留与免除死亡装备耐久惩罚（仅房主权威端写入，关闭即精准还原原版难度设置）
+        -- EPlayerDeathBehavior 枚举：0=DropItemsOnDeath（原版掉落）, 1=KeepItemsOnDeath（保留全部物品）
+        if isHost then
+            local targetDeathBehavior = cfg.keepInventoryOnDeath and 1 or base.deathBehavior
+            local targetDurPenalty = cfg.noDeathDurabilityPenalty and 0.0 or base.deathDurabilityPenalty
+            pcall(function()
+                if gms.DeathBehavior ~= targetDeathBehavior then
+                    gms.DeathBehavior = targetDeathBehavior
+                end
+            end)
+            pcall(function()
+                local curPen = gms.ItemDurabilityPenaltyOnDeathPercentage or 0.0
+                if math.abs(curPen - targetDurPenalty) > 0.0001 then
+                    gms.ItemDurabilityPenaltyOnDeathPercentage = targetDurPenalty
+                end
+            end)
+        end
+
         livePlayerDmg = gms.PlayerDamageMultiplier
         liveEnemyDmg = gms.EnemyDamageMultiplier
+        pcall(function() liveKeepInv = (gms.DeathBehavior == 1) end)
+        pcall(function() liveNoDurPenalty = ((gms.ItemDurabilityPenaltyOnDeathPercentage or 0.0) <= 0.0001) end)
         appliedAny = true
 
         local d = gms.GameDifficulty
@@ -396,6 +491,7 @@ local function applyGameModeSettings()
         else diffName = "自定义" end
     end
 
+    -- 优先通过当前 SurvivalGameState 的模式管理器获取正在生效的设置实例
     local okGs, gs = pcall(FindFirstOf, "SurvivalGameState")
     if okGs and safeValid(gs) then
         pcall(function()
@@ -406,6 +502,7 @@ local function applyGameModeSettings()
         end)
     end
 
+    -- 兜底遍历所有非 CDO 的 USurvivalGameModeSettings 实例（兼容极少数加载过渡帧）
     if not appliedAny then
         local okAll, list = pcall(FindAllOf, "SurvivalGameModeSettings")
         if okAll and list then
@@ -418,12 +515,14 @@ local function applyGameModeSettings()
         end
     end
 
-    return livePlayerDmg, liveEnemyDmg, diffName
+    return livePlayerDmg, liveEnemyDmg, diffName, liveKeepInv, liveNoDurPenalty
 end
 
 -- ============================================================
 -- 6. 功能三：采集与掉落数量倍率（ULootComponent + SpawnLoot Hook + 自然拾取）
 -- ============================================================
+
+--- 判断掉落组件所属对象是否需要排除（玩家死亡背包、乳牙、宝箱与储物箱，避免异常复制）。
 local function shouldSkipLootOwner(ownerFullName)
     if not ownerFullName or ownerFullName == "" then return false end
     local low = ownerFullName:lower()
@@ -436,6 +535,7 @@ local function shouldSkipLootOwner(ownerFullName)
         or low:find("chest") ~= nil
 end
 
+--- 幂等地将单个 ULootComponent 的普通物品掉落数量按倍率放大（支持随时关闭还原原版数量）。
 local function applyLootComponent(lc)
     if not safeValid(lc) then return false end
     local ownerName = ""
@@ -465,7 +565,8 @@ local function applyLootComponent(lc)
     for i = 1, len do
         pcall(function()
             local entry = items[i]
-            if entry and entry.Type == 0 then -- 仅放大 ELootType::Item，绝不触碰乳牙Actor/科学点/装备
+            -- 仅放大 ELootType::Item (0)，绝不触碰乳牙 Actor / 科学点 / 装备等特殊掉落
+            if entry and entry.Type == 0 then
                 local cur = entry.Count or 0
                 if orig[i] == nil then
                     orig[i] = cur
@@ -478,6 +579,7 @@ local function applyLootComponent(lc)
                     if mult > 1 then
                         if isHaulingRowName(rowName) then
                             if cfg.harvestAffectHauling then
+                                -- 搬运物单棵封顶 12 根，防止满地草板触发物理引擎剧烈抖动与掉帧
                                 target = math.min(12, math.max(baseCnt, math.floor(baseCnt * mult + 0.5)))
                             end
                         else
@@ -494,6 +596,7 @@ local function applyLootComponent(lc)
     return true
 end
 
+--- 扫描世界中全部已加载的 ULootComponent 与植被映射掉落表，批量应用采集倍率。
 local function applyAllLootComponents()
     local cnt = 0
     local ok, list = pcall(FindAllOf, "LootComponent")
@@ -504,6 +607,7 @@ local function applyAllLootComponents()
             end
         end
     end
+    -- 同步处理 GameInstance.FoliageMappings 挂载的植被模板掉落组件（草、杂草、蘑菇等）
     pcall(function()
         local gi = UEHelpers.GetGameInstance()
         if safeValid(gi) and gi.FoliageMappings then
@@ -531,7 +635,7 @@ pcall(function()
     end)
 end)
 
--- 地面自然植被与无主刷新物按 E 拾取增量 Hook
+--- 采集玩家当前背包内各物品 RowName 的总堆叠数量快照，用于前后对比计算拾取增量。
 local function snapshotInventoryCounts(invComp)
     local counts = {}
     if not safeValid(invComp) then return counts end
@@ -551,6 +655,9 @@ local function snapshotInventoryCounts(invComp)
     return counts
 end
 
+-- 地面自然植被与无主刷新物按 E 拾取增量 Hook：
+-- 通过对比 ServerHandleInteract 前后的背包增量，仅对自然无主可堆叠资源补发 (mult - 1) 倍额外数量，
+-- 避免把玩家自己丢在地上的物品反复拾取刷成无限。
 pcall(function()
     RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHandleInteract", function(selfParam)
         if not (cfg.harvestEnabled and cfg.harvestAffectPickup and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
@@ -563,8 +670,10 @@ pcall(function()
         pcall(function()
             local curObj = player.CurrentInteractable
             if not safeValid(curObj) then
+                -- 植被实例（ISM）交互时 CurrentInteractable 可能为空，允许后续按小增量判定
                 allowBoost = true
             elseif curObj:IsA("/Script/Maine.SpawnedItem") then
+                -- 仅放行无丢弃者（DroppedBy 为空）且有地图预摆数据的自然刷新单件可堆叠物品
                 local droppedBy = nil
                 pcall(function() droppedBy = curObj:GetDroppedBy() end)
                 local placedRow = ""
@@ -605,6 +714,7 @@ pcall(function()
         for rn, newTotal in pairs(after) do
             local oldTotal = snap.before[rn] or 0
             local delta = newTotal - oldTotal
+            -- 限制单次增量 <= 3，避免从储物箱或掉落背包整堆拾取时误触倍率放大
             if delta > 0 and delta <= 3 and not isHaulingRowName(rn) then
                 local addAmount = delta * extraMult
                 pcall(function()
@@ -634,8 +744,609 @@ pcall(function()
 end)
 
 -- ============================================================
+-- 6.5. 死亡保护扩展：一键找回掉落背包（唤醒远距 LOD + 瞬移到目标玩家脚边）
+-- ============================================================
+
+--- 提取指定玩家角色（及其 PlayerState）的归一化 GUID 键与小写玩家名，用于匹配掉落背包归属。
+local function extractPlayerIdentity(pawn)
+    local gKey = ""
+    local nameLow = ""
+    if not safeValid(pawn) then return gKey, nameLow end
+
+    pcall(function()
+        local ps = pawn.PlayerState
+        if safeValid(ps) then
+            gKey = guidToKey(ps.PlayerGuid)
+            if gKey == "" then
+                pcall(function() gKey = guidToKey(ps:GetPlayerGuid()) end)
+            end
+            pcall(function()
+                local pn = ueStringToLua(ps:GetPlayerName())
+                if pn ~= "" then nameLow = pn:lower() end
+            end)
+        end
+    end)
+    if gKey == "" then
+        pcall(function() gKey = guidToKey(pawn.PlayerGuid) end)
+    end
+    return gKey, nameLow
+end
+
+--- 判断一个 ALootBag 内部是否已经没有物品（用于跳过已被捡空但尚未销毁的空背包）。
+local function isLootBagEmpty(bag)
+    if not safeValid(bag) then return true end
+    local empty = false
+    pcall(function()
+        local inv = bag.InventoryComponent
+        if not safeValid(inv) then
+            empty = true
+            return
+        end
+        local okEmpty, isEmp = pcall(function() return inv:IsInventoryEmpty() end)
+        if okEmpty and isEmp == true then
+            empty = true
+            return
+        end
+        local items = inv.Items
+        if items and #items == 0 then
+            empty = true
+        end
+    end)
+    return empty
+end
+
+--- 从 UBaseLODActor 提取未加载目标蓝图短类名（纯只读查询，绝不触发 LOD 唤醒）。
+local function getLodActorClassShort(lod)
+    local clsShort = ""
+    if not safeValid(lod) then return clsShort end
+    pcall(function()
+        local hardCls = lod:GetActorClassHard()
+        if safeValid(hardCls) then
+            clsShort = cleanClassName(hardCls:GetFName():ToString())
+        end
+    end)
+    if clsShort == "" then
+        pcall(function()
+            local softCls = lod:GetActorClassSoft()
+            if softCls then
+                local softStr = ""
+                if type(softCls) == "string" then
+                    softStr = softCls
+                elseif softCls.AssetPathName then
+                    softStr = softCls.AssetPathName:ToString()
+                elseif softCls.ToString then
+                    softStr = softCls:ToString()
+                else
+                    softStr = tostring(softCls)
+                end
+                if softStr and softStr ~= "" and softStr ~= "None" then
+                    clsShort = cleanClassName(softStr)
+                end
+            end
+        end)
+    end
+    return clsShort
+end
+
+--- 在不唤醒 LOD 的前提下，通过 InventoryLODComponent.ProxyComponent 判断远距未加载背包是否已空。
+-- @return true=确认已空, false=确认非空或无法判定（交由唤醒后二次校验）
+local function isUnloadedLodInventoryEmpty(lod)
+    local empty = false
+    if not safeValid(lod) then return false end
+    pcall(function()
+        local comps = lod.LODComponents
+        if not comps then return end
+        for i = 1, #comps do
+            local comp = comps[i]
+            if safeValid(comp) then
+                local cname = ""
+                pcall(function() cname = comp:GetClass():GetFName():ToString() end)
+                if cname == "InventoryLODComponent" then
+                    local proxyComp = nil
+                    pcall(function() proxyComp = comp.ProxyComponent end)
+                    if safeValid(proxyComp) then
+                        local okEmp, isEmp = pcall(function() return proxyComp:IsInventoryEmpty() end)
+                        if okEmp and isEmp == true then
+                            empty = true
+                            return
+                        end
+                        local items = nil
+                        pcall(function() items = proxyComp.Items end)
+                        if items and #items == 0 then
+                            empty = true
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return empty
+end
+
+--- 将指定掉落背包安全瞬移到目标坐标，清除物理残留速度并触发联机坐标同步。
+-- 先尝试 K2_TeleportTo（UE4 内置防卡墙微调），若被狭小洞穴几何体拒绝则降级为 K2_SetActorLocation(bSweep=false, bTeleport=true)。
+local function teleportLootBagSafely(bag, destPos)
+    if not safeValid(bag) then return false end
+
+    -- 清除可能存在的下落/翻滚物理速度，防止悬崖或水下找回的背包落地后弹飞
+    pcall(function()
+        local root = bag.RootComponent
+        if safeValid(root) then
+            pcall(function() root:SetPhysicsLinearVelocity({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
+            pcall(function() root:SetPhysicsAngularVelocityInDegrees({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
+        end
+    end)
+
+    local moved = false
+    pcall(function()
+        local okTp = bag:K2_TeleportTo(destPos, { Pitch = 0, Yaw = 0, Roll = 0 })
+        if okTp == true then
+            moved = true
+        end
+    end)
+    if not moved then
+        pcall(function()
+            local hitOut = {}
+            bag:K2_SetActorLocation(destPos, false, hitOut, true)
+            moved = true
+        end)
+    end
+
+    -- 通知 Grounded 联机复制层立即刷新背包坐标，保证联机队友端立刻同步到新位置
+    pcall(function() bag:ResyncReplicationTransform() end)
+    return moved
+end
+
+--- 一键找回玩家死亡掉落的非空背包（见 ADR-0002）。
+-- 仅在房主权威端执行；采用“零唤醒前置过滤”机制：
+--   1. 先从 HUDMarkerManagerComponent 收集游戏原生登记的 DroppedBackpack(7) 标记与对应 Actor/LOD；
+--   2. 扫描已加载的 ALootBag（无需唤醒）；
+--   3. 对未加载的 ULootBagLODActor，在调用 ConvertToFullActorBlocking() 前必须通过四重只读前置校验：
+--      类型白名单(BP_Backpack/HUD标记) + 宝箱/建筑袋黑名单 + UProxyLootBagActor 归属校验 + ProxyInventory 非空校验，
+--      彻底杜绝误唤醒未加载实验室子关卡中的 Ominent 宝箱引发引擎空指针闪退。
+-- @param recoverAllParty false=仅找回房主/单人自己的掉落背包；true=找回全队所有玩家背包（在线送至本人脚边，离线归房主）
+local function recoverDroppedBackpacks(recoverAllParty)
+    local okGs, gs = pcall(FindFirstOf, "SurvivalGameState")
+    local pc = UEHelpers.GetPlayerController()
+    local hostPawn = safeValid(pc) and pc.Pawn or nil
+
+    if not (okGs and safeValid(gs) and safeValid(hostPawn)) then
+        lastStatusMessage = "当前尚未进入存档，无法找回掉落背包"
+        logInfo(lastStatusMessage)
+        return
+    end
+
+    local isHost = true
+    pcall(function() isHost = gs:HasAuthority() end)
+    if not isHost then
+        lastStatusMessage = "仅房主可执行一键找回背包（请由房主点击找回全队背包）"
+        logInfo(lastStatusMessage)
+        return
+    end
+
+    -- 1. 收集房主及全部在线队友的角色与身份映射（GUID 与玩家名双索引）
+    local hostGuidKey, hostNameLow = extractPlayerIdentity(hostPawn)
+    local backpackClass = nil
+    pcall(function() backpackClass = hostPawn.Backpack end)
+
+    local guidToPawn = {}
+    local nameToPawn = {}
+    local onlinePawnsByAddr = {}
+    local onlineCount = 0
+
+    local function registerOnlinePawn(p)
+        if not safeValid(p) then return end
+        local addr = p:GetAddress()
+        if onlinePawnsByAddr[addr] then return end
+        onlinePawnsByAddr[addr] = p
+        onlineCount = onlineCount + 1
+        local gk, nl = extractPlayerIdentity(p)
+        if gk ~= "" then guidToPawn[gk] = p end
+        if nl ~= "" then nameToPawn[nl] = p end
+    end
+
+    registerOnlinePawn(hostPawn)
+    pcall(function()
+        if safeValid(gs.PartyComponent) and gs.PartyComponent.PartyMembers then
+            local members = gs.PartyComponent.PartyMembers
+            for i = 1, #members do
+                registerOnlinePawn(members[i])
+            end
+        end
+    end)
+    pcall(function()
+        local allChars = FindAllOf("SurvivalPlayerCharacter")
+        if allChars then
+            for _, ch in ipairs(allChars) do
+                registerOnlinePawn(ch)
+            end
+        end
+    end)
+
+    -- 2. 收集游戏原生 HUDMarkerManagerComponent 中已确认的 DroppedBackpack(7) 标记（零唤醒）
+    local bagsByAddr = {}
+    local candidateBags = {}
+    local markerConfirmedLod = {}   -- key=LODActor 地址 -> true
+    local markerLodOwnerGuid = {}   -- key=LODActor 地址 -> RestrictedToPlayer GUID 字符串键
+    local skippedEmpty = 0
+    local otherPlayerBagCount = 0
+    local wokeLodCount = 0
+
+    local function pushCandidateBag(bag)
+        if not safeValid(bag) then return end
+        local fullName = ""
+        pcall(function() fullName = bag:GetFullName() end)
+        if fullName:find("Default__") then return end
+        local destroying = false
+        pcall(function() destroying = (bag:IsActorBeingDestroyed() == true) end)
+        if destroying then return end
+
+        local addr = bag:GetAddress()
+        if not bagsByAddr[addr] then
+            bagsByAddr[addr] = true
+            table.insert(candidateBags, bag)
+        end
+    end
+
+    local function collectDroppedBackpackMarkers(markerArr)
+        if not markerArr then return end
+        local n = 0
+        pcall(function() n = #markerArr end)
+        for i = 1, n do
+            pcall(function()
+                local md = markerArr[i]
+                if not safeValid(md) then return end
+                local mType = -1
+                pcall(function() mType = md:GetMarkerType() end)
+                if mType == -1 then
+                    pcall(function() mType = md.MarkerType or -1 end)
+                end
+                if mType ~= 7 then return end -- EHUDMarkerType::DroppedBackpack == 7
+
+                local ownerGk = ""
+                pcall(function() ownerGk = guidToKey(md:GetRestrictedToPlayer()) end)
+                if ownerGk == "" then
+                    pcall(function() ownerGk = guidToKey(md.RestrictedToPlayer) end)
+                end
+
+                local refAct = nil
+                pcall(function() refAct = md:GetReferencedActor() end)
+                if safeValid(refAct) then
+                    pushCandidateBag(refAct)
+                end
+
+                local refLod = nil
+                pcall(function() refLod = md:GetReferencedLODActor() end)
+                if safeValid(refLod) then
+                    local lAddr = refLod:GetAddress()
+                    markerConfirmedLod[lAddr] = true
+                    if ownerGk ~= "" then
+                        markerLodOwnerGuid[lAddr] = ownerGk
+                    end
+                end
+            end)
+        end
+    end
+
+    pcall(function()
+        local hm = nil
+        pcall(function() hm = gs.HUDMarkerManagerComponent end)
+        if not safeValid(hm) then
+            pcall(function() hm = FindFirstOf("HUDMarkerManagerComponent") end)
+        end
+        if safeValid(hm) then
+            pcall(function()
+                if hm.RegisteredActorMarkerData then
+                    collectDroppedBackpackMarkers(hm.RegisteredActorMarkerData.MarkerArray)
+                end
+            end)
+            pcall(function()
+                if hm.RegisteredLODActorMarkerData then
+                    collectDroppedBackpackMarkers(hm.RegisteredLODActorMarkerData.MarkerArray)
+                end
+            end)
+            pcall(function()
+                collectDroppedBackpackMarkers(hm.ReplicatedMarkerList)
+            end)
+        end
+    end)
+
+    -- 3. 先收集所有已加载的 ALootBag（纯只读，无任何 LOD 唤醒风险）
+    pcall(function()
+        local loadedBags = FindAllOf("LootBag")
+        if loadedBags then
+            for _, bag in ipairs(loadedBags) do
+                pushCandidateBag(bag)
+            end
+        end
+    end)
+
+    -- 4. 仅对严格通过“玩家掉落背包 + 归属匹配 + 非空”前置校验的远距未加载 LOD 执行按需唤醒（上限 16 个）
+    local MAX_WAKE_PER_CLICK = 16
+    local lodsToWake = {}
+    local seenLodAddr = {}
+
+    local function considerLootBagLod(lod)
+        if not safeValid(lod) then return end
+        local lAddr = lod:GetAddress()
+        if seenLodAddr[lAddr] then return end
+        seenLodAddr[lAddr] = true
+
+        local fullActor = nil
+        pcall(function() fullActor = lod.FullActor end)
+        if safeValid(fullActor) then
+            pushCandidateBag(fullActor)
+            return
+        end
+
+        local confirmedByMarker = (markerConfirmedLod[lAddr] == true)
+        local clsShort = getLodActorClassShort(lod)
+        local lowCls = clsShort:lower()
+
+        -- 黑名单硬拦截：绝不唤醒任何 Ominent 宝箱、补给箱、储物箱或建筑战利品袋
+        if lowCls:find("chest") or lowCls:find("ominent") or lowCls:find("treasure")
+            or lowCls:find("storage") or lowCls:find("building") or lowCls:find("supply") then
+            return
+        end
+
+        -- 白名单校验：必须匹配玩家背包蓝图类型、类名含 backpack，或经 HUD DroppedBackpack 标记确认
+        local isBackpackType = confirmedByMarker or (lowCls:find("backpack") ~= nil)
+        if (not isBackpackType) and safeValid(backpackClass) then
+            pcall(function()
+                if lod:IsFullActorType(backpackClass) == true then
+                    isBackpackType = true
+                end
+            end)
+        end
+        if not isBackpackType then
+            return
+        end
+
+        -- 读取 UProxyLootBagActor 归属信息（无需唤醒 FullActor）
+        local proxyGuidKey = markerLodOwnerGuid[lAddr] or ""
+        local proxyOwnerNameLow = ""
+        pcall(function()
+            local proxy = lod.ProxyActor
+            if safeValid(proxy) then
+                if proxyGuidKey == "" then
+                    proxyGuidKey = guidToKey(proxy.OwnerPlayerGuid)
+                end
+                local pn = ueStringToLua(proxy.OwnerName)
+                if pn ~= "" then proxyOwnerNameLow = pn:lower() end
+            end
+        end)
+
+        -- 无主且无 DroppedBackpack 标记的容器属于场景预摆物体，禁止唤醒
+        if (not confirmedByMarker) and proxyGuidKey == "" and proxyOwnerNameLow == "" then
+            return
+        end
+
+        -- 未加载代理中已可判定为空背包时，直接跳过不唤醒
+        if isUnloadedLodInventoryEmpty(lod) then
+            skippedEmpty = skippedEmpty + 1
+            return
+        end
+
+        -- 仅找回自己的背包时，先在未加载层排除明确属于其他队友的远距背包
+        if not recoverAllParty then
+            local matchesHost = false
+            if hostGuidKey ~= "" and proxyGuidKey ~= "" then
+                matchesHost = (proxyGuidKey == hostGuidKey)
+            elseif hostNameLow ~= "" and proxyOwnerNameLow ~= "" then
+                matchesHost = (proxyOwnerNameLow == hostNameLow)
+            elseif onlineCount <= 1 and confirmedByMarker then
+                matchesHost = true
+            end
+            if not matchesHost then
+                otherPlayerBagCount = otherPlayerBagCount + 1
+                return
+            end
+        end
+
+        if #lodsToWake < MAX_WAKE_PER_CLICK then
+            table.insert(lodsToWake, lod)
+        end
+    end
+
+    pcall(function()
+        local mgr = gs.LODActorManagerComponent
+        if not safeValid(mgr) or not mgr.LODActors then return end
+        local lods = mgr.LODActors
+        for i = 1, #lods do
+            local lod = lods[i]
+            if safeValid(lod) then
+                pcall(function()
+                    local lAddr = lod:GetAddress()
+                    if markerConfirmedLod[lAddr] or lod:GetClass():GetFName():ToString() == "LootBagLODActor" then
+                        considerLootBagLod(lod)
+                    end
+                end)
+            end
+        end
+    end)
+
+    -- 仅在遍历 LODActors 结束后再逐一唤醒少量已确认的远距玩家背包（避免迭代期间修改数组）
+    for _, lod in ipairs(lodsToWake) do
+        pcall(function()
+            lod:ConvertToFullActorBlocking()
+            local fullActor = nil
+            pcall(function() fullActor = lod.FullActor end)
+            if not safeValid(fullActor) then
+                pcall(function() fullActor = lod:K2_GetFullActor() end)
+            end
+            if safeValid(fullActor) then
+                wokeLodCount = wokeLodCount + 1
+                pushCandidateBag(fullActor)
+            end
+        end)
+    end
+
+    -- 5. 严格筛选玩家死亡掉落背包（ELootBagType::PlayerBackpack = 1）、跳过空包，并按目标玩家分组
+    local statics = getSurvivalStatics()
+    local targetGroups = {}      -- key=targetPawn 地址 -> { pawn=targetPawn, bags={...} }
+    local targetGroupOrder = {}
+    local offlineToHostCount = 0
+
+    for _, bag in ipairs(candidateBags) do
+        pcall(function()
+            -- 严格排除建筑拆毁/储物箱损坏产生的战利品袋（ELootBagType::Undefined = 0）
+            local bagType = bag.LootBagType
+            if bagType ~= 1 then return end
+
+            -- 跳过已空背包
+            if isLootBagEmpty(bag) then
+                skippedEmpty = skippedEmpty + 1
+                return
+            end
+
+            local ownerGuidRaw = nil
+            pcall(function() ownerGuidRaw = bag.OwnerPlayerGuid end)
+            local ownerGuidKey = guidToKey(ownerGuidRaw)
+            local ownerNameLow = ueStringToLua(bag.OwnerName):lower()
+
+            -- 判定该背包是否属于当前房主本人
+            local isMine = false
+            if hostGuidKey ~= "" and ownerGuidKey ~= "" then
+                isMine = (ownerGuidKey == hostGuidKey)
+            elseif hostNameLow ~= "" and ownerNameLow ~= "" then
+                isMine = (ownerNameLow == hostNameLow)
+            elseif onlineCount <= 1 then
+                -- 单人存档若历史旧包未写入 GUID，兜底归属当前单人玩家
+                isMine = true
+            end
+
+            local targetPawn = nil
+            if not recoverAllParty then
+                if not isMine then
+                    otherPlayerBagCount = otherPlayerBagCount + 1
+                    return
+                end
+                targetPawn = hostPawn
+            else
+                -- 全队找回：优先按 GUID / 名字匹配在线队友，离线玩家背包交由房主代收
+                if isMine then
+                    targetPawn = hostPawn
+                else
+                    if ownerGuidKey ~= "" and guidToPawn[ownerGuidKey] then
+                        targetPawn = guidToPawn[ownerGuidKey]
+                    end
+                    if (not safeValid(targetPawn)) and statics and ownerGuidKey ~= "" and ownerGuidRaw then
+                        pcall(function()
+                            local found = statics:GetPlayerCharacterFromPlayerGuid(gs, ownerGuidRaw)
+                            if safeValid(found) then targetPawn = found end
+                        end)
+                    end
+                    if (not safeValid(targetPawn)) and ownerNameLow ~= "" and nameToPawn[ownerNameLow] then
+                        targetPawn = nameToPawn[ownerNameLow]
+                    end
+                    if not safeValid(targetPawn) then
+                        targetPawn = hostPawn
+                        offlineToHostCount = offlineToHostCount + 1
+                    end
+                end
+            end
+
+            local tAddr = targetPawn:GetAddress()
+            if not targetGroups[tAddr] then
+                targetGroups[tAddr] = { pawn = targetPawn, bags = {} }
+                table.insert(targetGroupOrder, tAddr)
+            end
+            table.insert(targetGroups[tAddr].bags, bag)
+        end)
+    end
+
+    -- 6. 对每位目标玩家的匹配背包，在其正前方地面按小扇形阵列错开落地
+    local totalRecovered = 0
+    for _, tAddr in ipairs(targetGroupOrder) do
+        local grp = targetGroups[tAddr]
+        local pawn = grp.pawn
+        local bags = grp.bags
+        if safeValid(pawn) and #bags > 0 then
+            local pLoc = nil
+            local fwdX, fwdY = 1.0, 0.0
+            local rightX, rightY = 0.0, 1.0
+            pcall(function() pLoc = pawn:K2_GetActorLocation() end)
+            pcall(function()
+                local f = pawn:GetActorForwardVector()
+                if f then
+                    local len2d = math.sqrt((f.X or 0) * (f.X or 0) + (f.Y or 0) * (f.Y or 0))
+                    if len2d > 0.001 then
+                        fwdX = f.X / len2d
+                        fwdY = f.Y / len2d
+                        rightX = -fwdY
+                        rightY = fwdX
+                    end
+                end
+            end)
+
+            if pLoc then
+                local totalForPlayer = #bags
+                for idx, bag in ipairs(bags) do
+                    local forwardDist = 135.0
+                    local sideOffset = 0.0
+                    if totalForPlayer > 1 then
+                        -- 每排最多 5 个背包，左右间隔 65cm、前后排间距 70cm，避免碰撞箱重叠弹飞
+                        local row = math.floor((idx - 1) / 5)
+                        local col = (idx - 1) % 5
+                        local rowCount = math.min(5, totalForPlayer - row * 5)
+                        local centered = col - (rowCount - 1) * 0.5
+                        forwardDist = 140.0 + row * 70.0
+                        sideOffset = centered * 65.0
+                    end
+
+                    local destPos = {
+                        X = (pLoc.X or 0) + fwdX * forwardDist + rightX * sideOffset,
+                        Y = (pLoc.Y or 0) + fwdY * forwardDist + rightY * sideOffset,
+                        Z = (pLoc.Z or 0) + 45.0, -- 略抬高 45cm 让背包自然落回地面，避免卡入地底
+                    }
+                    if teleportLootBagSafely(bag, destPos) then
+                        totalRecovered = totalRecovered + 1
+                    end
+                end
+            end
+        end
+    end
+
+    -- 7. 生成清晰中文状态反馈（写入顶部状态栏与 UE4SS 控制台）
+    if totalRecovered == 0 then
+        if recoverAllParty then
+            if skippedEmpty > 0 then
+                lastStatusMessage = string.format("未发现非空玩家掉落背包（已自动跳过 %d 个空背包）", skippedEmpty)
+            else
+                lastStatusMessage = "当前世界未检测到任何可找回的玩家掉落背包"
+            end
+        else
+            if otherPlayerBagCount > 0 then
+                lastStatusMessage = string.format("未检测到属于你的掉落背包（另有 %d 个队友背包，可点“找回全队背包”）", otherPlayerBagCount)
+            elseif skippedEmpty > 0 then
+                lastStatusMessage = string.format("未发现属于你的非空掉落背包（已自动跳过 %d 个空背包）", skippedEmpty)
+            else
+                lastStatusMessage = "当前未检测到属于你的掉落背包"
+            end
+        end
+    else
+        if recoverAllParty then
+            if offlineToHostCount > 0 then
+                lastStatusMessage = string.format("已找回全队 %d 个掉落背包（其中 %d 个离线玩家背包已送至房主脚边）！",
+                    totalRecovered, offlineToHostCount)
+            else
+                lastStatusMessage = string.format("已将全队 %d 个掉落背包各自瞬移到对应玩家正前方地面！", totalRecovered)
+            end
+        else
+            lastStatusMessage = string.format("已将你的 %d 个掉落背包瞬移到正前方地面，按 E 即可拾取！", totalRecovered)
+        end
+    end
+
+    logInfo(string.format("一键找回背包完成: mode=%s recovered=%d wokeLod=%d skippedEmpty=%d offlineToHost=%d -> %s",
+        recoverAllParty and "all_party" or "self", totalRecovered, wokeLodCount, skippedEmpty, offlineToHostCount, lastStatusMessage))
+end
+
+-- ============================================================
 -- 7. 功能四：“M” 地图乳牙、高级乳牙与全游戏资源目录扫描
 -- ============================================================
+
+--- 懒加载并缓存游戏核心 DataTable（AllItemsTable / HarvestNodesTable / CharactersTable）。
 local function loadDataTables()
     local gi = UEHelpers.GetGameInstance()
     if safeValid(gi) and safeValid(gi.GlobalTableData) then
@@ -654,6 +1365,7 @@ local function loadDataTables()
     end
 end
 
+--- 从游戏数据表一次性构建简体中文译名索引与原版资源扫描仪支持列表。
 local function loadTableTranslations()
     loadDataTables()
     local statics = getSurvivalStatics()
@@ -773,6 +1485,9 @@ local function isLodDeadOrInvalid(lod, fullActor, healthLodCls)
     return isDead
 end
 
+--- 扫描全图固定收集品（乳牙/高级乳牙/SCA.B）与全部存活 LOD 实体，更新内存标点桶并按需写出 catalog.json。
+-- @param writeCatalogFile 是否将排序后的资源目录原子写入 data/catalog.json 供 C++ 菜单展示
+-- @param quietLog         是否静默日志（定时增量刷新时设为 true 避免刷屏）
 local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
     local okGs, gs = pcall(FindFirstOf, "SurvivalGameState")
     if not okGs or not safeValid(gs) then return false end
@@ -1328,6 +2043,8 @@ local function findActiveMapPanel()
     return nil, nil
 end
 
+--- 在每帧/定时轮询中检测 M 地图开关状态，并将最新控件内存指针、地图边界及筛选后的标点写入 map_live.json。
+-- @return true 表示 M 地图当前处于打开状态
 local function updateMapLiveFrame(now)
     local panel, rootWin = findActiveMapPanel()
     if not safeValid(panel) then
@@ -1493,8 +2210,10 @@ local function updateMapLiveFrame(now)
 end
 
 -- ============================================================
--- 9. 处理菜单一次性操作指令
+-- 9. 处理菜单一次性操作指令（通过 data/actions.json 序列号去重）
 -- ============================================================
+
+--- 消费 C++ 悬浮菜单写入的一次性操作指令（放路标、开扫描仪、一键秒建、重扫世界、一键找回背包等）。
 local function processActions()
     local raw = readAllText(ACTIONS_PATH)
     if not raw or raw == "" then return end
@@ -1563,6 +2282,10 @@ local function processActions()
                 logInfo(lastStatusMessage)
             end
         end)
+    elseif t == "recover_my_backpacks" then
+        recoverDroppedBackpacks(false)
+    elseif t == "recover_all_backpacks" then
+        recoverDroppedBackpacks(true)
     elseif t == "refresh_catalog" then
         foliagePinCache = {}
         noFoliageRows = {}
@@ -1578,6 +2301,8 @@ end
 -- ============================================================
 -- 10. 单线程安全主调度器（彻底避免 UE4SS 多 LoopAsync 并发崩溃）
 -- ============================================================
+
+--- 轮询 data/config.json，若文本内容发生变化则解码并合并到内存配置表 cfg。
 local function pollConfig()
     local raw = readAllText(CONFIG_PATH)
     if not raw or raw == "" or raw == lastConfigRaw then return false end
@@ -1590,13 +2315,16 @@ local function pollConfig()
     return true
 end
 
-local function writeRuntimeStatus(inWorld, isHost, diffName, liveP, liveE)
+--- 将当前世界状态、实时伤害/死亡保护生效值及乳牙统计原子写入 data/status.json 供菜单顶部展示。
+local function writeRuntimeStatus(inWorld, isHost, diffName, liveP, liveE, liveKeepInv, liveNoDurPenalty)
     writeAtomicText(STATUS_PATH, json.encode({
         inWorld = inWorld,
         isHost = isHost,
         difficulty = diffName,
         livePlayerDamage = liveP,
         liveEnemyDamage = liveE,
+        liveKeepInventoryOnDeath = liveKeepInv == true,
+        liveNoDeathDurabilityPenalty = liveNoDurPenalty == true,
         uncollectedMilkMolars = molarStats.unMilk,
         uncollectedMegaMolars = molarStats.unMega,
         totalMilkMolars = molarStats.totMilk,
@@ -1615,10 +2343,11 @@ local lastSlowTickClock = 0
 local lastLootSweepClock = 0
 local lastMapCheckClock = 0
 
+--- 游戏主线程统一调度入口（由唯一 LoopAsync 经 ExecuteInGameThread 串行驱动，保证 UObject 线程安全）。
 local function onGameThreadTick()
     local now = os.clock()
 
-    -- 1. 高频任务：仅在已进入存档时检测与刷新 M 地图标点（M 地图打开时 50ms 刷新，关闭时 250ms 探测）
+    -- 1. 高频任务：仅在已进入存档时检测与刷新 M 地图标点（M 地图打开时 40ms 刷新，关闭时 250ms 探测）
     if catalogBuiltForWorld ~= nil then
         local mapInterval = lastMapOpen and 0.04 or 0.25
         if now - lastMapCheckClock >= mapInterval then
@@ -1627,7 +2356,7 @@ local function onGameThreadTick()
         end
     end
 
-    -- 2. 低频任务（每 0.6 秒）：同步配置、执行菜单操作、维护堆叠/伤害倍率与进图状态
+    -- 2. 低频任务（每 0.6 秒）：同步配置、执行菜单操作、维护堆叠/伤害/死亡保护与进图状态
     if now - lastSlowTickClock >= 0.6 then
         lastSlowTickClock = now
 
@@ -1643,8 +2372,9 @@ local function onGameThreadTick()
             local isHost = true
             pcall(function() isHost = gs:HasAuthority() end)
 
-            local liveP, liveE, diffName = applyGameModeSettings()
+            local liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost)
 
+            -- 检测到切换世界/新读档，重置上一存档的资源目录缓存并等待 2.5 秒完成流式加载
             local worldKey = gs:GetAddress()
             if catalogBuiltForWorld ~= worldKey then
                 catalogBuiltForWorld = worldKey
@@ -1657,11 +2387,11 @@ local function onGameThreadTick()
                 lastStatusMessage = "正在加载世界资源与乳牙坐标..."
             end
 
-            -- 进入存档 2.5 秒后自动执行一次全量世界扫描（不使用嵌套 ExecuteWithDelay）
+            -- 进入存档 2.5 秒后自动执行一次全量世界扫描（不使用嵌套 ExecuteWithDelay 避免并发）
             if (not worldInitialScanDone) and (now - worldEnterClock >= 2.5) then
                 worldInitialScanDone = true
                 applyStackSizeMultiplier()
-                applyGameModeSettings()
+                liveP, liveE, diffName, liveKeepInv, liveNoDurPenalty = applyGameModeSettings(isHost)
                 applyAllLootComponents()
                 refreshWorldCatalogAndPins(true, false)
                 lastStatusMessage = "已就绪！按 M 查看乳牙与追踪资源，按 Insert/F8 调节参数"
@@ -1674,8 +2404,9 @@ local function onGameThreadTick()
                 end
             end
 
-            writeRuntimeStatus(true, isHost, diffName, liveP, liveE)
+            writeRuntimeStatus(true, isHost, diffName, liveP, liveE, liveKeepInv, liveNoDurPenalty)
         else
+            -- 退出存档返回主菜单时彻底清空旧世界对象地址缓存，避免悬空地址复用
             if catalogBuiltForWorld ~= nil then
                 catalogBuiltForWorld = nil
                 worldInitialScanDone = false
@@ -1693,7 +2424,7 @@ local function onGameThreadTick()
                     writeAtomicText(MAP_LIVE_PATH, json.encode({ mapOpen = false }))
                 end
             end
-            writeRuntimeStatus(false, true, "未进入存档", 1.0, 1.0)
+            writeRuntimeStatus(false, true, "未进入存档", 1.0, 1.0, false, false)
         end
     end
 
@@ -1704,7 +2435,7 @@ end
 LoopAsync(50, function()
     local now = os.clock()
     if tickInFlight then
-        -- 看门狗：若超过 3 秒未释放（如极罕见切换关卡丢帧），自动解锁防止卡死
+        -- 看门狗：若超过 3 秒未释放（如极罕见切换关卡丢帧），自动解锁防止调度器永久卡死
         if now - tickStartClock < 3.0 then
             return false
         end
@@ -1715,4 +2446,4 @@ LoopAsync(50, function()
     return false
 end)
 
-logInfo("GroundedQoL v1.1 初始化完成（单线程稳定调度 + DX12/DX11 支持）！按 Insert 或 F8 打开中文菜单。")
+logInfo("GroundedQoL v1.2 初始化完成（单线程稳定调度 + 死亡保护与背包找回 + DX12/DX11 支持）！按 Insert 或 F8 打开中文菜单。")
