@@ -1,0 +1,28 @@
+# CMake / MSVC 编译产物
+overlay/build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.dll
+
+# 本地下载缓存与分发压缩包（建议通过 GitHub Releases 发布）
+downloads/
+dist/
+
+# 运行时数据与日志
+**/data/
+*.log
+*.tmp
+
+# 本地开发探测与 SDK 摘录临时文件
+probe_report.txt
+sdk_part*.txt
+
+# 编辑器与系统临时文件
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini
