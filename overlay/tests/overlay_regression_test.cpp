@@ -37,10 +37,13 @@
 
 using QueryStateFn = int(__cdecl*)();
 using QueryMetricsFn = void(__cdecl*)(unsigned long long*, unsigned long long*, int*);
+using QueryDx12ResilienceFn = void(__cdecl*)(int*, int*, int*);
+using QueryMenuRectFn = void(__cdecl*)(float*, float*, float*, float*);
 using VoidTestFn = void(__cdecl*)();
 using SetWantTextFn = void(__cdecl*)(int, float, float);
 using InjectImeCandFn = void(__cdecl*)(const char*, const char* const*, int);
 using GetClickedCandFn = int(__cdecl*)();
+using PushActionTestFn = void(__cdecl*)(const char*, const char*);
 
 static int g_origSetCursorCalls = 0;
 static int g_origMouseDownCalls = 0;
@@ -254,6 +257,11 @@ static int RunDx12Test(const std::wstring& dllPath) {
     DeleteFileW((dataDir + L"\\config.json").c_str());
     DeleteFileW((dataDir + L"\\actions.json").c_str());
 
+    DeleteFileW((dataDir + L"\\config.json").c_str());
+    DeleteFileW((dataDir + L"\\catalog.json").c_str());
+    DeleteFileW((dataDir + L"\\actions.json").c_str());
+    DeleteFileW((dataDir + L"\\status.json").c_str());
+    DeleteFileW((dataDir + L"\\map_live.json").c_str());
     std::printf("[TEST-DX12] Loading DLL...\n");
     HMODULE mod = LoadLibraryW(dllPath.c_str());
     if (!mod) {
@@ -351,6 +359,8 @@ static int RunDx12Test(const std::wstring& dllPath) {
 
     if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &sd, nullptr, nullptr, &swap1))) return 5;
     swap1->QueryInterface(IID_PPV_ARGS(&swap3));
+    swap1->Release();
+    swap1 = nullptr;
 
     dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
     dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmdList));
@@ -651,7 +661,7 @@ static int RunDx12Test(const std::wstring& dllPath) {
         std::printf("[TEST-DX12] Verified window-thread TSF+IMM unlock/restore, Esc composition guard, Chinese WM_IME_CHAR, and Alt+Tab!\n");
     }
 
-    // 7. 切换联机客机状态 + ResizeBuffers 稳定性验证
+    // 7. 切换联机客机状态 + ResizeBuffers + ResizeBuffers1(格式/缓冲数变更重建) + SwapChain 重建重绑 + 小视口回拉防越界验证
     Sleep(450);
     WriteMockStatusData(dataDir, false, false, false);
     if (!pumpAndPresent(6)) return 13;
@@ -662,6 +672,96 @@ static int RunDx12Test(const std::wstring& dllPath) {
         return 14;
     }
     if (!pumpAndPresent(5)) return 15;
+
+    auto queryResilience = reinterpret_cast<QueryDx12ResilienceFn>(GetProcAddress(mod, "GroundedQoL_QueryDx12Resilience"));
+    auto queryMenuRect = reinterpret_cast<QueryMenuRectFn>(GetProcAddress(mod, "GroundedQoL_QueryMenuRect"));
+    if (!queryResilience || !queryMenuRect) {
+        std::printf("[FAIL] Missing GroundedQoL_QueryDx12Resilience / GroundedQoL_QueryMenuRect exports!\n");
+        return 63;
+    }
+
+    // 7a. 模拟 Grounded 实机 FD3D12Viewport::Resize 调用 IDXGISwapChain3::ResizeBuffers1 切换为 3 缓冲 + 10-bit R10G10B10A2_UNORM（Format=24）
+    {
+        UINT nodeMasks[3] = {1, 1, 1};
+        IUnknown* queues[3] = {queue, queue, queue};
+        HRESULT hrResize1 = swap3->ResizeBuffers1(3, 1280, 720, DXGI_FORMAT_R10G10B10A2_UNORM, 0, nodeMasks, queues);
+        if (FAILED(hrResize1)) {
+            std::printf("[FAIL] DX12 ResizeBuffers1(3 buffers, R10G10B10A2_UNORM) failed: 0x%08lX\n", hrResize1);
+            return 64;
+        }
+        unsigned long long idleBefore = 0, rendBefore = 0;
+        int imeDummy = 0;
+        queryMetrics(&idleBefore, &rendBefore, &imeDummy);
+        if (!pumpAndPresent(5)) return 65;
+        unsigned long long idleAfter = 0, rendAfter = 0;
+        queryMetrics(&idleAfter, &rendAfter, &imeDummy);
+        int r1Cnt = 0, rebuildCnt = 0, rebindCnt = 0;
+        queryResilience(&r1Cnt, &rebuildCnt, &rebindCnt);
+        if (r1Cnt < 1 || rebuildCnt < 1 || rendAfter <= rendBefore) {
+            std::printf("[FAIL] ResizeBuffers1 format/buffer change did not rebuild DX12 ImGui backend! r1=%d rebuild=%d rend=%llu->%llu\n",
+                        r1Cnt, rebuildCnt, rendBefore, rendAfter);
+            return 66;
+        }
+        std::printf("[TEST-DX12] Verified ResizeBuffers1(3x R10G10B10A2_UNORM) + ImGui_ImplDX12 PSO rebuild (r1=%d rebuild=%d)!\n",
+                    r1Cnt, rebuildCnt);
+    }
+
+    // 7b. 模拟游戏进图/切全屏时为同一游戏窗口重建全新 SwapChain，验证自动重绑不静默丢帧且菜单继续渲染可见
+    {
+        swap3->Release();
+        swap3 = nullptr;
+
+        DXGI_SWAP_CHAIN_DESC1 sdNew{};
+        sdNew.BufferCount = 3;
+        sdNew.Width = 640;
+        sdNew.Height = 480;
+        sdNew.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sdNew.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sdNew.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        sdNew.SampleDesc.Count = 1;
+
+        SetWindowPos(hwnd, nullptr, 100, 100, 656, 519, SWP_NOZORDER | SWP_NOACTIVATE);
+        PumpMessages();
+
+        IDXGISwapChain1* swap1New = nullptr;
+        HRESULT hrNewSc = factory->CreateSwapChainForHwnd(queue, hwnd, &sdNew, nullptr, nullptr, &swap1New);
+        if (FAILED(hrNewSc) || !swap1New || FAILED(swap1New->QueryInterface(IID_PPV_ARGS(&swap3)))) {
+            if (swap1New) swap1New->Release();
+            std::printf("[FAIL] Failed to recreate SwapChain for rebind test: hr=0x%08lX\n", hrNewSc);
+            return 67;
+        }
+        swap1New->Release();
+
+        unsigned long long idleBefore = 0, rendBefore = 0;
+        int imeDummy = 0;
+        queryMetrics(&idleBefore, &rendBefore, &imeDummy);
+        if (!pumpAndPresent(6)) return 68;
+        unsigned long long idleAfter = 0, rendAfter = 0;
+        queryMetrics(&idleAfter, &rendAfter, &imeDummy);
+        int r1Cnt = 0, rebuildCnt = 0, rebindCnt = 0;
+        queryResilience(&r1Cnt, &rebuildCnt, &rebindCnt);
+        if (rebindCnt < 1 || rendAfter <= rendBefore || (queryState() & (1 << 2)) == 0) {
+            std::printf("[FAIL] Recreated SwapChain was NOT rebound cleanly! rebind=%d rend=%llu->%llu state=0x%X\n",
+                        rebindCnt, rendBefore, rendAfter, queryState());
+            return 69;
+        }
+
+        // 验证窗口缩小到 640x480 后，主菜单自动钳制回可视视口内（绝不悬在屏幕外出现“有鼠标无菜单”）
+        float mx = 0, my = 0, mw = 0, mh = 0;
+        queryMenuRect(&mx, &my, &mw, &mh);
+        RECT smallRc{};
+        GetClientRect(hwnd, &smallRc);
+        const float cw = static_cast<float>(smallRc.right - smallRc.left);
+        const float ch = static_cast<float>(smallRc.bottom - smallRc.top);
+        if (mw <= 100.0f || mh <= 100.0f || mx < 0.0f || my < 0.0f ||
+            mx + mw > cw + 2.0f || my + mh > ch + 2.0f) {
+            std::printf("[FAIL] Menu window was NOT clamped inside shrunk viewport! rect=(%.1f,%.1f %.1fx%.1f) client=%.0fx%.0f\n",
+                        mx, my, mw, mh, cw, ch);
+            return 70;
+        }
+        std::printf("[TEST-DX12] Verified SwapChain rebind (rebind=%d) & shrunk viewport menu clamp (%.0f,%.0f %.0fx%.0f in %.0fx%.0f)!\n",
+                    rebindCnt, mx, my, mw, mh, cw, ch);
+    }
 
     // 8. 按 F8 关闭菜单 -> 验证立即向 UE4 归还隐藏光标与 ClipCursor，并复测二次打开无闪烁
     Sleep(220);
@@ -703,9 +803,27 @@ static int RunDx12Test(const std::wstring& dllPath) {
     DeleteFileW((dataDir + L"\\actions.json").c_str());
     DeleteFileW((dataDir + L"\\catalog.json").c_str());
 
-    std::printf("[PASS] DX12 full regression test PASSED!\n");
+    // 正常释放并走自然进程退出（不再用 TerminateProcess 绕过 DLL_PROCESS_DETACH），实测退出阶段 0 闪退！
+    if (tsfMgr) {
+        if (ue4DisabledDoc) {
+            ITfDocumentMgr* tmp = nullptr;
+            tsfMgr->AssociateFocus(hwnd, nullptr, &tmp);
+            if (tmp) tmp->Release();
+            ue4DisabledDoc->Release();
+        }
+        if (origCuasDoc) origCuasDoc->Release();
+        tsfMgr->Release();
+    }
+    if (swap3) swap3->Release();
+    if (queue) queue->Release();
+    if (dev) dev->Release();
+    if (factory) factory->Release();
+    DestroyWindow(hwnd);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    CoUninitialize();
+
+    std::printf("[PASS] DX12 full regression test PASSED (clean process exit)!\n");
     std::fflush(stdout);
-    TerminateProcess(GetCurrentProcess(), 0);
     return 0;
 }
 
@@ -725,6 +843,12 @@ static int RunDx11Test(const std::wstring& dllPath) {
                "  \"stackMultiplier\": 15\n"
                "}\n";
     }
+    // 模拟上次游戏会话退出后磁盘残留的 status.json（旧会话确认号 lastActionSeq=8）：
+    // 新会话启动后 seq 从 1 开始，连续下发 [1] 与 [2] 绝不可被旧会话的确认号 8 误裁剪掉！
+    {
+        std::ofstream stOld(dataDir + L"\\status.json", std::ios::binary | std::ios::trunc);
+        stOld << "{\"inWorld\":true,\"isHost\":true,\"lastActionSession\":\"s_stale_prev_session\",\"lastActionSeq\":8}\n";
+    }
 
     std::printf("[TEST-DX11] Loading DLL...\n");
     HMODULE mod = LoadLibraryW(dllPath.c_str());
@@ -734,9 +858,93 @@ static int RunDx11Test(const std::wstring& dllPath) {
     auto setWantText = reinterpret_cast<SetWantTextFn>(GetProcAddress(mod, "GroundedQoL_TestSetWantTextInput"));
     auto injectIme = reinterpret_cast<InjectImeCandFn>(GetProcAddress(mod, "GroundedQoL_TestInjectImeCandidates"));
     auto getClickedCand = reinterpret_cast<GetClickedCandFn>(GetProcAddress(mod, "GroundedQoL_TestGetLastClickedCandidate"));
-    if (!queryState || !expireBanner || !setWantText || !injectIme || !getClickedCand) return 22;
+    auto pushAction = reinterpret_cast<PushActionTestFn>(GetProcAddress(mod, "GroundedQoL_TestPushAction"));
+    if (!queryState || !expireBanner || !setWantText || !injectIme || !getClickedCand || !pushAction) return 22;
 
     Sleep(800);
+
+    // 0) 优先复现并验收「重启后旧会话 lastActionSeq=8 残留时，连续发送 seq=1 与 seq=2 绝不丢单」
+    {
+        // 先推 seq=1 并等待其落盘到 actions.json，再推 seq=2（两条均未被 Lua 消费）
+        pushAction("activate_surveyors", "");
+        Sleep(140);
+        pushAction("build_all_blueprints", "");
+        Sleep(180);
+        std::string batchText = ReadTextFile(dataDir + L"\\actions.json");
+        if (batchText.find("\"session\"") == std::string::npos ||
+            batchText.find("\"actions\"") == std::string::npos ||
+            batchText.find("activate_surveyors") == std::string::npos ||
+            batchText.find("build_all_blueprints") == std::string::npos) {
+            std::printf("[FAIL] Stale previous-session lastActionSeq=8 dropped new-session action 1! text=%s\n",
+                        batchText.c_str());
+            return 58;
+        }
+
+        // 再写一条不带 lastActionSession 的旧版格式 status.json（lastActionSeq=999），继续推 seq=3 -> 仍不得裁剪本会话队列
+        {
+            std::ofstream stLegacy(dataDir + L"\\status.json", std::ios::binary | std::ios::trunc);
+            stLegacy << "{\"inWorld\":true,\"isHost\":true,\"lastActionSeq\":999}\n";
+        }
+        Sleep(420);
+        pushAction("survey_item", "FoodMint");
+        Sleep(180);
+        std::string afterLegacyText = ReadTextFile(dataDir + L"\\actions.json");
+        if (afterLegacyText.find("activate_surveyors") == std::string::npos ||
+            afterLegacyText.find("build_all_blueprints") == std::string::npos ||
+            afterLegacyText.find("survey_item") == std::string::npos) {
+            std::printf("[FAIL] Session-less stale status.json unexpectedly pruned active session queue! text=%s\n",
+                        afterLegacyText.c_str());
+            return 59;
+        }
+
+        // 提取当前会话真实 session ID，模拟 Lua 确认本会话 seq=2，再推 seq=4 -> 仅裁剪 1..2，保留 3..4
+        std::string curSession;
+        const std::string key = "\"session\":\"";
+        size_t pos = afterLegacyText.find(key);
+        if (pos != std::string::npos) {
+            size_t start = pos + key.size();
+            size_t end = afterLegacyText.find('"', start);
+            if (end != std::string::npos) curSession = afterLegacyText.substr(start, end - start);
+        }
+        if (curSession.empty()) {
+            std::printf("[FAIL] Failed to extract non-empty session token from actions.json! text=%s\n",
+                        afterLegacyText.c_str());
+            return 60;
+        }
+        {
+            std::ofstream stCur(dataDir + L"\\status.json", std::ios::binary | std::ios::trunc);
+            stCur << "{\"inWorld\":true,\"isHost\":true,\"lastActionSession\":\"" << curSession
+                  << "\",\"lastActionSeq\":2}\n";
+        }
+        Sleep(420);
+        pushAction("refresh_catalog", "");
+        Sleep(180);
+        std::string prunedText = ReadTextFile(dataDir + L"\\actions.json");
+        if (prunedText.find("activate_surveyors") != std::string::npos ||
+            prunedText.find("build_all_blueprints") != std::string::npos ||
+            prunedText.find("survey_item") == std::string::npos ||
+            prunedText.find("refresh_catalog") == std::string::npos) {
+            std::printf("[FAIL] Matching-session ACK did not accurately prune 1..2 while keeping 3..4! text=%s\n",
+                        prunedText.c_str());
+            return 61;
+        }
+
+        // 模拟 Lua 原子重命名消费删除 actions.json，再推新指令 -> 旧指令彻底清空不重现
+        DeleteFileW((dataDir + L"\\actions.json").c_str());
+        pushAction("recover_my_backpacks", "");
+        Sleep(180);
+        std::string afterDelText = ReadTextFile(dataDir + L"\\actions.json");
+        if (afterDelText.find("recover_my_backpacks") == std::string::npos ||
+            afterDelText.find("survey_item") != std::string::npos ||
+            afterDelText.find("refresh_catalog") != std::string::npos) {
+            std::printf("[FAIL] actions.json did not clear consumed batch after delete! text=%s\n",
+                        afterDelText.c_str());
+            return 62;
+        }
+        DeleteFileW((dataDir + L"\\actions.json").c_str());
+        DeleteFileW((dataDir + L"\\status.json").c_str());
+        std::printf("[TEST-DX11] Verified session-scoped action ACK (ignores stale seq=8/999 across restarts, prunes only matching session, clears after consume)!\n");
+    }
 
     {
         std::string cfgText = ReadTextFile(dataDir + L"\\config.json");
@@ -861,12 +1069,35 @@ static int RunDx11Test(const std::wstring& dllPath) {
     for (int i = 0; i < 2; ++i) { PumpMessages(); swap->Present(0, 0); Sleep(16); }
     std::printf("[TEST-DX11] Verified foreground self-drawn IME bar NEVER hidden by menu + focus-safe click!\n");
 
+    // 3) 再次验证菜单交互后的连续快速批量推送（单次唤醒合并写入）
+    DeleteFileW((dataDir + L"\\actions.json").c_str());
+    pushAction("activate_surveyors", "");
+    pushAction("build_all_blueprints", "");
+    Sleep(180);
+    {
+        std::string batchText = ReadTextFile(dataDir + L"\\actions.json");
+        if (batchText.find("\"actions\"") == std::string::npos ||
+            batchText.find("activate_surveyors") == std::string::npos ||
+            batchText.find("build_all_blueprints") == std::string::npos) {
+            std::printf("[FAIL] Batched actions.json lost rapid actions! text=%s\n", batchText.c_str());
+            return 55;
+        }
+    }
+    std::printf("[TEST-DX11] Verified rapid batched actions.json merge after menu interaction!\n");
+
     DeleteFileW((dataDir + L"\\config.json").c_str());
+    DeleteFileW((dataDir + L"\\status.json").c_str());
     DeleteFileW((dataDir + L"\\actions.json").c_str());
 
-    std::printf("[PASS] DX11 full regression test PASSED!\n");
+    // 正常释放并走自然进程退出（验证 DLL_PROCESS_DETACH + 永生单例退出路径返回码严格为 0，无 RtlEnterCriticalSection 闪退）
+    if (swap) swap->Release();
+    if (ctx) ctx->Release();
+    if (dev) dev->Release();
+    DestroyWindow(hwnd);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+
+    std::printf("[PASS] DX11 full regression test PASSED (clean process exit)!\n");
     std::fflush(stdout);
-    TerminateProcess(GetCurrentProcess(), 0);
     return 0;
 }
 

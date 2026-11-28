@@ -229,22 +229,26 @@ private:
 
     std::atomic<bool> m_mapOpenFast{false};
     std::atomic<unsigned long long> m_lastCatalogUpdateTick{0};
+    std::atomic<int> m_lastAckedActionSeq{0};
 
     // 后台 I/O 线程状态与待落盘队列
     std::mutex m_ioMutex;
     std::condition_variable m_ioCv;
     std::thread m_ioThread;
     std::atomic<bool> m_stopIo{false};
+    std::atomic<bool> m_processTerminating{false};
     bool m_ioStarted = false;
     bool m_pendingConfigSave = false;
     ModConfig m_pendingConfigData;
     std::deque<PendingAction> m_pendingActions;
+    std::deque<PendingAction> m_unconsumedActions; ///< 仅后台线程访问：保留尚未被 Lua 消费删除的指令批次，避免连续点击相互覆盖
 
     unsigned long long m_catalogMtime = 0;
     unsigned long long m_mapLiveMtime = 0;
     unsigned long long m_statusMtime = 0;
     unsigned long long m_lastSlowPollTick = 0;
     unsigned long long m_lastFastPollTick = 0;
+    std::string m_actionSession; ///< 当前进程会话唯一标识，确保旧会话 status.json 中的 lastActionSeq 绝不裁剪新会话队列
     int m_actionSeq = 0;
 };
 

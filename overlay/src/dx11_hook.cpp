@@ -62,6 +62,11 @@ enum class GraphicsApi {
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using ResizeBuffers1Fn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
+using CreateSwapChainForHwndFn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
 using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using TFGetThreadMgrFn = HRESULT(WINAPI*)(ITfThreadMgr**);
 using SetCursorFn = HCURSOR(WINAPI*)(HCURSOR);
@@ -73,12 +78,23 @@ using SetCursorPosFn = BOOL(WINAPI*)(int, int);
 PresentFn g_origPresent = nullptr;
 Present1Fn g_origPresent1 = nullptr;
 ResizeBuffersFn g_origResizeBuffers = nullptr;
+ResizeBuffers1Fn g_origResizeBuffers1 = nullptr;
+CreateSwapChainForHwndFn g_origCreateSwapChainForHwnd = nullptr;
 ExecuteCommandListsFn g_origExecuteCommandLists = nullptr;
 SetCursorFn g_origSetCursor = nullptr;
 ShowCursorFn g_origShowCursor = nullptr;
 ClipCursorFn g_origClipCursor = nullptr;
 SetCursorPosFn g_origSetCursorPos = nullptr;
-WNDPROC g_origWndProc = nullptr;
+std::atomic<WNDPROC> g_origWndProc{nullptr};
+
+/// 线程安全调用原窗口过程（卸载瞬间若 g_origWndProc 已置空，安全回退到 DefWindowProcW 绝不空指针崩溃）。
+LRESULT CallOrigWndProcSafe(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC orig = g_origWndProc.load(std::memory_order_acquire);
+    if (orig) {
+        return ::CallWindowProcW(orig, hWnd, msg, wParam, lParam);
+    }
+    return ::DefWindowProcW(hWnd, msg, wParam, lParam);
+}
 
 std::mutex g_logMutex;
 std::mutex g_queueMutex;
@@ -109,6 +125,8 @@ std::atomic<bool> g_isExclusiveFullscreen{false};
 std::atomic<int> g_desiredImGuiCursor{ImGuiMouseCursor_Arrow};
 // 防止 DXGI Present1 内部调用 Present 或第三方叠加层转发导致同一帧重复渲染 ImGui
 thread_local bool t_inPresent = false;
+// 防止 ResizeBuffers1 内部转发到 ResizeBuffers 引发重复清理/重建
+thread_local bool t_inResize = false;
 // 标记当前线程正由本插件主动调用 Win32 光标 API，避免自递归拦截
 thread_local bool t_inOverlayCursorCall = false;
 
@@ -119,6 +137,12 @@ std::atomic<unsigned long long> g_renderedFrameCount{0};
 std::atomic<int> g_imeCharsCommitted{0};
 std::atomic<bool> g_selfDrawnImeRenderedLastFrame{false};
 std::atomic<int> g_lastClickedImeCandidateForTest{-1};
+std::atomic<int> g_dx12ResizeBuffers1Count{0};
+std::atomic<int> g_dx12BackendRebuildCount{0};
+std::atomic<int> g_dx12SwapChainRebindCount{0};
+std::atomic<bool> g_needLogMenuRender{false};
+unsigned long long g_lastDiagErrorTick = 0;
+IDXGISwapChain* g_lastIgnoredSwapChain = nullptr;
 
 // ==================== 光标接管状态（ADR-0004：菜单期 Win32 光标 API 条件拦截，关闭期零干扰直通） ====================
 std::atomic<bool> g_cursorApiInterceptEnabled{false};
@@ -168,9 +192,20 @@ ID3D11RenderTargetView* g_d3d11Rtv = nullptr;
 struct Dx12CandidateQueue {
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
+    unsigned long long lastExecTick = 0;
+    unsigned long long execCount = 0;
+};
+struct SwapChainQueueBinding {
+    IDXGISwapChain* swapChain = nullptr;
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
 };
 std::vector<Dx12CandidateQueue> g_candidateQueues;
-std::atomic<bool> g_dx12QueueLocked{false};
+std::vector<SwapChainQueueBinding> g_swapChainQueues;
+std::atomic<ID3D12CommandQueue*> g_activeDx12QueuePtr{nullptr};
+std::atomic<unsigned long long> g_activeDx12QueueExecCount{0};
+unsigned long long g_lastObservedActiveQueueExecCount = 0;
+int g_activeQueueStaleFrames = 0;
 
 struct Dx12FrameContext {
     ID3D12CommandAllocator* cmdAllocator = nullptr;
@@ -190,6 +225,10 @@ ID3D12GraphicsCommandList* g_d3d12CmdList = nullptr;
 ID3D12Fence* g_d3d12Fence = nullptr;
 HANDLE g_d3d12FenceEvent = nullptr;
 UINT64 g_d3d12FenceValue = 0;
+DXGI_FORMAT g_dx12RtvFormat = DXGI_FORMAT_UNKNOWN;
+UINT g_dx12BufferCount = 0;
+UINT g_dx12Width = 0;
+UINT g_dx12Height = 0;
 std::vector<Dx12FrameContext> g_dx12Frames;
 
 // ==================== 编码与辅助工具 ====================
@@ -930,9 +969,12 @@ void ReleaseCursorOverrideOnWindowThread(HWND hWnd, bool notifyOrigCursor) {
     }
 
     // 立刻派发一次 WM_SETCURSOR 给 UE4 原窗口过程，使游戏即时恢复隐藏光标或原生 UI 光标
-    if (notifyOrigCursor && g_origWndProc) {
-        ::CallWindowProcW(g_origWndProc, hWnd, WM_SETCURSOR,
-                          reinterpret_cast<WPARAM>(hWnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+    if (notifyOrigCursor) {
+        WNDPROC orig = g_origWndProc.load(std::memory_order_acquire);
+        if (orig) {
+            ::CallWindowProcW(orig, hWnd, WM_SETCURSOR,
+                              reinterpret_cast<WPARAM>(hWnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+        }
     }
 }
 
@@ -956,6 +998,7 @@ void ApplyMenuOpenTransition(bool next, const char* source) {
     if (next) {
         // 立刻开启菜单期 Win32 光标 API 拦截，杜绝首次打开瞬间在消息到达前被 UE4 Tick 抢先隐藏光标
         g_cursorApiInterceptEnabled.store(true, std::memory_order_release);
+        g_needLogMenuRender.store(true, std::memory_order_relaxed);
         MaybeTriggerMenuSoftRefresh();
     } else {
         g_cursorApiInterceptEnabled.store(false, std::memory_order_release);
@@ -1073,9 +1116,52 @@ void ReleaseDx12BackBuffers() {
     }
 }
 
-bool CreateDx12BackBuffers(IDXGISwapChain* swapChain) {
+/// 将可能为 _TYPELESS 的后缓冲格式归一为可用于 RTV 与 ImGui_ImplDX12 PSO 的具体格式。
+DXGI_FORMAT ResolveConcreteDx12RtvFormat(DXGI_FORMAT swapDescFmt, DXGI_FORMAT resFmt) {
+    auto resolveTypeless = [](DXGI_FORMAT f) -> DXGI_FORMAT {
+        switch (f) {
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS:   return DXGI_FORMAT_R8G8B8A8_UNORM;
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS:   return DXGI_FORMAT_B8G8R8A8_UNORM;
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+            default:                              return f;
+        }
+    };
+    auto isTypeless = [](DXGI_FORMAT f) -> bool {
+        return f == DXGI_FORMAT_UNKNOWN ||
+               f == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+               f == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+               f == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
+               f == DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    };
+    if (!isTypeless(resFmt)) return resFmt;
+    if (!isTypeless(swapDescFmt)) return swapDescFmt;
+    DXGI_FORMAT f = resolveTypeless(swapDescFmt);
+    if (f != DXGI_FORMAT_UNKNOWN) return f;
+    f = resolveTypeless(resFmt);
+    return (f != DXGI_FORMAT_UNKNOWN) ? f : DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+/// 节流记录渲染异常日志（避免 60fps 刷爆 overlay.log）。
+void OverlayLogDiagThrottled(const char* fmt, ...) {
+    const unsigned long long now = GetTickCount64();
+    if (now - g_lastDiagErrorTick < 1500) return;
+    g_lastDiagErrorTick = now;
+
+    char msg[768];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+    OverlayLog("%s", msg);
+}
+
+bool CreateDx12BackBuffers(IDXGISwapChain* swapChain, DXGI_FORMAT* outConcreteFmt = nullptr) {
     DXGI_SWAP_CHAIN_DESC sd{};
     if (FAILED(swapChain->GetDesc(&sd)) || sd.BufferCount == 0) return false;
+
+    // 必须先释放旧的 backBuffer COM 引用，避免同 BufferCount 重建时泄漏引用导致后续 ResizeBuffers/ResizeBuffers1 失败
+    ReleaseDx12BackBuffers();
 
     if (g_d3d12RtvHeap) {
         g_d3d12RtvHeap->Release();
@@ -1102,45 +1188,231 @@ bool CreateDx12BackBuffers(IDXGISwapChain* swapChain) {
 
     UINT rtvStep = g_d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     D3D12_CPU_DESCRIPTOR_HANDLE handle = g_d3d12RtvHeap->GetCPUDescriptorHandleForHeapStart();
+    DXGI_FORMAT concreteFmt = ResolveConcreteDx12RtvFormat(sd.BufferDesc.Format, DXGI_FORMAT_UNKNOWN);
 
     for (UINT i = 0; i < sd.BufferCount; ++i) {
         if (!g_dx12Frames[i].cmdAllocator) {
             if (FAILED(g_d3d12Device->CreateCommandAllocator(
                     D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_dx12Frames[i].cmdAllocator)))) {
                 OverlayLog("DX12 CreateCommandAllocator[%u] failed", i);
+                ReleaseDx12BackBuffers();
                 return false;
             }
         }
         ID3D12Resource* bb = nullptr;
         if (FAILED(swapChain->GetBuffer(i, IID_PPV_ARGS(&bb))) || !bb) {
             OverlayLog("DX12 GetBuffer[%u] failed", i);
+            ReleaseDx12BackBuffers();
             return false;
         }
-        g_d3d12Device->CreateRenderTargetView(bb, nullptr, handle);
+        D3D12_RESOURCE_DESC resDesc = bb->GetDesc();
+        concreteFmt = ResolveConcreteDx12RtvFormat(sd.BufferDesc.Format, resDesc.Format);
+        D3D12_RENDER_TARGET_VIEW_DESC viewDesc{};
+        viewDesc.Format = concreteFmt;
+        viewDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        g_d3d12Device->CreateRenderTargetView(bb, &viewDesc, handle);
         g_dx12Frames[i].backBuffer = bb;
         g_dx12Frames[i].rtvHandle = handle;
         g_dx12Frames[i].fenceValue = 0;
         handle.ptr += rtvStep;
     }
+
+    g_dx12BufferCount = sd.BufferCount;
+    g_dx12Width = sd.BufferDesc.Width;
+    g_dx12Height = sd.BufferDesc.Height;
+    if (outConcreteFmt) *outConcreteFmt = concreteFmt;
     return true;
 }
 
-ID3D12CommandQueue* FindDirectQueueForDevice(ID3D12Device* dev) {
-    std::lock_guard<std::mutex> lk(g_queueMutex);
-    for (const auto& c : g_candidateQueues) {
-        if (c.device == dev && c.queue) {
-            return c.queue;
+/// 记录由 CreateSwapChainForHwnd 或 ResizeBuffers1 显式绑定的 DX12 呈现 CommandQueue。
+void RecordSwapChainQueueBinding(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue) {
+    if (!swapChain || !queue) return;
+    ID3D12Device* dev = nullptr;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return;
+    {
+        std::lock_guard<std::mutex> lk(g_queueMutex);
+        bool updated = false;
+        for (auto& b : g_swapChainQueues) {
+            if (b.swapChain == swapChain) {
+                b.device = dev;
+                b.queue = queue;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            if (g_swapChainQueues.size() >= 16) {
+                g_swapChainQueues.erase(g_swapChainQueues.begin());
+            }
+            g_swapChainQueues.push_back({swapChain, dev, queue});
         }
     }
-    return nullptr;
+    dev->Release();
+}
+
+/// 优先查找与目标 SwapChain 精确绑定的 DIRECT CommandQueue，否则选择同 Device 上最近最活跃的 DIRECT 队列。
+ID3D12CommandQueue* FindDirectQueueForSwapChain(IDXGISwapChain* swapChain, ID3D12Device* dev) {
+    std::lock_guard<std::mutex> lk(g_queueMutex);
+    if (swapChain) {
+        for (const auto& b : g_swapChainQueues) {
+            if (b.swapChain == swapChain && b.device == dev && b.queue) {
+                return b.queue;
+            }
+        }
+    }
+    ID3D12CommandQueue* best = nullptr;
+    unsigned long long bestTick = 0;
+    unsigned long long bestCount = 0;
+    for (const auto& c : g_candidateQueues) {
+        if (c.device == dev && c.queue) {
+            if (!best || c.lastExecTick > bestTick ||
+                (c.lastExecTick == bestTick && c.execCount > bestCount)) {
+                best = c.queue;
+                bestTick = c.lastExecTick;
+                bestCount = c.execCount;
+            }
+        }
+    }
+    return best;
+}
+
+/// 若已绑定 SwapChain 的显式呈现队列发生变化，或当前队列彻底静默而同 Device 另有持续执行的 DIRECT 队列，返回更优队列。
+ID3D12CommandQueue* CheckForBetterDirectQueue(IDXGISwapChain* swapChain) {
+    if (!g_d3d12Device || !g_d3d12CommandQueue) return nullptr;
+    std::lock_guard<std::mutex> lk(g_queueMutex);
+    // 1. CreateSwapChainForHwnd / ResizeBuffers1 显式绑定的呈现队列拥有最高权威
+    for (const auto& b : g_swapChainQueues) {
+        if (b.swapChain == swapChain && b.device == g_d3d12Device && b.queue) {
+            return (b.queue != g_d3d12CommandQueue) ? b.queue : nullptr;
+        }
+    }
+    // 2. 若当前队列已连续多帧未执行，而同设备存在刚刚在执行命令的另一条 DIRECT 队列，自动切换过去
+    const unsigned long long curExec = g_activeDx12QueueExecCount.load(std::memory_order_relaxed);
+    if (curExec != g_lastObservedActiveQueueExecCount) {
+        g_lastObservedActiveQueueExecCount = curExec;
+        g_activeQueueStaleFrames = 0;
+        return nullptr;
+    }
+    g_activeQueueStaleFrames++;
+    if (g_activeQueueStaleFrames < 30) return nullptr;
+
+    const unsigned long long now = GetTickCount64();
+    ID3D12CommandQueue* best = nullptr;
+    unsigned long long bestCount = 0;
+    for (const auto& c : g_candidateQueues) {
+        if (c.device == g_d3d12Device && c.queue && c.queue != g_d3d12CommandQueue &&
+            now >= c.lastExecTick && (now - c.lastExecTick) <= 250 && c.execCount >= 10) {
+            if (!best || c.execCount > bestCount) {
+                best = c.queue;
+                bestCount = c.execCount;
+            }
+        }
+    }
+    return best;
+}
+
+/// 完整重建 DX12 ImGui 渲染后端（处理 RTVFormat / BufferCount / CommandQueue 变更，杜绝 DX12 PSO 格式不匹配静默丢绘制）。
+bool RebuildDx12ImGuiBackend(IDXGISwapChain* swapChain, ID3D12CommandQueue* newQueueOverride, const char* reason) {
+    if (!g_imguiInitialized || g_activeApi != GraphicsApi::DX12 || !g_d3d12Device || !g_d3d12SrvHeap) {
+        return false;
+    }
+    WaitForDx12GpuIdle();
+    ImGui_ImplDX12_Shutdown();
+    {
+        std::lock_guard<std::mutex> lk(g_srvAllocMutex);
+        std::memset(g_srvSlotUsed, 0, sizeof(g_srvSlotUsed));
+    }
+
+    if (newQueueOverride && newQueueOverride != g_d3d12CommandQueue) {
+        newQueueOverride->AddRef();
+        if (g_d3d12CommandQueue) g_d3d12CommandQueue->Release();
+        g_d3d12CommandQueue = newQueueOverride;
+        g_activeDx12QueuePtr.store(g_d3d12CommandQueue, std::memory_order_release);
+        g_activeDx12QueueExecCount.store(0, std::memory_order_relaxed);
+        g_lastObservedActiveQueueExecCount = 0;
+        g_activeQueueStaleFrames = 0;
+    }
+
+    DXGI_FORMAT concreteFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (!CreateDx12BackBuffers(swapChain, &concreteFmt)) {
+        OverlayLog("DX12 RebuildDx12ImGuiBackend(%s): CreateDx12BackBuffers failed!", reason ? reason : "?");
+        return false;
+    }
+
+    ImGui_ImplDX12_InitInfo initInfo{};
+    initInfo.Device = g_d3d12Device;
+    initInfo.CommandQueue = g_d3d12CommandQueue;
+    initInfo.NumFramesInFlight = static_cast<int>(g_dx12BufferCount);
+    initInfo.RTVFormat = concreteFmt;
+    initInfo.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    initInfo.SrvDescriptorHeap = g_d3d12SrvHeap;
+    initInfo.SrvDescriptorAllocFn = SrvDescriptorAllocCallback;
+    initInfo.SrvDescriptorFreeFn = SrvDescriptorFreeCallback;
+
+    if (!ImGui_ImplDX12_Init(&initInfo)) {
+        OverlayLog("DX12 RebuildDx12ImGuiBackend(%s): ImGui_ImplDX12_Init failed!", reason ? reason : "?");
+        return false;
+    }
+    g_dx12RtvFormat = concreteFmt;
+    g_dx12BackendRebuildCount.fetch_add(1, std::memory_order_relaxed);
+    g_needLogMenuRender.store(true, std::memory_order_relaxed);
+    OverlayLog("DX12 ImGui backend rebuilt (%s): Size=%ux%u Buffers=%u Format=%d Queue=0x%p",
+               reason ? reason : "?", g_dx12Width, g_dx12Height, g_dx12BufferCount,
+               static_cast<int>(g_dx12RtvFormat), g_d3d12CommandQueue);
+    return true;
+}
+
+/// 仅释放当前 DX12/DX11 图形后端资源（保留 ImGuiContext / Win32 后端 / WndProc 子类化与菜单开关状态，供 SwapChain 重绑复用）。
+void ShutdownGraphicsBackendOnly() {
+    if (g_activeApi == GraphicsApi::DX12) {
+        WaitForDx12GpuIdle();
+        if (g_imguiInitialized) {
+            ImGui_ImplDX12_Shutdown();
+        }
+    } else if (g_activeApi == GraphicsApi::DX11) {
+        if (g_imguiInitialized) {
+            ImGui_ImplDX11_Shutdown();
+        }
+    }
+
+    ReleaseDx11Rtv();
+    if (g_d3d11Context) { g_d3d11Context->Release(); g_d3d11Context = nullptr; }
+    if (g_d3d11Device) { g_d3d11Device->Release(); g_d3d11Device = nullptr; }
+
+    ReleaseDx12BackBuffers();
+    for (auto& f : g_dx12Frames) {
+        if (f.cmdAllocator) f.cmdAllocator->Release();
+    }
+    g_dx12Frames.clear();
+    if (g_d3d12CmdList) { g_d3d12CmdList->Release(); g_d3d12CmdList = nullptr; }
+    if (g_d3d12Fence) { g_d3d12Fence->Release(); g_d3d12Fence = nullptr; }
+    if (g_d3d12FenceEvent) { CloseHandle(g_d3d12FenceEvent); g_d3d12FenceEvent = nullptr; }
+    if (g_d3d12RtvHeap) { g_d3d12RtvHeap->Release(); g_d3d12RtvHeap = nullptr; }
+    if (g_d3d12SrvHeap) { g_d3d12SrvHeap->Release(); g_d3d12SrvHeap = nullptr; }
+    if (g_d3d12CommandQueue) { g_d3d12CommandQueue->Release(); g_d3d12CommandQueue = nullptr; }
+    if (g_d3d12Device) { g_d3d12Device->Release(); g_d3d12Device = nullptr; }
+    {
+        std::lock_guard<std::mutex> lk(g_srvAllocMutex);
+        std::memset(g_srvSlotUsed, 0, sizeof(g_srvSlotUsed));
+    }
+    g_activeDx12QueuePtr.store(nullptr, std::memory_order_release);
+    g_activeDx12QueueExecCount.store(0, std::memory_order_relaxed);
+    g_lastObservedActiveQueueExecCount = 0;
+    g_activeQueueStaleFrames = 0;
+    g_dx12RtvFormat = DXGI_FORMAT_UNKNOWN;
+    g_dx12BufferCount = 0;
+    g_dx12Width = 0;
+    g_dx12Height = 0;
+    g_activeApi = GraphicsApi::None;
+    g_boundSwapChain = nullptr;
 }
 
 // ==================== WndProc 钩子（窗口主线程） ====================
 
 /// 游戏主窗口消息钩子：严格隔离菜单开关态下的光标、键盘与中文 IME/TSF 消息。
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (g_shuttingDown.load()) {
-        return CallWindowProcW(g_origWndProc, hWnd, msg, wParam, lParam);
+    if (g_shuttingDown.load(std::memory_order_acquire)) {
+        return CallOrigWndProcSafe(hWnd, msg, wParam, lParam);
     }
 
     // 1. 处理本插件跨线程投递到窗口主线程的内部同步消息
@@ -1195,7 +1467,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     }
 
     if (!g_imguiInitialized) {
-        return CallWindowProcW(g_origWndProc, hWnd, msg, wParam, lParam);
+        return CallOrigWndProcSafe(hWnd, msg, wParam, lParam);
     }
 
     // 3. 菜单关闭状态：零干扰直通！绝不调用 ImGui_ImplWin32_WndProcHandler，绝不触碰光标与输入捕获（见 ADR-0004）
@@ -1209,7 +1481,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         if (HandleMapQuickShortcut(msg, wParam, lParam)) {
             return 0;
         }
-        return CallWindowProcW(g_origWndProc, hWnd, msg, wParam, lParam);
+        return CallOrigWndProcSafe(hWnd, msg, wParam, lParam);
     }
 
     // 4. 菜单打开状态下的窗口焦点切换（Alt+Tab 保持菜单打开但临时让出光标与 IME 控制权，见 Q8）
@@ -1220,10 +1492,10 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             std::lock_guard<std::recursive_mutex> lk(g_imguiInputMutex);
             ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
         }
-        return CallWindowProcW(g_origWndProc, hWnd, msg, wParam, lParam);
+        return CallOrigWndProcSafe(hWnd, msg, wParam, lParam);
     }
     if (msg == WM_SETFOCUS) {
-        LRESULT origRes = CallWindowProcW(g_origWndProc, hWnd, msg, wParam, lParam);
+        LRESULT origRes = CallOrigWndProcSafe(hWnd, msg, wParam, lParam);
         {
             std::lock_guard<std::recursive_mutex> lk(g_imguiInputMutex);
             ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
@@ -1440,7 +1712,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             break;
     }
 
-    return CallWindowProcW(g_origWndProc, hWnd, msg, wParam, lParam);
+    return CallOrigWndProcSafe(hWnd, msg, wParam, lParam);
 }
 
 // ==================== 初始化逻辑（自动区分 DX12 / DX11） ====================
@@ -1463,8 +1735,8 @@ void ConfigureImGuiContextCommon(HWND hwnd, float scale) {
     ImGui::GetPlatformIO().Platform_SetImeDataFn = CustomSetImeDataFn;
 }
 
-/// 首次拦截到有效游戏主 SwapChain 时执行懒初始化，自动适配 DX12（优先）或 DX11 并挂接 WndProc。
-bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
+/// 为指定 SwapChain 初始化（或重绑）DX12 / DX11 渲染后端；首次初始化同时创建 ImGui 上下文并挂接 WndProc。
+bool InitGraphicsBackendForSwapChain(IDXGISwapChain* swapChain, bool isRebind) {
     DXGI_SWAP_CHAIN_DESC sd{};
     if (FAILED(swapChain->GetDesc(&sd))) return false;
     if (!sd.OutputWindow || sd.BufferDesc.Width < 200 || sd.BufferDesc.Height < 200) {
@@ -1480,7 +1752,7 @@ bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
     // 1. 优先尝试 DirectX 12（Grounded Steam Windows 11 默认使用 DX12）
     ID3D12Device* d12Dev = nullptr;
     if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&d12Dev))) && d12Dev) {
-        ID3D12CommandQueue* queue = FindDirectQueueForDevice(d12Dev);
+        ID3D12CommandQueue* queue = FindDirectQueueForSwapChain(swapChain, d12Dev);
         if (!queue) {
             d12Dev->Release();
             return false;
@@ -1494,10 +1766,39 @@ bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
         }
         sc3->Release();
 
-        g_dx12QueueLocked.store(true);
+        auto rollbackDx12Init = [isRebind](bool createdImGui) {
+            if (!isRebind && createdImGui) {
+                ImGui_ImplWin32_Shutdown();
+                ImGui::DestroyContext();
+            }
+            ReleaseDx12BackBuffers();
+            for (auto& f : g_dx12Frames) {
+                if (f.cmdAllocator) f.cmdAllocator->Release();
+            }
+            g_dx12Frames.clear();
+            if (g_d3d12CmdList) { g_d3d12CmdList->Release(); g_d3d12CmdList = nullptr; }
+            if (g_d3d12Fence) { g_d3d12Fence->Release(); g_d3d12Fence = nullptr; }
+            if (g_d3d12FenceEvent) { CloseHandle(g_d3d12FenceEvent); g_d3d12FenceEvent = nullptr; }
+            if (g_d3d12RtvHeap) { g_d3d12RtvHeap->Release(); g_d3d12RtvHeap = nullptr; }
+            if (g_d3d12SrvHeap) { g_d3d12SrvHeap->Release(); g_d3d12SrvHeap = nullptr; }
+            if (g_d3d12CommandQueue) { g_d3d12CommandQueue->Release(); g_d3d12CommandQueue = nullptr; }
+            if (g_d3d12Device) { g_d3d12Device->Release(); g_d3d12Device = nullptr; }
+            g_activeDx12QueuePtr.store(nullptr, std::memory_order_release);
+            g_dx12RtvFormat = DXGI_FORMAT_UNKNOWN;
+            g_dx12BufferCount = 0;
+            g_boundSwapChain = nullptr;
+            if (!isRebind) {
+                g_gameHwnd = nullptr;
+            }
+        };
+
         g_d3d12Device = d12Dev;
         g_d3d12CommandQueue = queue;
         g_d3d12CommandQueue->AddRef();
+        g_activeDx12QueuePtr.store(g_d3d12CommandQueue, std::memory_order_release);
+        g_activeDx12QueueExecCount.store(0, std::memory_order_relaxed);
+        g_lastObservedActiveQueueExecCount = 0;
+        g_activeQueueStaleFrames = 0;
 
         D3D12_DESCRIPTOR_HEAP_DESC srvDesc{};
         srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1505,12 +1806,18 @@ bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
         srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_d3d12Device->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&g_d3d12SrvHeap)))) {
             OverlayLog("DX12 CreateDescriptorHeap(SRV) failed");
+            rollbackDx12Init(false);
             return false;
         }
         g_d3d12SrvIncrement = g_d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        memset(g_srvSlotUsed, 0, sizeof(g_srvSlotUsed));
+        {
+            std::lock_guard<std::mutex> lk(g_srvAllocMutex);
+            std::memset(g_srvSlotUsed, 0, sizeof(g_srvSlotUsed));
+        }
 
-        if (!CreateDx12BackBuffers(swapChain)) {
+        DXGI_FORMAT concreteFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (!CreateDx12BackBuffers(swapChain, &concreteFmt)) {
+            rollbackDx12Init(false);
             return false;
         }
 
@@ -1518,28 +1825,36 @@ bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
                 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_dx12Frames[0].cmdAllocator, nullptr,
                 IID_PPV_ARGS(&g_d3d12CmdList)))) {
             OverlayLog("DX12 CreateCommandList failed");
+            rollbackDx12Init(false);
             return false;
         }
         g_d3d12CmdList->Close();
 
         if (FAILED(g_d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_d3d12Fence)))) {
             OverlayLog("DX12 CreateFence failed");
+            rollbackDx12Init(false);
             return false;
         }
         g_d3d12FenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_d3d12FenceEvent) {
+            OverlayLog("DX12 CreateEventW(Fence) failed");
+            rollbackDx12Init(false);
+            return false;
+        }
         g_d3d12FenceValue = 0;
 
-        g_gameHwnd = sd.OutputWindow;
         g_boundSwapChain = swapChain;
-        g_uiScale = scale;
-
-        ConfigureImGuiContextCommon(g_gameHwnd, g_uiScale);
+        if (!isRebind) {
+            g_gameHwnd = sd.OutputWindow;
+            g_uiScale = scale;
+            ConfigureImGuiContextCommon(g_gameHwnd, g_uiScale);
+        }
 
         ImGui_ImplDX12_InitInfo initInfo{};
         initInfo.Device = g_d3d12Device;
         initInfo.CommandQueue = g_d3d12CommandQueue;
-        initInfo.NumFramesInFlight = static_cast<int>(sd.BufferCount);
-        initInfo.RTVFormat = sd.BufferDesc.Format;
+        initInfo.NumFramesInFlight = static_cast<int>(g_dx12BufferCount);
+        initInfo.RTVFormat = concreteFmt;
         initInfo.DSVFormat = DXGI_FORMAT_UNKNOWN;
         initInfo.SrvDescriptorHeap = g_d3d12SrvHeap;
         initInfo.SrvDescriptorAllocFn = SrvDescriptorAllocCallback;
@@ -1547,17 +1862,29 @@ bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
 
         if (!ImGui_ImplDX12_Init(&initInfo)) {
             OverlayLog("ImGui_ImplDX12_Init failed");
+            rollbackDx12Init(true);
             return false;
         }
 
-        g_origWndProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProc)));
+        g_dx12RtvFormat = concreteFmt;
+        if (!isRebind) {
+            g_origWndProc.store(
+                reinterpret_cast<WNDPROC>(
+                    SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProc))),
+                std::memory_order_release);
+            g_imguiInitialized = true;
+            g_initTick.store(GetTickCount64());
+        } else {
+            g_dx12SwapChainRebindCount.fetch_add(1, std::memory_order_relaxed);
+            g_needLogMenuRender.store(true, std::memory_order_relaxed);
+        }
         g_activeApi = GraphicsApi::DX12;
-        g_imguiInitialized = true;
-        g_initTick.store(GetTickCount64());
-        OverlayLog("DX12 ImGui initialized! HWND=0x%p Size=%ux%u Buffers=%u Format=%d Scale=%.2f",
-                   g_gameHwnd, sd.BufferDesc.Width, sd.BufferDesc.Height,
-                   sd.BufferCount, static_cast<int>(sd.BufferDesc.Format), g_uiScale);
+        g_lastFullscreenCheckTick = 0;
+        OverlayLog("DX12 ImGui %s! HWND=0x%p SC=0x%p Size=%ux%u Buffers=%u Format=%d(desc=%d) Queue=0x%p Scale=%.2f",
+                   isRebind ? "rebound" : "initialized",
+                   g_gameHwnd, swapChain, sd.BufferDesc.Width, sd.BufferDesc.Height,
+                   sd.BufferCount, static_cast<int>(concreteFmt), static_cast<int>(sd.BufferDesc.Format),
+                   g_d3d12CommandQueue, g_uiScale);
         return true;
     }
 
@@ -1566,26 +1893,42 @@ bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
     if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&d11Dev))) && d11Dev) {
         g_d3d11Device = d11Dev;
         g_d3d11Device->GetImmediateContext(&g_d3d11Context);
-        g_gameHwnd = sd.OutputWindow;
         g_boundSwapChain = swapChain;
-        g_uiScale = scale;
         CreateDx11Rtv(swapChain);
 
-        ConfigureImGuiContextCommon(g_gameHwnd, g_uiScale);
+        if (!isRebind) {
+            g_gameHwnd = sd.OutputWindow;
+            g_uiScale = scale;
+            ConfigureImGuiContextCommon(g_gameHwnd, g_uiScale);
+        }
         ImGui_ImplDX11_Init(g_d3d11Device, g_d3d11Context);
 
-        g_origWndProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProc)));
+        if (!isRebind) {
+            g_origWndProc.store(
+                reinterpret_cast<WNDPROC>(
+                    SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProc))),
+                std::memory_order_release);
+            g_imguiInitialized = true;
+            g_initTick.store(GetTickCount64());
+        } else {
+            g_dx12SwapChainRebindCount.fetch_add(1, std::memory_order_relaxed);
+            g_needLogMenuRender.store(true, std::memory_order_relaxed);
+        }
         g_activeApi = GraphicsApi::DX11;
-        g_imguiInitialized = true;
-        g_initTick.store(GetTickCount64());
-        OverlayLog("DX11 ImGui initialized! HWND=0x%p Size=%ux%u Format=%d Scale=%.2f",
-                   g_gameHwnd, sd.BufferDesc.Width, sd.BufferDesc.Height,
+        g_lastFullscreenCheckTick = 0;
+        OverlayLog("DX11 ImGui %s! HWND=0x%p SC=0x%p Size=%ux%u Format=%d Scale=%.2f",
+                   isRebind ? "rebound" : "initialized",
+                   g_gameHwnd, swapChain, sd.BufferDesc.Width, sd.BufferDesc.Height,
                    static_cast<int>(sd.BufferDesc.Format), g_uiScale);
         return true;
     }
 
     return false;
+}
+
+/// 首次拦截到有效游戏主 SwapChain 时执行懒初始化，自动适配 DX12（优先）或 DX11 并挂接 WndProc。
+bool TryInitImGuiForSwapChain(IDXGISwapChain* swapChain) {
+    return InitGraphicsBackendForSwapChain(swapChain, false);
 }
 
 /// 在 Present 帧内轮询 Insert / F8 兜底热键（防止 RawInput 或 Steam Overlay 吞掉 WM_KEYDOWN）。
@@ -1653,8 +1996,25 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
             return;
         }
     }
-    if (swapChain != g_boundSwapChain) {
-        return;
+    if (swapChain != g_boundSwapChain || g_activeApi == GraphicsApi::None) {
+        DXGI_SWAP_CHAIN_DESC sd{};
+        if (SUCCEEDED(swapChain->GetDesc(&sd)) && sd.OutputWindow == g_gameHwnd &&
+            sd.BufferDesc.Width >= 200 && sd.BufferDesc.Height >= 200) {
+            OverlayLog("Detected SwapChain change for HWND=0x%p: 0x%p -> 0x%p (Size=%ux%u Buffers=%u Format=%d), rebinding...",
+                       g_gameHwnd, g_boundSwapChain, swapChain, sd.BufferDesc.Width, sd.BufferDesc.Height,
+                       sd.BufferCount, static_cast<int>(sd.BufferDesc.Format));
+            ShutdownGraphicsBackendOnly();
+            if (!InitGraphicsBackendForSwapChain(swapChain, true)) {
+                return;
+            }
+        } else {
+            if (swapChain != g_lastIgnoredSwapChain) {
+                g_lastIgnoredSwapChain = swapChain;
+                OverlayLog("Ignoring unrelated SwapChain=0x%p (HWND=0x%p, boundHWND=0x%p)",
+                           swapChain, sd.OutputWindow, g_gameHwnd);
+            }
+            return;
+        }
     }
 
     PollFallbackHotkeys();
@@ -1695,12 +2055,46 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
 
     if (g_activeApi == GraphicsApi::DX12) {
         IDXGISwapChain3* sc3 = nullptr;
-        if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return;
+        if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) {
+            OverlayLogDiagThrottled("DX12 RenderFrame: QueryInterface(IDXGISwapChain3) failed!");
+            return;
+        }
         UINT backIdx = sc3->GetCurrentBackBufferIndex();
         sc3->Release();
 
-        if (backIdx >= g_dx12Frames.size() || !g_dx12Frames[backIdx].backBuffer) {
-            if (!CreateDx12BackBuffers(swapChain)) return;
+        // 实时校验当前活跃 BackBuffer 资源指针、RTVFormat、BufferCount 与 CommandQueue：
+        // 即使游戏通过 ResizeBuffers1 / HDR 切换 / MPO 过渡替换了后缓冲，也绝不往悬空旧纹理里静默空画！
+        ID3D12Resource* liveBb = nullptr;
+        if (FAILED(swapChain->GetBuffer(backIdx, IID_PPV_ARGS(&liveBb))) || !liveBb) {
+            OverlayLogDiagThrottled("DX12 RenderFrame: GetBuffer(%u) failed!", backIdx);
+            return;
+        }
+        const bool bbStale = (backIdx >= g_dx12Frames.size() || g_dx12Frames[backIdx].backBuffer != liveBb);
+        const DXGI_FORMAT liveResFmt = liveBb->GetDesc().Format;
+        liveBb->Release();
+
+        ID3D12CommandQueue* betterQueue = CheckForBetterDirectQueue(swapChain);
+        if (bbStale || betterQueue != nullptr) {
+            DXGI_SWAP_CHAIN_DESC liveSd{};
+            const bool gotSd = SUCCEEDED(swapChain->GetDesc(&liveSd));
+            const DXGI_FORMAT liveFmt = ResolveConcreteDx12RtvFormat(
+                gotSd ? liveSd.BufferDesc.Format : g_dx12RtvFormat, liveResFmt);
+            const bool needBackendRebuild =
+                (betterQueue != nullptr) ||
+                (liveFmt != g_dx12RtvFormat) ||
+                (gotSd && liveSd.BufferCount != g_dx12BufferCount);
+
+            if (needBackendRebuild) {
+                const char* why = betterQueue ? "QueueSwitch" : (liveFmt != g_dx12RtvFormat ? "FormatChanged" : "BufferCountChanged");
+                if (!RebuildDx12ImGuiBackend(swapChain, betterQueue, why)) return;
+            } else {
+                OverlayLog("DX12 backbuffer pointer changed on Present (idx=%u, Size=%ux%u, Format=%d), rebuilding RTVs",
+                           backIdx, gotSd ? liveSd.BufferDesc.Width : 0, gotSd ? liveSd.BufferDesc.Height : 0,
+                           static_cast<int>(liveFmt));
+                WaitForDx12GpuIdle();
+                if (!CreateDx12BackBuffers(swapChain)) return;
+                g_needLogMenuRender.store(true, std::memory_order_relaxed);
+            }
             if (backIdx >= g_dx12Frames.size() || !g_dx12Frames[backIdx].backBuffer) return;
         }
 
@@ -1714,6 +2108,10 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
         {
             std::lock_guard<std::recursive_mutex> lk(g_imguiInputMutex);
             ImGui_ImplWin32_NewFrame();
+            ImGuiIO& io = ImGui::GetIO();
+            if ((io.DisplaySize.x <= 1.0f || io.DisplaySize.y <= 1.0f) && g_dx12Width >= 200 && g_dx12Height >= 200) {
+                io.DisplaySize = ImVec2(static_cast<float>(g_dx12Width), static_cast<float>(g_dx12Height));
+            }
             ImGui::NewFrame();
         }
 
@@ -1731,9 +2129,18 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
         }
 
         ImGui::Render();
+        ImDrawData* drawData = ImGui::GetDrawData();
 
-        if (FAILED(frame.cmdAllocator->Reset())) return;
-        if (FAILED(g_d3d12CmdList->Reset(frame.cmdAllocator, nullptr))) return;
+        HRESULT hrAlloc = frame.cmdAllocator->Reset();
+        if (FAILED(hrAlloc)) {
+            OverlayLogDiagThrottled("DX12 cmdAllocator->Reset failed: hr=0x%08lX (idx=%u)", hrAlloc, backIdx);
+            return;
+        }
+        HRESULT hrList = g_d3d12CmdList->Reset(frame.cmdAllocator, nullptr);
+        if (FAILED(hrList)) {
+            OverlayLogDiagThrottled("DX12 cmdList->Reset failed: hr=0x%08lX (idx=%u)", hrList, backIdx);
+            return;
+        }
 
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1748,7 +2155,7 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
         ID3D12DescriptorHeap* heaps[] = {g_d3d12SrvHeap};
         g_d3d12CmdList->SetDescriptorHeaps(1, heaps);
 
-        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_d3d12CmdList);
+        ImGui_ImplDX12_RenderDrawData(drawData, g_d3d12CmdList);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -1764,6 +2171,16 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
 
         frame.fenceValue = ++g_d3d12FenceValue;
         g_d3d12CommandQueue->Signal(g_d3d12Fence, frame.fenceValue);
+
+        if (menuOpen && g_needLogMenuRender.exchange(false, std::memory_order_relaxed)) {
+            OverlayLog("DX12 Menu frame submitted: BackIdx=%u BackBuf=%ux%u Disp=%.0fx%.0f Lists=%d Vtx=%d Format=%d Queue=0x%p SC=0x%p",
+                       backIdx, g_dx12Width, g_dx12Height,
+                       drawData ? drawData->DisplaySize.x : 0.0f,
+                       drawData ? drawData->DisplaySize.y : 0.0f,
+                       drawData ? drawData->CmdListsCount : 0,
+                       drawData ? drawData->TotalVtxCount : 0,
+                       static_cast<int>(g_dx12RtvFormat), g_d3d12CommandQueue, swapChain);
+        }
     } else if (g_activeApi == GraphicsApi::DX11) {
         if (!g_d3d11Rtv) {
             CreateDx11Rtv(swapChain);
@@ -1800,28 +2217,71 @@ void RenderFrameOnSwapChain(IDXGISwapChain* swapChain) {
 
 void STDMETHODCALLTYPE HookedExecuteCommandLists(
     ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* ppCommandLists) {
-    if (!g_shuttingDown.load(std::memory_order_relaxed) && !g_dx12QueueLocked.load(std::memory_order_relaxed) && queue) {
-        D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
-        if (desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-            ID3D12Device* dev = nullptr;
-            if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
-                std::lock_guard<std::mutex> lk(g_queueMutex);
-                bool exists = false;
-                for (const auto& c : g_candidateQueues) {
-                    if (c.device == dev && c.queue == queue) {
-                        exists = true;
-                        break;
+    if (!g_shuttingDown.load(std::memory_order_relaxed) && queue) {
+        // 99.99% 极速热路径：已绑定的主 DIRECT 队列仅做 1 次指针比较 + 原子自增，零加锁零 GetDesc 开销
+        if (queue == g_activeDx12QueuePtr.load(std::memory_order_relaxed)) {
+            g_activeDx12QueueExecCount.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+            if (desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                ID3D12Device* dev = nullptr;
+                if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
+                    const unsigned long long now = GetTickCount64();
+                    std::lock_guard<std::mutex> lk(g_queueMutex);
+                    bool exists = false;
+                    for (auto& c : g_candidateQueues) {
+                        if (c.device == dev && c.queue == queue) {
+                            c.lastExecTick = now;
+                            c.execCount++;
+                            exists = true;
+                            break;
+                        }
                     }
+                    if (!exists) {
+                        if (g_candidateQueues.size() >= 16) {
+                            g_candidateQueues.erase(g_candidateQueues.begin());
+                        }
+                        g_candidateQueues.push_back({dev, queue, now, 1});
+                        OverlayLog("Captured DIRECT DX12 CommandQueue=0x%p (Device=0x%p)", queue, dev);
+                    }
+                    dev->Release();
                 }
-                if (!exists && g_candidateQueues.size() < 8) {
-                    g_candidateQueues.push_back({dev, queue});
-                    OverlayLog("Captured DIRECT DX12 CommandQueue=0x%p (Device=0x%p)", queue, dev);
-                }
-                dev->Release();
             }
         }
     }
     g_origExecuteCommandLists(queue, numCommandLists, ppCommandLists);
+}
+
+HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
+    IDXGIFactory2* factory, IUnknown* pDevice, HWND hWnd,
+    const DXGI_SWAP_CHAIN_DESC1* pDesc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+    IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain) {
+    // 若游戏为当前已绑定的主窗口重建 SwapChain，必须在调用原 CreateSwapChainForHwnd 前释放本层持有的旧 BackBuffer 引用，
+    // 否则 DXGI Flip-Model 会因旧 SwapChain 尚未析构而直接返回 E_ACCESSDENIED (0x80070005)！
+    if (!g_shuttingDown.load(std::memory_order_relaxed) &&
+        g_imguiInitialized && hWnd && hWnd == g_gameHwnd &&
+        pDesc && pDesc->Width >= 200 && pDesc->Height >= 200) {
+        OverlayLog("CreateSwapChainForHwnd targeting bound HWND=0x%p (%ux%u, fmt=%d): releasing old backend before creation",
+                   hWnd, pDesc->Width, pDesc->Height, static_cast<int>(pDesc->Format));
+        ShutdownGraphicsBackendOnly();
+    }
+
+    HRESULT hr = g_origCreateSwapChainForHwnd(
+        factory, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+    if (SUCCEEDED(hr) && pDevice && ppSwapChain && *ppSwapChain &&
+        !g_shuttingDown.load(std::memory_order_relaxed)) {
+        ID3D12CommandQueue* q = nullptr;
+        if (SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&q))) && q) {
+            RecordSwapChainQueueBinding(*ppSwapChain, q);
+            OverlayLog("CreateSwapChainForHwnd captured SC=0x%p HWND=0x%p Queue=0x%p Size=%ux%u Format=%d",
+                       *ppSwapChain, hWnd, q,
+                       pDesc ? pDesc->Width : 0, pDesc ? pDesc->Height : 0,
+                       pDesc ? static_cast<int>(pDesc->Format) : 0);
+            q->Release();
+        }
+    }
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
@@ -1843,11 +2303,10 @@ HRESULT STDMETHODCALLTYPE HookedPresent1(
     return g_origPresent1(swapChain, syncInterval, presentFlags, pPresentParameters);
 }
 
-HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
-    IDXGISwapChain* swapChain, UINT bufferCount, UINT width, UINT height,
-    DXGI_FORMAT newFormat, UINT swapChainFlags) {
+void HandleResizePre(IDXGISwapChain* swapChain, UINT width, UINT height, UINT bufferCount, DXGI_FORMAT newFormat, const char* apiName) {
     if (g_imguiInitialized && swapChain == g_boundSwapChain) {
-        OverlayLog("ResizeBuffers called (%ux%u, buffers=%u)", width, height, bufferCount);
+        OverlayLog("%s called (%ux%u, buffers=%u, format=%d)",
+                   apiName, width, height, bufferCount, static_cast<int>(newFormat));
         if (g_activeApi == GraphicsApi::DX12) {
             WaitForDx12GpuIdle();
             ReleaseDx12BackBuffers();
@@ -1856,18 +2315,84 @@ HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
             ImGui_ImplDX11_InvalidateDeviceObjects();
         }
     }
+}
+
+void HandleResizePost(IDXGISwapChain* swapChain, HRESULT hr, ID3D12CommandQueue* explicitPresentQueue, const char* apiName) {
+    if (!SUCCEEDED(hr) || !g_imguiInitialized || swapChain != g_boundSwapChain) return;
+    g_lastFullscreenCheckTick = 0; // 分辨率/全屏切换后立刻重新探测独占全屏态
+    if (g_activeApi == GraphicsApi::DX12) {
+        DXGI_SWAP_CHAIN_DESC sd{};
+        const bool gotSd = SUCCEEDED(swapChain->GetDesc(&sd));
+        DXGI_FORMAT bbResFmt = DXGI_FORMAT_UNKNOWN;
+        ID3D12Resource* bb0 = nullptr;
+        if (SUCCEEDED(swapChain->GetBuffer(0, IID_PPV_ARGS(&bb0))) && bb0) {
+            bbResFmt = bb0->GetDesc().Format;
+            bb0->Release();
+        }
+        const DXGI_FORMAT nextFmt = ResolveConcreteDx12RtvFormat(
+            gotSd ? sd.BufferDesc.Format : g_dx12RtvFormat, bbResFmt);
+        const bool queueChanged = (explicitPresentQueue != nullptr && explicitPresentQueue != g_d3d12CommandQueue);
+        const bool needRebuild = (nextFmt != g_dx12RtvFormat) ||
+                                 (gotSd && sd.BufferCount != g_dx12BufferCount) ||
+                                 queueChanged;
+        if (needRebuild) {
+            RebuildDx12ImGuiBackend(swapChain, explicitPresentQueue, apiName);
+        } else {
+            CreateDx12BackBuffers(swapChain);
+            g_needLogMenuRender.store(true, std::memory_order_relaxed);
+        }
+    } else if (g_activeApi == GraphicsApi::DX11) {
+        CreateDx11Rtv(swapChain);
+        ImGui_ImplDX11_CreateDeviceObjects();
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
+    IDXGISwapChain* swapChain, UINT bufferCount, UINT width, UINT height,
+    DXGI_FORMAT newFormat, UINT swapChainFlags) {
+    const bool outer = !t_inResize;
+    if (outer) {
+        t_inResize = true;
+        HandleResizePre(swapChain, width, height, bufferCount, newFormat, "ResizeBuffers");
+    }
 
     HRESULT hr = g_origResizeBuffers(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
 
-    if (SUCCEEDED(hr) && g_imguiInitialized && swapChain == g_boundSwapChain) {
-        g_lastFullscreenCheckTick = 0; // 分辨率/全屏切换后立刻重新探测独占全屏态
-        if (g_activeApi == GraphicsApi::DX12) {
-            CreateDx12BackBuffers(swapChain);
-        } else if (g_activeApi == GraphicsApi::DX11) {
-            CreateDx11Rtv(swapChain);
-            ImGui_ImplDX11_CreateDeviceObjects();
+    if (outer) {
+        HandleResizePost(swapChain, hr, nullptr, "ResizeBuffers");
+        t_inResize = false;
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookedResizeBuffers1(
+    IDXGISwapChain3* swapChain, UINT bufferCount, UINT width, UINT height,
+    DXGI_FORMAT newFormat, UINT swapChainFlags, const UINT* pCreationNodeMask,
+    IUnknown* const* ppPresentQueue) {
+    g_dx12ResizeBuffers1Count.fetch_add(1, std::memory_order_relaxed);
+
+    ID3D12CommandQueue* presentQueue = nullptr;
+    if (ppPresentQueue && ppPresentQueue[0]) {
+        ppPresentQueue[0]->QueryInterface(IID_PPV_ARGS(&presentQueue));
+        if (presentQueue) {
+            RecordSwapChainQueueBinding(swapChain, presentQueue);
         }
     }
+
+    const bool outer = !t_inResize;
+    if (outer) {
+        t_inResize = true;
+        HandleResizePre(swapChain, width, height, bufferCount, newFormat, "ResizeBuffers1");
+    }
+
+    HRESULT hr = g_origResizeBuffers1(
+        swapChain, bufferCount, width, height, newFormat, swapChainFlags, pCreationNodeMask, ppPresentQueue);
+
+    if (outer) {
+        HandleResizePost(swapChain, hr, presentQueue, "ResizeBuffers1");
+        t_inResize = false;
+    }
+    if (presentQueue) presentQueue->Release();
     return hr;
 }
 
@@ -1875,6 +2400,8 @@ struct ResolvedVTableAddrs {
     void* present = nullptr;
     void* present1 = nullptr;
     void* resizeBuffers = nullptr;
+    void* resizeBuffers1 = nullptr;
+    void* createSwapChainForHwnd = nullptr;
     void* executeCommandLists = nullptr;
 };
 
@@ -1902,6 +2429,9 @@ bool ResolveGraphicsVTables(ResolvedVTableAddrs& out) {
 
     if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
         SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev12)))) {
+        void** fVtable = *reinterpret_cast<void***>(factory);
+        out.createSwapChainForHwnd = fVtable[15];
+
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
@@ -1923,8 +2453,17 @@ bool ResolveGraphicsVTables(ResolvedVTableAddrs& out) {
                 out.present = sVtable[8];
                 out.resizeBuffers = sVtable[13];
                 out.present1 = sVtable[22];
-                OverlayLog("Resolved DX12 VTables: Present=0x%p Present1=0x%p Resize=0x%p ExecCmdLists=0x%p",
-                           out.present, out.present1, out.resizeBuffers, out.executeCommandLists);
+
+                IDXGISwapChain3* sc3 = nullptr;
+                if (SUCCEEDED(swap12->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
+                    void** s3Vtable = *reinterpret_cast<void***>(sc3);
+                    out.resizeBuffers1 = s3Vtable[39];
+                    sc3->Release();
+                }
+
+                OverlayLog("Resolved DX12 VTables: Present=0x%p Present1=0x%p Resize=0x%p Resize1=0x%p CreateSC=0x%p ExecCmdLists=0x%p",
+                           out.present, out.present1, out.resizeBuffers, out.resizeBuffers1,
+                           out.createSwapChainForHwnd, out.executeCommandLists);
             }
         }
     }
@@ -2038,6 +2577,18 @@ bool InstallGraphicsHook() {
     OverlayLog("MH_CreateHook(ResizeBuffers) -> %d", static_cast<int>(st));
     if (st != MH_OK) return false;
 
+    if (addrs.resizeBuffers1 && addrs.resizeBuffers1 != addrs.resizeBuffers) {
+        st = MH_CreateHook(addrs.resizeBuffers1, reinterpret_cast<void*>(&HookedResizeBuffers1),
+                           reinterpret_cast<void**>(&g_origResizeBuffers1));
+        OverlayLog("MH_CreateHook(ResizeBuffers1) -> %d", static_cast<int>(st));
+    }
+
+    if (addrs.createSwapChainForHwnd) {
+        st = MH_CreateHook(addrs.createSwapChainForHwnd, reinterpret_cast<void*>(&HookedCreateSwapChainForHwnd),
+                           reinterpret_cast<void**>(&g_origCreateSwapChainForHwnd));
+        OverlayLog("MH_CreateHook(CreateSwapChainForHwnd) -> %d", static_cast<int>(st));
+    }
+
     // 挂接 USER32 光标 API（ADR-0004）：菜单关闭时单分支零开销直通，菜单打开时阻止 UE4 每帧隐藏/闪烁/锁框
     if (HMODULE user32 = ::GetModuleHandleW(L"user32.dll")) {
         if (void* pSetCur = reinterpret_cast<void*>(::GetProcAddress(user32, "SetCursor"))) {
@@ -2068,19 +2619,19 @@ bool InstallGraphicsHook() {
 }
 
 void UninstallGraphicsHook(bool processTerminating) {
-    g_shuttingDown.store(true);
+    g_shuttingDown.store(true, std::memory_order_release);
     if (processTerminating) {
         // 进程终止阶段仅快速解除 WndProc 子类化，避免在 Loader Lock 内等待 GPU 围栏或调用 COM 造成退出卡死
-        if (g_gameHwnd && g_origWndProc) {
-            SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origWndProc));
-            g_origWndProc = nullptr;
+        WNDPROC orig = g_origWndProc.exchange(nullptr, std::memory_order_acq_rel);
+        if (g_gameHwnd && orig) {
+            SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
         }
         return;
     }
 
-    if (g_gameHwnd && g_origWndProc) {
-        SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origWndProc));
-        g_origWndProc = nullptr;
+    WNDPROC orig = g_origWndProc.exchange(nullptr, std::memory_order_acq_rel);
+    if (g_gameHwnd && orig) {
+        SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
     }
     ReleaseTsfSinkOnWindowThread();
 
@@ -2193,6 +2744,14 @@ void GetTestMetrics(unsigned long long* outIdleFrames,
     if (outIdleFrames) *outIdleFrames = g_idleFrameCount.load(std::memory_order_relaxed);
     if (outRenderedFrames) *outRenderedFrames = g_renderedFrameCount.load(std::memory_order_relaxed);
     if (outImeCharCount) *outImeCharCount = g_imeCharsCommitted.load(std::memory_order_relaxed);
+}
+
+void GetDx12ResilienceMetrics(int* outResizeBuffers1Count,
+                              int* outBackendRebuildCount,
+                              int* outSwapChainRebindCount) {
+    if (outResizeBuffers1Count) *outResizeBuffers1Count = g_dx12ResizeBuffers1Count.load(std::memory_order_relaxed);
+    if (outBackendRebuildCount) *outBackendRebuildCount = g_dx12BackendRebuildCount.load(std::memory_order_relaxed);
+    if (outSwapChainRebindCount) *outSwapChainRebindCount = g_dx12SwapChainRebindCount.load(std::memory_order_relaxed);
 }
 
 void ForceExpireStartupBannerForTest() {

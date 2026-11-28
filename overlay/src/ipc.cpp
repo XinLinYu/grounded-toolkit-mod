@@ -11,6 +11,7 @@
 #include <Windows.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -86,15 +87,26 @@ IpcBridge::IpcBridge()
     : m_configSnap(std::make_shared<ModConfig>()),
       m_catalogSnap(std::make_shared<std::vector<CatalogEntry>>()),
       m_mapLiveSnap(std::make_shared<MapLiveState>()),
-      m_statusSnap(std::make_shared<RuntimeStatus>()) {}
+      m_statusSnap(std::make_shared<RuntimeStatus>()) {
+    LARGE_INTEGER qpc{};
+    QueryPerformanceCounter(&qpc);
+    char sbuf[96];
+    std::snprintf(sbuf, sizeof(sbuf), "s_%lu_%llu_%lld",
+                  static_cast<unsigned long>(GetCurrentProcessId()),
+                  static_cast<unsigned long long>(GetTickCount64()),
+                  static_cast<long long>(qpc.QuadPart));
+    m_actionSession = sbuf;
+}
 
 IpcBridge::~IpcBridge() {
     Shutdown(true);
 }
 
 IpcBridge& IpcBridge::Instance() {
-    static IpcBridge inst;
-    return inst;
+    // 使用永生堆单例（Immortal Singleton）：进程退出时后台分离线程可能仍处于内核返回前夕，
+    // 绝不让 atexit 析构 m_mutex / m_ioMutex / m_ioCv，彻底杜绝退出阶段 RtlEnterCriticalSection 访问已销毁锁闪退。
+    static IpcBridge* inst = new IpcBridge();
+    return *inst;
 }
 
 void IpcBridge::Initialize(const std::wstring& dllDirectory) {
@@ -113,6 +125,8 @@ void IpcBridge::Initialize(const std::wstring& dllDirectory) {
             m_configSnap = defaultCfg;
             AtomicWriteText(m_dataDir + L"\\config.json", SerializeConfigJson(*defaultCfg).dump(2));
         }
+        // 启动新会话时清理上次异常退出可能残留的旧 actions.json，避免误触发过期指令
+        DeleteFileW((m_dataDir + L"\\actions.json").c_str());
     }
 
     // 立即在初始化线程预读一次已有 IPC 文件，并拉起后台异步 I/O 轮询线程
@@ -127,7 +141,10 @@ void IpcBridge::Initialize(const std::wstring& dllDirectory) {
 }
 
 void IpcBridge::Shutdown(bool processTerminating) {
-    m_stopIo.store(true);
+    if (processTerminating) {
+        m_processTerminating.store(true, std::memory_order_release);
+    }
+    m_stopIo.store(true, std::memory_order_release);
     m_ioCv.notify_all();
     if (!processTerminating) {
         std::thread toJoin;
@@ -187,8 +204,14 @@ bool IpcBridge::AtomicWriteText(const std::wstring& path, const std::string& con
             return false;
         }
     }
-    // 使用 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH 确保跨线程/跨脚本不会读到半截文件
-    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    // 使用 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH 原子替换，遇极短暂文件共享竞争时做有界重试
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+            return true;
+        }
+        Sleep(1);
+    }
+    return false;
 }
 
 bool IpcBridge::LoadConfigLocked() {
@@ -292,25 +315,47 @@ void IpcBridge::FlushPendingWritesOnWorker() {
     }
 
     if (!actsToWrite.empty() && !m_dataDir.empty()) {
-        // 连续爆发推送时优先保留高优先级用户操作（如找回背包/放路标不被静默软刷新覆盖）
-        const PendingAction* chosen = &actsToWrite.back();
-        if (chosen->type == "refresh_catalog_soft" && actsToWrite.size() > 1) {
-            for (auto it = actsToWrite.rbegin(); it != actsToWrite.rend(); ++it) {
-                if (it->type != "refresh_catalog_soft") {
-                    chosen = &(*it);
-                    break;
-                }
+        const std::wstring actionsPath = m_dataDir + L"\\actions.json";
+        // 若磁盘上的 actions.json 已被 Lua 通过原子重命名认领走，则清空上一批缓冲；
+        // 若仍存在则按已确认的 lastActionSeq 裁剪旧指令后再把新指令追加合并，确保交错并发读写 0 丢单。
+        if (GetFileAttributesW(actionsPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            m_unconsumedActions.clear();
+        } else {
+            const int acked = m_lastAckedActionSeq.load(std::memory_order_acquire);
+            while (!m_unconsumedActions.empty() && m_unconsumedActions.front().seq <= acked) {
+                m_unconsumedActions.pop_front();
             }
         }
-        json j = {
-            {"seq", chosen->seq},
-            {"type", chosen->type},
-            {"payload", chosen->payload},
-            {"x", chosen->x},
-            {"y", chosen->y},
-            {"z", chosen->z},
+        for (auto& act : actsToWrite) {
+            // 合并多余的连续静默目录软刷新，保留高优先级用户操作不丢失
+            if (act.type == "refresh_catalog_soft" && !m_unconsumedActions.empty() &&
+                m_unconsumedActions.back().type == "refresh_catalog_soft") {
+                m_unconsumedActions.back() = std::move(act);
+                continue;
+            }
+            if (m_unconsumedActions.size() >= 32) {
+                m_unconsumedActions.pop_front();
+            }
+            m_unconsumedActions.push_back(std::move(act));
+        }
+
+        json arr = json::array();
+        for (const auto& a : m_unconsumedActions) {
+            arr.push_back({
+                {"session", m_actionSession},
+                {"seq", a.seq},
+                {"type", a.type},
+                {"payload", a.payload},
+                {"x", a.x},
+                {"y", a.y},
+                {"z", a.z},
+            });
+        }
+        json batch = {
+            {"session", m_actionSession},
+            {"actions", std::move(arr)},
         };
-        AtomicWriteText(m_dataDir + L"\\actions.json", j.dump());
+        AtomicWriteText(actionsPath, batch.dump());
     }
 }
 
@@ -409,6 +454,20 @@ void IpcBridge::PollFilesOnWorker() {
                 rs->stackSummary = j.value("stackSummary", "");
                 rs->surveyedItemName = j.value("surveyedItemName", "");
                 rs->lastMessage = j.value("lastMessage", "");
+                // 仅当 status.json 回传的 lastActionSession 与本进程会话严格一致时，才采信 lastActionSeq 裁剪队列；
+                // 重启后若磁盘上仍残留上次会话的 status.json（如 lastActionSeq=8 或缺少 session），必须完全忽略，防止误删新会话 seq=1！
+                std::string ackedSession;
+                if (auto itS = j.find("lastActionSession"); itS != j.end() && itS->is_string()) {
+                    ackedSession = itS->get<std::string>();
+                }
+                int ackedSeq = 0;
+                if (auto itQ = j.find("lastActionSeq"); itQ != j.end() && itQ->is_number_integer()) {
+                    ackedSeq = itQ->get<int>();
+                }
+                if (!ackedSession.empty() && ackedSession == m_actionSession &&
+                    ackedSeq > m_lastAckedActionSeq.load(std::memory_order_relaxed)) {
+                    m_lastAckedActionSeq.store(ackedSeq, std::memory_order_release);
+                }
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_statusSnap = std::move(rs);
             } catch (...) {
@@ -449,17 +508,19 @@ void IpcBridge::PollFilesOnWorker() {
 }
 
 void IpcBridge::IoWorkerLoop() {
-    while (!m_stopIo.load()) {
+    while (!m_stopIo.load(std::memory_order_acquire)) {
         FlushPendingWritesOnWorker();
         PollFilesOnWorker();
 
         std::unique_lock<std::mutex> ioLock(m_ioMutex);
         m_ioCv.wait_for(ioLock, std::chrono::milliseconds(40), [this]() {
-            return m_stopIo.load() || m_pendingConfigSave || !m_pendingActions.empty();
+            return m_stopIo.load(std::memory_order_acquire) || m_pendingConfigSave || !m_pendingActions.empty();
         });
     }
-    // 退出前尽量把最后一笔未落盘配置写出
-    FlushPendingWritesOnWorker();
+    // 仅在显式 FreeLibrary 卸载时补写最后一笔未落盘配置；进程终止阶段直接返回，避免磁盘 I/O 与退出竞争
+    if (!m_processTerminating.load(std::memory_order_acquire)) {
+        FlushPendingWritesOnWorker();
+    }
 }
 
 std::shared_ptr<const ModConfig> IpcBridge::GetConfigSnapshot() {

@@ -83,6 +83,11 @@ void GetTestMetrics(unsigned long long* outIdleFrames,
                     unsigned long long* outRenderedFrames,
                     int* outImeCharCount);
 
+/// 获取 DX12 健壮性计数（ResizeBuffers1 次数、后端重建次数、SwapChain 重绑次数），供回归测试校验。
+void GetDx12ResilienceMetrics(int* outResizeBuffers1Count,
+                              int* outBackendRebuildCount,
+                              int* outSwapChainRebindCount);
+
 /// 测试辅助：将启动横幅计时提前过期，便于测试即时验证空闲直通路径。
 void ForceExpireStartupBannerForTest();
 

@@ -1,7 +1,7 @@
 ﻿# ==============================================================================
 # 文件：deploy.ps1
 # 职责：GroundedQoL 一键编译 Release x64 悬浮菜单 DLL、部署到本机 Steam 游戏目录，
-#       并打包可直接分发给联机队友的绿色安装包（dist/GroundedQoL_Steam_v1.4.7.zip）。
+#       并打包可直接分发给联机队友的绿色安装包（dist/GroundedQoL_v1.1.0.zip）。
 # 使用示例：
 #   powershell -ExecutionPolicy Bypass -File .\deploy.ps1 -GameDir "G:\SteamLibrary\steamapps\common\Grounded"
 # ==============================================================================
@@ -92,7 +92,7 @@ Set-Content -Path (Join-Path $ue4ssDir 'Mods\mods.txt') -Value $modsTxt -Encodin
 Write-Output '=== [4/4] 生成联机队友分享绿色包 ==='
 $distDir = Join-Path $projRoot 'dist'
 $stageDir = Join-Path $distDir 'GroundedQoL_Package'
-$zipPath = Join-Path $distDir 'GroundedQoL_Steam_v1.4.7.zip'
+$zipPath = Join-Path $distDir 'GroundedQoL_v1.1.0.zip'
 if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir 'ue4ss\Mods\GroundedQoL\Scripts') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir 'ue4ss\Mods\GroundedQoL\data') | Out-Null

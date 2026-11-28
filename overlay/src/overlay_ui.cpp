@@ -819,21 +819,57 @@ void RenderImeCandidateBar(float uiScale) {
 }
 
 /// 渲染游戏内 Mod 主配置菜单。
+static std::atomic<float> g_lastMenuWinX{0.0f};
+static std::atomic<float> g_lastMenuWinY{0.0f};
+static std::atomic<float> g_lastMenuWinW{0.0f};
+static std::atomic<float> g_lastMenuWinH{0.0f};
+
 void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cfgDirty, bool& menuOpen, float uiScale) {
     const auto statusPtr = IpcBridge::Instance().GetStatusSnapshot();
     const auto catalogPtr = IpcBridge::Instance().GetCatalogSnapshot();
     const RuntimeStatus& status = *statusPtr;
     const auto& catalog = *catalogPtr;
 
-    ImGui::SetNextWindowSize(ImVec2(800.0f * uiScale, 700.0f * uiScale), ImGuiCond_FirstUseEver);
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    const float maxW = std::max(360.0f, disp.x - 24.0f);
+    const float maxH = std::max(280.0f, disp.y - 24.0f);
+    const float initW = std::min(800.0f * uiScale, maxW);
+    const float initH = std::min(700.0f * uiScale, maxH);
+
+    ImGui::SetNextWindowSizeConstraints(ImVec2(std::min(420.0f, maxW), std::min(320.0f, maxH)), ImVec2(maxW, maxH));
+    ImGui::SetNextWindowSize(ImVec2(initW, initH), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(
-        ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f),
+        ImVec2(disp.x * 0.5f, disp.y * 0.5f),
         ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
     if (!ImGui::Begin("禁闭求生 体验增强工具箱 (GroundedQoL)  |  Insert / F8 开关", &menuOpen, flags)) {
         ImGui::End();
         return;
+    }
+
+    // 分辨率切换或窗口缩放后自动将菜单钳制回可视视口内，杜绝窗口跑出屏幕外“有鼠标无菜单”
+    if (disp.x > 64.0f && disp.y > 64.0f) {
+        ImVec2 winPos = ImGui::GetWindowPos();
+        ImVec2 winSz = ImGui::GetWindowSize();
+        bool needClampSz = (winSz.x > maxW + 1.0f || winSz.y > maxH + 1.0f);
+        if (needClampSz) {
+            winSz.x = std::min(winSz.x, maxW);
+            winSz.y = std::min(winSz.y, maxH);
+            ImGui::SetWindowSize(winSz);
+        }
+        const float maxPosX = std::max(0.0f, disp.x - winSz.x);
+        const float maxPosY = std::max(0.0f, disp.y - winSz.y);
+        float clampedX = std::clamp(winPos.x, 0.0f, maxPosX);
+        float clampedY = std::clamp(winPos.y, 0.0f, maxPosY);
+        if (std::abs(clampedX - winPos.x) > 0.5f || std::abs(clampedY - winPos.y) > 0.5f) {
+            ImGui::SetWindowPos(ImVec2(clampedX, clampedY));
+            winPos = ImVec2(clampedX, clampedY);
+        }
+        g_lastMenuWinX.store(winPos.x, std::memory_order_relaxed);
+        g_lastMenuWinY.store(winPos.y, std::memory_order_relaxed);
+        g_lastMenuWinW.store(winSz.x, std::memory_order_relaxed);
+        g_lastMenuWinH.store(winSz.y, std::memory_order_relaxed);
     }
 
     // 顶部状态条
@@ -918,9 +954,9 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
             ImGui::Separator();
             ImGui::Spacing();
 
-            // 3. 采集入包与搬运倍率（ADR-0005：普通物品 1 倍爆出、入包统一乘倍率；仅搬运物砍倒瞬时缩放）
+            // 3. 采集入包与搬运倍率（ADR-0005：全路径 AddItem 入包乘倍率 + 搬运物瞬时缩放）
             ImGui::TextColored(ImVec4(0.55f, 0.96f, 0.55f, 1.0f), "3. 采集入包与搬运数量倍率（房主设置全队生效，地上仅爆 1 倍防卡顿）");
-            if (ImGui::Checkbox("启用采集入包倍率（砍/锤/挖/杀爆出保持 1 倍，拾取入包与摸尸走倍率）##harv", &cfg.harvestEnabled)) cfgDirty = true;
+            if (ImGui::Checkbox("启用全路径采集入包倍率（直拾/砍挖爆出/摸尸/自动装备与超堆叠溢出均走倍率）##harv", &cfg.harvestEnabled)) cfgDirty = true;
             ImGui::BeginDisabled(!cfg.harvestEnabled);
             if (ImGui::SliderInt("采集倍率 (x)##harvMult", &cfg.harvestMultiplier, 1, 20, "%d 倍")) cfgDirty = true;
             ImGui::SameLine();
@@ -934,14 +970,14 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
                 ImGui::SameLine();
             }
             ImGui::NewLine();
-            if (ImGui::Checkbox("同时对草板/杂草茎等肩扛搬运物生效（砍倒瞬间缩放并还原，单棵封顶 12 根）", &cfg.harvestAffectHauling)) {
+            if (ImGui::Checkbox("同时对草板/杂草茎等肩扛搬运物生效（砍倒瞬间缩放并还原，单棵放大上限 12 根，不削减原版）", &cfg.harvestAffectHauling)) {
                 cfgDirty = true;
             }
-            if (ImGui::Checkbox("同时对地面天然散落物直拾生效（树枝/植物纤维/鹅卵石/小蘑菇等）", &cfg.harvestAffectPickup)) {
+            if (ImGui::Checkbox("同时对地面天然散落物直拾生效（树枝/植物纤维/鹅卵石/小蘑菇/三叶草/树液等）", &cfg.harvestAffectPickup)) {
                 cfgDirty = true;
             }
             ImGui::EndDisabled();
-            ImGui::TextDisabled("零模板污染架构：严格排除玩家丢弃物、投掷物、拆建返还物、容器转移与单件装备 | 本次已生效: %d 次",
+            ImGui::TextDisabled("防刷保护：严格排除玩家丢弃/投掷/射出箭矢、拆建返还、箱子转移、制作产出与单件装备 | 本次已生效: %d 次",
                                 status.lootCompCount);
 
             ImGui::Spacing();
@@ -949,11 +985,12 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
             ImGui::Spacing();
 
             // 4. 工作台建设、合成与制作无需材料立刻完成
+            const bool isClientBlocked = status.inWorld && !status.isHost;
             ImGui::TextColored(ImVec4(0.95f, 0.65f, 1.0f, 1.0f), "4. 无材料秒建与免费合成（工作台/建筑/工具制作，不影响成就）");
-            if (ImGui::Checkbox("建造无需材料立刻建成（含工作台等全部建筑蓝图）##instbuild", &cfg.instantBuildEnabled)) {
+            if (ImGui::Checkbox("建造无需材料立刻建成（含工作台等全部建筑蓝图，房主开启全队生效）##instbuild", &cfg.instantBuildEnabled)) {
                 cfgDirty = true;
             }
-            if (ImGui::Checkbox("工作台/背包合成制作工具无需材料立刻完成##freecraft", &cfg.freeCraftEnabled)) {
+            if (ImGui::Checkbox("工作台/背包免费合成、修理与武器防具升级（无需材料，不含纺车/烤炉/研磨机等队列加工台）##freecraft", &cfg.freeCraftEnabled)) {
                 cfgDirty = true;
             }
             if (ImGui::Checkbox("同时解锁全部制作与建筑配方（可选）##unlockall", &cfg.unlockAllRecipes)) {
@@ -972,10 +1009,18 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
                 cfgDirty = true;
             }
             ImGui::SameLine();
+            ImGui::BeginDisabled(isClientBlocked);
             if (ImGui::Button("一键建成已放置的未完工蓝图")) {
                 IpcBridge::Instance().PushAction("build_all_blueprints");
             }
-            ImGui::TextDisabled("说明：秒建对全队放置的蓝图即时生效；无材料制作在房主端立刻生效，队友安装分享包后亦可同步使用。");
+            ImGui::EndDisabled();
+            if (isClientBlocked) {
+                ImGui::TextColored(
+                    ImVec4(1.0f, 0.72f, 0.32f, 1.0f),
+                    "联机客机提示：秒建与一键建成未完工蓝图仅由房主端生效；免费制作需房主与客机均勾选才会在制作界面点亮按钮。");
+            } else {
+                ImGui::TextDisabled("说明：秒建对全队放置的蓝图即时生效；免费制作覆盖背包/工作台合成、修理与强化（队列加工台保持原版规则），联机客机需同步勾选。");
+            }
 
             ImGui::Spacing();
             ImGui::Separator();
@@ -983,7 +1028,6 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
 
             // 5. 死亡背包保留、耐久保护与一键找回背包
             ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.78f, 1.0f), "5. 死亡保护与一键找回背包（房主设置全队生效，不影响成就）");
-            const bool isClientBlocked = status.inWorld && !status.isHost;
             ImGui::BeginDisabled(isClientBlocked);
             if (ImGui::Checkbox("死亡时保留背包内全部物品（不生成掉落背包）##keepinv", &cfg.keepInventoryOnDeath)) {
                 cfgDirty = true;
@@ -1055,7 +1099,7 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
             ImGui::Separator();
             if (status.inWorld && !status.isHost) {
                 ImGui::TextColored(ImVec4(0.45f, 0.90f, 1.0f, 1.0f),
-                                   "客机独立追踪模式：乳牙/SCA.B 与全图植被已同步，采集点/生物/宝箱自动追踪客机周边已加载范围（主客机勾选互不共享）。");
+                                   "客机独立追踪模式：已载入全图鉴生物/采集点与全图植被目录，可随时搜索预勾选；生物/采集点进入周边网络同步范围后自动亮标（主客机互不共享）。");
             }
             ImGui::TextColored(ImVec4(0.55f, 0.96f, 0.55f, 1.0f),
                                "自由追踪全游戏物品 / 道具 / 资源 / 采集点 / 生物（仅本机可见、可多选，共 %d 项）",
@@ -1125,6 +1169,9 @@ void RenderModMenuWindow(const ModConfig& immutableCfg, ModConfig& cfg, bool& cf
                         if (e.count > 0) {
                             std::snprintf(label, sizeof(label), "%s  [%s | %d处]",
                                           e.name.c_str(), CategoryLabelZh(e.category), e.count);
+                        } else if (status.inWorld && !status.isHost && (e.category == "creature" || e.category == "node")) {
+                            std::snprintf(label, sizeof(label), "%s  [%s | 范围内0处]",
+                                          e.name.c_str(), CategoryLabelZh(e.category));
                         } else {
                             std::snprintf(label, sizeof(label), "%s  [%s]",
                                           e.name.c_str(), CategoryLabelZh(e.category));
@@ -1312,6 +1359,13 @@ bool HandleMapQuickShortcut(UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
 
 int GetLastRenderedMapPinCount() {
     return g_lastRenderedPinCount.load(std::memory_order_relaxed);
+}
+
+void GetLastMenuWindowRect(float* outX, float* outY, float* outW, float* outH) {
+    if (outX) *outX = g_lastMenuWinX.load(std::memory_order_relaxed);
+    if (outY) *outY = g_lastMenuWinY.load(std::memory_order_relaxed);
+    if (outW) *outW = g_lastMenuWinW.load(std::memory_order_relaxed);
+    if (outH) *outH = g_lastMenuWinH.load(std::memory_order_relaxed);
 }
 
 } // namespace gqol

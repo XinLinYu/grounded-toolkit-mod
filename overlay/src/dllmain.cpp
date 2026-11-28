@@ -84,6 +84,20 @@ extern "C" __declspec(dllexport) void __cdecl GroundedQoL_QueryTestMetrics(
     gqol::GetTestMetrics(outIdleFrames, outRenderedFrames, outImeCharCount);
 }
 
+/// 供自动化回归测试查询 DX12 ResizeBuffers1 / 后端重建 / SwapChain 重绑次数。
+extern "C" __declspec(dllexport) void __cdecl GroundedQoL_QueryDx12Resilience(
+    int* outResizeBuffers1Count,
+    int* outBackendRebuildCount,
+    int* outSwapChainRebindCount) {
+    gqol::GetDx12ResilienceMetrics(outResizeBuffers1Count, outBackendRebuildCount, outSwapChainRebindCount);
+}
+
+/// 供自动化回归测试查询最近一帧主菜单窗口在视口内的坐标与尺寸（验证分辨率变化防越界）。
+extern "C" __declspec(dllexport) void __cdecl GroundedQoL_QueryMenuRect(
+    float* outX, float* outY, float* outW, float* outH) {
+    gqol::GetLastMenuWindowRect(outX, outY, outW, outH);
+}
+
 /// 供自动化回归测试强制跳过开场 10 秒提示条，以即时验证空闲零开销直通路径。
 extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestExpireStartupBanner() {
     gqol::ForceExpireStartupBannerForTest();
@@ -103,6 +117,13 @@ extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestInjectImeCandidate
 /// 供自动化回归测试查询最近一次被鼠标点击选中的候选字页内索引（-1 表示未点击）。
 extern "C" __declspec(dllexport) int __cdecl GroundedQoL_TestGetLastClickedCandidate() {
     return gqol::GetLastClickedImeCandidateForTest();
+}
+
+/// 供自动化回归测试直接推送一条一次性操作指令，验证 actions.json 队列批量保留不相互覆盖。
+extern "C" __declspec(dllexport) void __cdecl GroundedQoL_TestPushAction(const char* type, const char* payload) {
+    if (type && type[0] != '\0') {
+        gqol::IpcBridge::Instance().PushAction(type, payload ? payload : "");
+    }
 }
 
 /// DLL 生命周期入口：Attach 时保证只拉起一次初始化线程，Detach 时安全卸载图形钩子与异步 IPC 线程。

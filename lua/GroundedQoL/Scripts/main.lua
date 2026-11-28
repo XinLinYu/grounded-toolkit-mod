@@ -126,10 +126,12 @@ local cfg = {
 }
 
 local lastConfigRaw = ""
+local lastActionSession = ""
 local lastActionSeq = 0
 local lastStatusMessage = "插件已就绪，按 Insert 或 F8 打开中文菜单"
 local lastStatusJson = ""
 local lastMapLiveJson = ""
+local lastCatalogJson = ""
 local lastStackConfigKey = ""
 local lastHarvestConfigKey = ""
 
@@ -144,11 +146,23 @@ local lastStackSummary = ""
 
 local origDamageMap = {}   -- key=USurvivalGameModeSettings 地址，保存伤害/免材/死亡行为等原版基准值
 local harvestBoostHits = 0 -- 当次进图实时生效的采集入包/搬运倍率计数（彻底替代旧的全图 LootComponent 扫表）
-local spawnLootRestoreStack = {}      -- key=ULootComponent 地址 -> LIFO 原版 Count 恢复栈（仅搬运物瞬时缩放）
+local spawnLootActiveDepth = {}       -- key=ULootComponent 地址 -> 当前并发调用深度（防 OnDeath->SpawnLoot 嵌套重复缩放）
+local spawnLootRestoreMap = {}        -- key=ULootComponent 地址 -> 原版 Count 恢复记录（仅搬运物瞬时缩放）
 local excludedSpawnedActorAddrs = {}  -- 本局内通过玩家丢弃/投掷/拆建生成的 ASpawnedItem 地址黑名单
 local excludedItemObjAddrs = {}       -- 本局内被玩家丢弃/拆建返还的 UItem 对象地址黑名单
 local recentExcludedDropEvents = {}   -- 近期玩家丢弃/拆建事件的空间兜底缓冲（防 C++ 内部新建 UItem 绕过地址表）
 local inExcludedDropDepth = 0         -- 同步 Hook 深度：>0 时新生成的 ASpawnedItem 自动记入防刷黑名单
+local inNonHarvestAddDepth = 0        -- 非采集入包调用深度（箱子转移/合并/制作/容器直取期间屏蔽入包倍率）
+local inModExtraAddDepth = 0          -- 本插件溢出补发调用深度（防 ServerCreateAndAddItem 递归触发 AddItem 倍率）
+local inAddItemDepth = 0              -- InventoryComponent:AddItem 同步执行深度（供 ClientOnItemAdded 精确识别 TryPickupItem 自动堆叠装备分支）
+local foliagePickupActorAddrs = {}    -- 由 NotifySwapped(bFromDamage=false) 产生的天然植被直拾 ASpawnedItem 地址表
+local foliagePickupItemAddrs = {}     -- 由 NotifySwapped(bFromDamage=false) 产生的天然植被直拾 UItem 地址表
+local interactContextByPlayer = {}    -- 记录玩家当前/最近一次交互/触碰上下文（用于容器防护、直拾植被判定与装备栈增量溯源）
+local pendingAddItemBoosts = {}       -- key=UInventoryComponent 地址 -> AddItem Pre/Post 共享待加倍栈
+local pendingEquipBoosts = {}         -- key=UEquipmentComponent 地址 -> ServerEquipItem Pre/Post 共享待加倍栈
+local recentEquipHandledByInv = {}    -- key=UInventoryComponent 地址 -> 刚由 ServerEquipItem 处理完的防重复记录
+local recentlyBoostedItemAddrs = {}   -- key=UItem 地址 -> os.clock()（防止 TryPickupItem 分支 4 AddItem->ServerEquipItem 对同一物品二次倍增）
+local cachedClassMap = {}             -- UClass 缓存表，供 obj:IsA(UClass) 正确校验类型
 
 -- 引擎单件、高频世界对象与静态数据表句柄缓存（避免每帧/每秒重复 FindFirstOf 扫描 GObjects）
 local cachedGlobalItemData = nil
@@ -162,12 +176,16 @@ local cachedStatics = nil
 local cachedAllItemsTable = nil
 local cachedHarvestNodesTable = nil
 local cachedCharactersTable = nil
+local cachedBestiaryTable = nil
 
 -- 世界资源目录、本地化映射与乳牙统计缓存
 local itemRowToZhName = {}
 local surveyableRows = {}
 local harvestTableByHint = {}
 local charTableByHint = {}
+local charTableRows = {}
+local staticBestiaryCreatures = {}
+local staticHarvestNodes = {}
 local nodeClassToZhName = {}
 local nodeClassToDropRows = {}
 local creatureClassToZhName = {}
@@ -175,14 +193,12 @@ local catalogBuiltForWorld = nil
 local worldEnterClock = 0
 local worldInitialScanDone = false
 local catalogList = {}
+local catalogMetaById = {}
 local worldPinBuckets = {}
 local collectiblePins = {}
 local molarStats = { unMilk = 0, totMilk = 0, unMega = 0, totMega = 0 }
 local lastSurveyedName = ""
 local foliagePinCache = {}
-
--- 记录 ServerHandleInteract 执行前的背包快照（用于计算按 E 拾取自然物品的增量）
-local interactSnapshot = {}
 
 -- 常见未加载代理采集点的简体中文友好兜底名称（当远距离蓝图尚未流式加载时使用）
 local NODE_FALLBACK_ZH = {
@@ -244,6 +260,73 @@ local function safeValid(obj)
     if not obj then return false end
     local ok, v = pcall(function() return obj:IsValid() end)
     return ok and v == true
+end
+
+--- 安全解包 UE4SS FWeakObjectPtr / RemoteUnrealParam / UObject，返回存活的 UObject 或 nil。
+local function unwrapWeakObject(val)
+    if not val then return nil end
+    if safeValid(val) then return val end
+    local inner = nil
+    pcall(function()
+        if val.Get then
+            local o = val:Get()
+            if safeValid(o) then inner = o end
+        elseif val.get then
+            local o = val:get()
+            if safeValid(o) then inner = o end
+        end
+    end)
+    return inner
+end
+
+--- 缓存并获取指定 UE 脚本路径对应的 UClass 对象，用于兼容 UE4SS v4.0.0 的 obj:IsA(UClass)。
+local function getCachedUClass(scriptClassPath)
+    local cached = cachedClassMap[scriptClassPath]
+    if safeValid(cached) then return cached end
+    local ok, cls = pcall(StaticFindObject, scriptClassPath)
+    if ok and safeValid(cls) then
+        cachedClassMap[scriptClassPath] = cls
+        return cls
+    end
+    return nil
+end
+
+--- 兼容 UE4SS v4.0.0 与离线单测的类型判定（优先传 UClass*，再兜底传字符串路径与短类名匹配）。
+local function isAOf(obj, scriptClassPath, fallbackShortName)
+    if not safeValid(obj) then return false end
+    local clsObj = getCachedUClass(scriptClassPath)
+    if safeValid(clsObj) then
+        local ok, res = pcall(function() return obj.IsA and obj:IsA(clsObj) == true end)
+        if ok and res then return true end
+    end
+    local okStr, resStr = pcall(function() return obj.IsA and obj:IsA(scriptClassPath) == true end)
+    if okStr and resStr then return true end
+    if fallbackShortName and fallbackShortName ~= "" then
+        local cname = ""
+        pcall(function() cname = obj:GetClass():GetFName():ToString() end)
+        if cname == fallbackShortName then return true end
+    end
+    return false
+end
+
+--- 懒获取 AllItemsTable（供 Hook 回调内安全使用，不依赖后文函数定义顺序）。
+local function ensureAllItemsTable()
+    if safeValid(cachedAllItemsTable) then return cachedAllItemsTable end
+    pcall(function()
+        local gi = UEHelpers.GetGameInstance()
+        if safeValid(gi) and safeValid(gi.GlobalTableData) and safeValid(gi.GlobalTableData.AllItemsTable) then
+            cachedAllItemsTable = gi.GlobalTableData.AllItemsTable
+        end
+    end)
+    if not safeValid(cachedAllItemsTable) then
+        pcall(function()
+            local gtd = FindFirstOf("GlobalTableData")
+            if safeValid(gtd) and safeValid(gtd.AllItemsTable) then
+                cachedAllItemsTable = gtd.AllItemsTable
+            end
+        end)
+    end
+    return cachedAllItemsTable
 end
 
 --- 将 UE4SS 返回的字符串/FString/FName/FText 统一安全转换为纯 Lua 字符串。
@@ -479,9 +562,19 @@ local function applyGameModeSettings(isHost, gsIn)
         end
 
         -- 2. 建筑建设无材料立刻建成 / 工作台与背包合成制作无需材料 / 可选解锁全部配方
-        local targetAutoBuild = cfg.instantBuildEnabled and true or base.autoComplete
-        local targetReqIngr = cfg.freeCraftEnabled and false or base.requireIngredients
-        local targetUnlock = cfg.unlockAllRecipes and true or base.unlockAll
+        -- 注意：Lua 中 `cond and false or fallback` 会因 false 为假值而永远落回 fallback，必须显式用 if 分支赋值！
+        local targetAutoBuild = base.autoComplete
+        if cfg.instantBuildEnabled then
+            targetAutoBuild = true
+        end
+        local targetReqIngr = base.requireIngredients
+        if cfg.freeCraftEnabled then
+            targetReqIngr = false
+        end
+        local targetUnlock = base.unlockAll
+        if cfg.unlockAllRecipes then
+            targetUnlock = true
+        end
 
         if gms.bAutoCompleteBuildings ~= targetAutoBuild then
             gms.bAutoCompleteBuildings = targetAutoBuild
@@ -584,17 +677,14 @@ end
 --- 判断一个 UObject 的类或名称是否属于储物箱/背包/建筑/工作台等非拾取容器。
 local function isContainerOrBuildingObject(obj)
     if not safeValid(obj) then return false end
+    if isAOf(obj, "/Script/Maine.Building", "Building")
+        or isAOf(obj, "/Script/Maine.LootBag", "LootBag") then
+        return true
+    end
     local clsName = ""
     local fullName = ""
     pcall(function() clsName = obj:GetClass():GetFName():ToString():lower() end)
     pcall(function() fullName = obj:GetFullName():lower() end)
-    local isBuilding = false
-    pcall(function()
-        if obj.IsA and (obj:IsA("/Script/Maine.Building") or obj:IsA("/Script/Maine.LootBag")) then
-            isBuilding = true
-        end
-    end)
-    if isBuilding then return true end
     return clsName:find("lootbag") ~= nil
         or clsName:find("storage") ~= nil
         or clsName:find("chest") ~= nil
@@ -603,6 +693,17 @@ local function isContainerOrBuildingObject(obj)
         or fullName:find("backpack") ~= nil
         or fullName:find("storage") ~= nil
         or fullName:find("chest") ~= nil
+end
+
+--- 判断一个 UObject 是否为玩家角色（ASurvivalPlayerCharacter）。
+local function isSurvivalPlayerObject(obj)
+    if not safeValid(obj) then return false end
+    if isAOf(obj, "/Script/Maine.SurvivalPlayerCharacter", "SurvivalPlayerCharacter") then
+        return true
+    end
+    local cname = ""
+    pcall(function() cname = obj:GetClass():GetFName():ToString():lower() end)
+    return cname:find("survivalplayercharacter") ~= nil or cname:find("player_male") ~= nil or cname:find("player_female") ~= nil
 end
 
 --- 安全解包 UE4SS 返回的 TScriptInterface<IInteractableInterface> 为实际 UObject。
@@ -621,12 +722,12 @@ local function unwrapInteractable(val)
     return inner
 end
 
---- 判断 FFoliageKey 是否指向一个有效的世界植被实例（ISM）。
+--- 判断 FFoliageKey 是否指向一个有效的世界植被实例（ISM），兼容 UE4SS FWeakObjectPtr 解包。
 local function hasValidFoliageKey(fk)
     if not fk then return false end
     local valid = false
     pcall(function()
-        local ism = fk.InstancedStaticMeshComponent
+        local ism = unwrapWeakObject(fk.InstancedStaticMeshComponent)
         local idx = fk.MeshIndex
         if safeValid(ism) and (idx == nil or idx >= 0) then
             valid = true
@@ -709,97 +810,176 @@ local function consumeMatchingExcludedDropEvent(rowName, itemActor)
     return false
 end
 
---- 仅在 ULootComponent:SpawnLoot 触发瞬间对「肩扛搬运物」（草板/杂草茎）做瞬时缩放，
--- 并在 Post-Hook 立刻精确还原原版 Count；普通可入包物品严格保持 1 倍落地，绝不污染任何蓝图模板（ADR-0005）。
-pcall(function()
-    RegisterHook("/Script/Maine.LootComponent:SpawnLoot", function(selfParam)
+--- 搬运物（草板/杂草茎）瞬时缩放 Pre-Hook 共用实现：
+-- 覆盖 ULootComponent:OnDeath / OnDamaged / SpawnLoot 三大入口，使用每对象嵌套深度防止重复缩放，
+-- 按 ELootSpawnType 精确过滤对应阶段条目（避免未砍倒时的 OnDamaged 空计次），并在最外层 Post-Hook 立刻还原原版 Count（ADR-0005）。
+local function scaleHaulingLootPre(selfParam, expectedSpawnType, skipThisCall)
+    pcall(function()
+        local lc = selfParam:get()
+        if not safeValid(lc) then return end
+        local addr = lc:GetAddress()
+        local depth = (spawnLootActiveDepth[addr] or 0) + 1
+        spawnLootActiveDepth[addr] = depth
+        if depth > 1 or skipThisCall then
+            -- 已被外层 OnDeath/OnDamaged 缩放过，或本次调用不产生物品（如 OnDamaged IsKillingBlow=true），跳过
+            return
+        end
+
+        if not (cfg.harvestEnabled and cfg.harvestAffectHauling and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
+            return
+        end
+        local lcName = ""
+        pcall(function() lcName = lc:GetFullName() end)
+        if isTemplateOrCdoName(lcName) then return end
+
+        local ownerName = ""
         pcall(function()
-            local lc = selfParam:get()
-            if not safeValid(lc) then return end
-            if not (cfg.harvestEnabled and cfg.harvestAffectHauling and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
-                return
-            end
-            local lcName = ""
-            pcall(function() lcName = lc:GetFullName() end)
-            if isTemplateOrCdoName(lcName) then return end
+            local outer = lc:GetOuter()
+            if safeValid(outer) then ownerName = outer:GetFullName() end
+        end)
+        if isTemplateOrCdoName(ownerName) or shouldSkipLootOwner(ownerName) then return end
 
-            local ownerName = ""
+        local items = nil
+        pcall(function() items = lc.Items end)
+        if not items then return end
+        local len = 0
+        pcall(function() len = #items end)
+        if len <= 0 then return end
+
+        local mult = cfg.harvestMultiplier
+        local haulingEntries = {}
+        local totalOrig = 0
+        for i = 1, len do
             pcall(function()
-                local outer = lc:GetOuter()
-                if safeValid(outer) then ownerName = outer:GetFullName() end
-            end)
-            if isTemplateOrCdoName(ownerName) or shouldSkipLootOwner(ownerName) then return end
-
-            local items = nil
-            pcall(function() items = lc.Items end)
-            if not items then return end
-            local len = 0
-            pcall(function() len = #items end)
-            if len <= 0 then return end
-
-            local mult = cfg.harvestMultiplier
-            local saved = nil
-            for i = 1, len do
-                pcall(function()
-                    local entry = items[i]
-                    -- 仅放大 ELootType::Item (0) 且属于肩扛搬运物的条目，其余普通物品保持原版 1 倍爆出
-                    if entry and entry.Type == 0 then
+                local entry = items[i]
+                -- 仅统计 ELootType::Item (0) 且符合当前触发阶段（SpawnType）的肩扛搬运物条目，其余普通物品保持原版 1 倍爆出
+                if entry and entry.Type == 0 then
+                    local st = entry.SpawnType
+                    if expectedSpawnType == nil or st == nil or st == expectedSpawnType then
                         local baseCnt = entry.Count or 0
                         if baseCnt > 0 then
                             local rowName = ""
                             pcall(function() rowName = entry.ItemData.RowName:ToString() end)
                             if isHaulingRowName(rowName) then
-                                local target = math.min(12, math.max(baseCnt, math.floor(baseCnt * mult + 0.5)))
-                                if target ~= baseCnt then
-                                    if not saved then saved = {} end
-                                    table.insert(saved, { idx = i, orig = baseCnt })
-                                    entry.Count = target
-                                end
+                                totalOrig = totalOrig + baseCnt
+                                table.insert(haulingEntries, { idx = i, entry = entry, orig = baseCnt, rowName = rowName })
                             end
                         end
                     end
-                end)
-            end
-
-            if saved then
-                local addr = lc:GetAddress()
-                local stk = spawnLootRestoreStack[addr]
-                if not stk then
-                    stk = {}
-                    spawnLootRestoreStack[addr] = stk
                 end
-                table.insert(stk, saved)
-                harvestBoostHits = harvestBoostHits + 1
-            end
-        end)
-    end, function(selfParam)
-        pcall(function()
-            local lc = selfParam:get()
-            if not safeValid(lc) then return end
-            local addr = lc:GetAddress()
-            local stk = spawnLootRestoreStack[addr]
-            if not stk or #stk == 0 then return end
-            local saved = table.remove(stk)
-            if #stk == 0 then
-                spawnLootRestoreStack[addr] = nil
-            end
+            end)
+        end
 
-            local items = nil
-            pcall(function() items = lc.Items end)
-            if not items then return end
-            for _, rec in ipairs(saved) do
-                pcall(function()
-                    local entry = items[rec.idx]
-                    if entry then
-                        entry.Count = rec.orig
+        -- 按「单株倍率放大上限 12 根，且不削减原版固有数量」分配总预算（而非每条各自封顶 12），
+        -- 当原版单株 totalOrig < 12 时最高放大至 12；若原版单株本身已 >= 12 则保持原版数量不削减。
+        local saved = nil
+        if totalOrig > 0 and #haulingEntries > 0 then
+            local plantTarget = math.max(totalOrig, math.min(12, math.floor(totalOrig * mult + 0.5)))
+            local extraBudget = plantTarget - totalOrig
+            if extraBudget > 0 then
+                local allocs = {}
+                local usedExtra = 0
+                for k, rec in ipairs(haulingEntries) do
+                    local wantExtra = math.max(0, math.floor(rec.orig * mult + 0.5) - rec.orig)
+                    local share = math.min(wantExtra, math.floor(extraBudget * rec.orig / totalOrig))
+                    allocs[k] = { extra = share, want = wantExtra }
+                    usedExtra = usedExtra + share
+                end
+                -- 分配按比例取整后的剩余余数，确保整株总量严格贴合 plantTarget（<= 12）
+                local rem = extraBudget - usedExtra
+                for k = 1, #haulingEntries do
+                    if rem <= 0 then break end
+                    local a = allocs[k]
+                    local room = a.want - a.extra
+                    if room > 0 then
+                        local give = math.min(rem, room)
+                        a.extra = a.extra + give
+                        rem = rem - give
                     end
-                end)
+                end
+                for k, rec in ipairs(haulingEntries) do
+                    local extra = allocs[k].extra
+                    if extra > 0 then
+                        if not saved then saved = {} end
+                        table.insert(saved, { idx = rec.idx, orig = rec.orig })
+                        rec.entry.Count = rec.orig + extra
+                    end
+                end
             end
-        end)
+        end
+
+        if saved then
+            spawnLootRestoreMap[addr] = saved
+            harvestBoostHits = harvestBoostHits + 1
+            if harvestBoostHits <= 15 then
+                logInfo(string.format("搬运倍率生效(#%d): %s 原始=%d -> 放大后=%d (%dx)",
+                    harvestBoostHits, haulingEntries[1].rowName or "Hauling", totalOrig, math.max(totalOrig, math.min(12, math.floor(totalOrig * mult + 0.5))), mult))
+            end
+        end
     end)
+end
+
+--- 搬运物瞬时缩放 Post-Hook 共用实现：在最外层调用退出时立即还原原版 Count。
+local function restoreHaulingLootPost(selfParam)
+    pcall(function()
+        local lc = selfParam:get()
+        if not safeValid(lc) then return end
+        local addr = lc:GetAddress()
+        local depth = (spawnLootActiveDepth[addr] or 1) - 1
+        if depth > 0 then
+            spawnLootActiveDepth[addr] = depth
+            return
+        end
+        spawnLootActiveDepth[addr] = nil
+
+        local saved = spawnLootRestoreMap[addr]
+        spawnLootRestoreMap[addr] = nil
+        if not saved then return end
+
+        local items = nil
+        pcall(function() items = lc.Items end)
+        if not items then return end
+        for _, rec in ipairs(saved) do
+            pcall(function()
+                local entry = items[rec.idx]
+                if entry then
+                    entry.Count = rec.orig
+                end
+            end)
+        end
+    end)
+end
+
+pcall(function()
+    RegisterHook("/Script/Maine.LootComponent:SpawnLoot", function(selfParam, _looterParam, spawnTypeParam)
+        local st = nil
+        pcall(function() if spawnTypeParam then st = spawnTypeParam:get() end end)
+        scaleHaulingLootPre(selfParam, st, false)
+    end, restoreHaulingLootPost)
 end)
 
--- 四重防刷拦截钩子：实时登记玩家丢弃、快捷丢弃、投掷以及拆毁建筑/取消蓝图返还的地面物品（始终保持 1 倍）。
+pcall(function()
+    RegisterHook("/Script/Maine.LootComponent:OnDeath", function(selfParam)
+        -- ELootSpawnType::SpawnOnDeath == 2
+        scaleHaulingLootPre(selfParam, 2, false)
+    end, restoreHaulingLootPost)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.LootComponent:OnDamaged", function(selfParam, _dmgParam, _infoParam, _instParam, _causerParam, isKillingBlowParam)
+        local isKill = false
+        pcall(function()
+            if isKillingBlowParam then
+                local v = isKillingBlowParam:get()
+                isKill = (v == true or v == 1)
+            end
+        end)
+        -- ELootSpawnType::SpawnOnHit == 1；致命一击由紧随其后的 OnDeath 统一掉落，此处跳过
+        scaleHaulingLootPre(selfParam, 1, isKill)
+    end, restoreHaulingLootPost)
+end)
+
+-- 防刷拦截钩子组 A：实时登记玩家丢弃、快捷丢弃、投掷、脱手以及拆毁建筑/取消蓝图返还的地面物品（始终保持 1 倍）。
 pcall(function()
     RegisterHook("/Script/Maine.InventoryComponent:ServerDropItem", function(selfParam, itemParam, countParam)
         inExcludedDropDepth = inExcludedDropDepth + 1
@@ -809,6 +989,35 @@ pcall(function()
             local it = itemParam and itemParam:get() or nil
             local cnt = countParam and countParam:get() or 1
             recordExcludedDrop(it, "", owner, cnt, 400.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.EquipmentComponent:ServerDropItem", function(selfParam, itemParam, countParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local eq = selfParam:get()
+            local owner = safeValid(eq) and eq:GetOuter() or nil
+            local it = itemParam and itemParam:get() or nil
+            local cnt = countParam and countParam:get() or 1
+            recordExcludedDrop(it, "", owner, cnt, 400.0)
+        end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.EquipmentComponent:ServerDumpItem", function(selfParam, itemParam)
+        inExcludedDropDepth = inExcludedDropDepth + 1
+        pcall(function()
+            local eq = selfParam:get()
+            local owner = safeValid(eq) and eq:GetOuter() or nil
+            local it = itemParam and itemParam:get() or nil
+            recordExcludedDrop(it, "", owner, 1, 400.0)
         end)
     end, function()
         inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
@@ -834,10 +1043,28 @@ pcall(function()
         pcall(function()
             local player = selfParam:get()
             local obj = objParam and objParam:get() or nil
+            local it = nil
+            local rn = ""
             if safeValid(obj) then
                 excludedSpawnedActorAddrs[obj:GetAddress()] = true
+                pcall(function()
+                    if obj.GetItem then it = obj:GetItem() end
+                end)
+                if not safeValid(it) then
+                    pcall(function()
+                        if obj.ItemDataRowHandle and obj.ItemDataRowHandle.RowName then
+                            it = obj
+                        end
+                    end)
+                end
+                if safeValid(it) then
+                    pcall(function() rn = it.ItemDataRowHandle.RowName:ToString() end)
+                end
             end
-            recordExcludedDrop(nil, "", player, 1, 400.0)
+            -- 仅在能明确物品 RowName 时写入空间兜底事件，避免通配符 "" 误伤附近击杀昆虫爆出的材料
+            if safeValid(it) or (rn ~= "" and rn ~= "None") then
+                recordExcludedDrop(it, rn, player, 1, 400.0)
+            end
         end)
     end, function()
         inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
@@ -849,8 +1076,41 @@ pcall(function()
         inExcludedDropDepth = inExcludedDropDepth + 1
         pcall(function()
             local player = selfParam:get()
-            recordExcludedDrop(nil, "", player, 1, 600.0)
+            local weapon = nil
+            local wRow = ""
+            if safeValid(player) then
+                pcall(function()
+                    local eq = player.EquipmentComponent
+                    if safeValid(eq) then
+                        if eq.GetWeapon then weapon = eq:GetWeapon()
+                        elseif eq.GetItemInSlot then weapon = eq:GetItemInSlot(1) end
+                        if safeValid(weapon) then
+                            pcall(function() wRow = weapon.ItemDataRowHandle.RowName:ToString() end)
+                        end
+                    end
+                end)
+            end
+            -- 只登记实际被投掷武器的精确 RowName（严禁写通配符 ""，否则投掷长矛/石子击杀昆虫后 15 秒 6 米内的虫材料会被误拦！）
+            if safeValid(weapon) or (wRow ~= "" and wRow ~= "None") then
+                recordExcludedDrop(weapon, wRow, player, 1, 600.0)
+            end
         end)
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.HaulingComponent:ServerDropItem", function()
+        inExcludedDropDepth = inExcludedDropDepth + 1
+    end, function()
+        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    end)
+end)
+
+pcall(function()
+    RegisterHook("/Script/Maine.HaulingComponent:ServerDropAll", function()
+        inExcludedDropDepth = inExcludedDropDepth + 1
     end, function()
         inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
     end)
@@ -886,14 +1146,14 @@ pcall(function()
     end)
 end)
 
+-- 注意：Building:BlueprintDropItems 是蓝图脚本函数（UE4SS 注册为 script hook (N, N)），
+-- 绝不可传第二个 Post-Hook 回调（否则 UE4SS 既不会触发 Post 导致 inExcludedDropDepth 永久泄漏拉黑全图掉落，
+-- 还会反复报 Lua::Registry::get_function_ref / attempt to call a RemoteUnrealParam value 错误）！
 pcall(function()
     RegisterHook("/Script/Maine.Building:BlueprintDropItems", function(selfParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
         pcall(function()
             recordExcludedDrop(nil, "", selfParam:get(), 16, 600.0)
         end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
     end)
 end)
 
@@ -925,269 +1185,1123 @@ pcall(function()
     end)
 end)
 
---- 采集玩家当前背包内各物品 RowName 的总堆叠数量快照，用于前后对比计算入包增量。
-local function snapshotInventoryCounts(invComp)
-    local counts = {}
-    if not safeValid(invComp) then return counts end
+-- 精准标记天然植被直拾（ISM -> ASpawnedItem，bFromDamage == false），与砍伐/破坏爆出（bFromDamage == true）彻底区分
+pcall(function()
+    RegisterHook("/Script/Maine.SpawnedItem:NotifySwapped", function(selfParam, _fromKeyParam, fromDamageParam)
+        pcall(function()
+            local fromDmg = false
+            if fromDamageParam then
+                local v = fromDamageParam:get()
+                fromDmg = (v == true or v == 1)
+            end
+            if not fromDmg then
+                local actor = selfParam:get()
+                if safeValid(actor) then
+                    foliagePickupActorAddrs[actor:GetAddress()] = true
+                    local it = nil
+                    pcall(function() it = actor:GetItem() end)
+                    if safeValid(it) then
+                        foliagePickupItemAddrs[it:GetAddress()] = true
+                    end
+                end
+            end
+        end)
+    end)
+end)
+
+-- 防刷拦截钩子组 B：容器转移、堆叠合并、物品制作、卸下装备与内部创建 RPC 期间严格保持 1 倍，绝不误倍增。
+-- 关键注意：严禁把 /Script/Maine.InventoryComponent:ServerAddItem 加入此处！
+-- 经实机二进制验证，ASurvivalPlayerCharacter::TryPickupItem 常规拾取路径调用的就是 ServerAddItem(Item, true) -> 尾调用 AddItem(Item, true)，
+-- 其余 14 处 ServerAddItem 调用方要么传 bIsNewItem=false，要么已被下方 ServerTransfer*/ServerSwap* 拦截。
+local function hookNonHarvestDepth(funcPath)
+    pcall(function()
+        RegisterHook(funcPath, function()
+            inNonHarvestAddDepth = inNonHarvestAddDepth + 1
+        end, function()
+            inNonHarvestAddDepth = math.max(0, inNonHarvestAddDepth - 1)
+        end)
+    end)
+end
+
+for _, nonHarvestRpc in ipairs({
+    "/Script/Maine.InventoryComponent:ServerTransferItemTo",
+    "/Script/Maine.InventoryComponent:ServerTransferItemFrom",
+    "/Script/Maine.InventoryComponent:ServerTransferAllTo",
+    "/Script/Maine.InventoryComponent:ServerTransferAllFrom",
+    "/Script/Maine.InventoryComponent:ServerSwapItemSlots",
+    "/Script/Maine.InventoryComponent:ServerSwapItemSlotsBetweenInventories",
+    "/Script/Maine.InventoryComponent:ServerMergeItemStacks",
+    "/Script/Maine.InventoryComponent:ServerCraftRecipe",
+    "/Script/Maine.InventoryComponent:ServerCraftRecipeForInventory",
+    "/Script/Maine.InventoryComponent:ServerCraftRecipeDataForInventory",
+    "/Script/Maine.InventoryComponent:ServerCreateAndAddItem",
+    "/Script/Maine.SurvivalPlayerController:ServerCraftRecipeAtBuilding",
+    "/Script/Maine.SurvivalPlayerController:ServerCraftRecipeDataAtBuilding",
+    "/Script/Maine.EquipmentComponent:ServerUnequipItem",
+    "/Script/Maine.EquipmentComponent:ServerUnequipItemSlot",
+}) do
+    hookNonHarvestDepth(nonHarvestRpc)
+end
+
+--- 统计背包内指定 RowName 的当前总堆叠数量（单物品 O(N) 轻量计数）。
+local function countRowInInventory(invComp, targetRowName)
+    local total = 0
+    if not safeValid(invComp) or not targetRowName or targetRowName == "" then return 0 end
     pcall(function()
         local items = invComp.Items
-        local n = #items
-        for i = 1, n do
+        if not items then return end
+        for i = 1, #items do
             local it = items[i]
             if safeValid(it) then
-                local rn = it.ItemDataRowHandle.RowName:ToString()
-                if rn and rn ~= "None" then
-                    counts[rn] = (counts[rn] or 0) + (it.StackSize or 1)
+                local rn = ""
+                pcall(function() rn = it.ItemDataRowHandle.RowName:ToString() end)
+                if rn == targetRowName then
+                    total = total + (it.StackSize or 1)
                 end
             end
         end
     end)
-    return counts
+    return total
 end
 
---- 判定交互对象是否为地面 ASpawnedItem 实例。
+--- 判定对象是否为地面 ASpawnedItem 实例。
 local function isSpawnedItemObject(obj)
     if not safeValid(obj) then return false end
-    local okA, resA = pcall(function()
-        return obj.IsA and obj:IsA("/Script/Maine.SpawnedItem") == true
-    end)
-    if okA and resA then return true end
+    if isAOf(obj, "/Script/Maine.SpawnedItem", "SpawnedItem") then
+        return true
+    end
     local cname = ""
     pcall(function() cname = obj:GetClass():GetFName():ToString() end)
     return cname == "SpawnedItem" or cname:find("WorldItem", 1, true) ~= nil
 end
 
---- 判定交互对象是否为已死亡可搜刮的生物尸体（排除玩家角色、背包与建筑容器）。
-local function isDeadCreatureCorpse(obj)
-    if not safeValid(obj) then return false end
-    if isContainerOrBuildingObject(obj) then return false end
-    local isPlayer = false
-    pcall(function()
-        if obj.IsA and obj:IsA("/Script/Maine.SurvivalPlayerCharacter") then isPlayer = true end
-    end)
-    if isPlayer then return false end
-
-    local isCreature = false
-    pcall(function()
-        if obj.IsA and (obj:IsA("/Script/Maine.SurvivalCreature") or obj:IsA("/Script/Maine.SurvivalCharacter")) then
-            isCreature = true
-        end
-    end)
-    if not isCreature then
-        local cname = ""
-        pcall(function() cname = obj:GetClass():GetFName():ToString():lower() end)
-        if cname:find("creature") or cname:find("spider") or cname:find("ant") or cname:find("bug") or cname:find("weevil") or cname:find("aphid") or cname:find("grub") then
-            isCreature = true
-        end
+--- 安全获取组件所属玩家角色（优先 GetOwner，兜底 GetOuter）。
+local function getComponentOwnerPlayer(comp)
+    if not safeValid(comp) then return nil end
+    local owner = nil
+    pcall(function() if comp.GetOwner then owner = comp:GetOwner() end end)
+    if not safeValid(owner) then
+        pcall(function() owner = comp:GetOuter() end)
     end
-    if not isCreature then return false end
-
-    local dead = false
-    pcall(function()
-        local hc = obj.HealthComponent
-        if safeValid(hc) then
-            if (hc.IsDead and hc:IsDead() == true) or (hc.GetHealthState and hc:GetHealthState() == 2) then
-                dead = true
-            end
-        end
-    end)
-    return dead
+    if isSurvivalPlayerObject(owner) then
+        return owner
+    end
+    return nil
 end
 
--- 统一入包倍率 Hook（ADR-0005）：
---   - 破坏/击杀爆出到地上的普通可堆叠物品（橡果/植物/矿石/糖果/虫材）地上保持 1 倍，按 E 拾取进背包时按倍率放大；
---   - 按 E 搜刮死虫尸体直入背包时同样按倍率放大（仅乘 1 次）；
---   - 地面天然散落物（ISM 植被与 PreplacedDesign 预摆自然物）由 harvestAffectPickup 独立控制；
---   - 严格通过四重防刷拦截排除玩家丢弃物、投掷物、拆建返还物、容器拿取、不可堆叠装备与多件整堆。
-pcall(function()
-    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHandleInteract", function(selfParam)
-        if not (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
+--- 判断 ASpawnedItem.DroppedByActor / GetDroppedBySpawnedActor 是否来自玩家或建筑/容器（用于防刷拦截）。
+-- 关键二进制实证：野生昆虫（ASurvivalCreature）与采集点（AHarvestNode）通过 ULootComponent 掉落地面材料时，
+-- 引擎也会把 ASpawnedItem.DroppedByActor 设为死亡昆虫的 LODActor！因此严禁见非空就一刀切拦截，
+-- 只拦截「玩家角色」与「建筑/储物箱/战利品袋」丢出的物品，放行昆虫与野生采集点掉落物。
+local function isExcludedDropperObject(obj)
+    if not safeValid(obj) then return false end
+    if isSurvivalPlayerObject(obj) or isContainerOrBuildingObject(obj) then
+        return true
+    end
+    -- 若为 UBaseLODActor（例如 UCharacterLODActor / UBuildingLODActor），解包 FullActor 与硬/软类名二次核验
+    local fullActor = nil
+    pcall(function() fullActor = obj.FullActor end)
+    if not safeValid(fullActor) then
+        pcall(function() if obj.K2_GetFullActor then fullActor = obj:K2_GetFullActor() end end)
+    end
+    if safeValid(fullActor) then
+        if isSurvivalPlayerObject(fullActor) or isContainerOrBuildingObject(fullActor) then
+            return true
+        end
+        if isAOf(fullActor, "/Script/Maine.SurvivalCreature", "SurvivalCreature")
+            or isAOf(fullActor, "/Script/Maine.HarvestNode", "HarvestNode") then
+            return false
+        end
+    end
+    local clsHint = ""
+    pcall(function()
+        if obj.GetActorClassHard then
+            local hc = obj:GetActorClassHard()
+            if safeValid(hc) then clsHint = hc:GetFName():ToString():lower() end
+        end
+    end)
+    if clsHint == "" then
+        pcall(function()
+            if obj.GetActorClassSoft then
+                clsHint = ueStringToLua(obj:GetActorClassSoft()):lower()
+            end
+        end)
+    end
+    if clsHint ~= "" then
+        if clsHint:find("survivalplayer", 1, true) ~= nil
+            or clsHint:find("player_male", 1, true) ~= nil
+            or clsHint:find("player_female", 1, true) ~= nil
+            or clsHint:find("building", 1, true) ~= nil
+            or clsHint:find("lootbag", 1, true) ~= nil
+            or clsHint:find("storage", 1, true) ~= nil
+            or clsHint:find("chest", 1, true) ~= nil
+            or clsHint:find("backpack", 1, true) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+--- 检查指定地面 ASpawnedItem 是否命中玩家丢弃/投掷/箭矢/玩家放置防刷规则，并返回 (blocked, preplaced, actorAddr)。
+local function inspectSpawnedActorFlags(spawnedActor)
+    if not safeValid(spawnedActor) then return false, 0, nil end
+    local spawnedAddr = spawnedActor:GetAddress()
+    if excludedSpawnedActorAddrs[spawnedAddr] then
+        return true, 0, spawnedAddr
+    end
+    local blocked = false
+    local preplaced = 0
+    pcall(function()
+        local droppedBy = nil
+        local droppedBySpawned = nil
+        local attackOwner = nil
+        pcall(function() droppedBy = spawnedActor:GetDroppedBy() end)
+        pcall(function() droppedBySpawned = spawnedActor:GetDroppedBySpawnedActor() end)
+        pcall(function() attackOwner = spawnedActor.AttackOwner end)
+        if isExcludedDropperObject(droppedBy) or isExcludedDropperObject(droppedBySpawned) or safeValid(attackOwner) then
+            blocked = true
             return
         end
-        local player = selfParam:get()
-        if not safeValid(player) then return end
+        if spawnedActor.bWasThrown == true or spawnedActor.bWasThrown == 1
+            or spawnedActor.bIsThrown == true or spawnedActor.bIsThrown == 1 then
+            blocked = true
+            return
+        end
+        pcall(function() preplaced = spawnedActor.PreplacedType or 0 end)
+        if preplaced == 0 then
+            pcall(function()
+                if spawnedActor.GetPreplacedType then preplaced = spawnedActor:GetPreplacedType() or 0 end
+            end)
+        end
+        if preplaced == 1 then
+            -- EPreplacedType::PreplacedUser (1)：玩家手动放置物一律 1 倍
+            blocked = true
+        end
+    end)
+    return blocked, preplaced, spawnedAddr
+end
 
-        -- 房主权威校验（客机按 E 也会通过 RPC 在房主端执行此函数，全队统一生效）
-        local hasAuth = true
+--- 从地面 ASpawnedItem 抓取交互前快照（供 TryPickupItem 自动叠加装备分支在实体被销毁前溯源防刷与原始数量）。
+local function snapshotSpawnedTarget(targetObj)
+    local snap = {
+        rowName = "",
+        stackSize = 1,
+        blocked = false,
+        isNatural = false,
+        actorAddr = nil,
+        itemAddr = nil,
+    }
+    if not (safeValid(targetObj) and isSpawnedItemObject(targetObj)) then
+        return snap
+    end
+    local blocked, preplaced, actorAddr = inspectSpawnedActorFlags(targetObj)
+    snap.blocked = blocked
+    snap.actorAddr = actorAddr
+    snap.isNatural = (preplaced == 2 or preplaced == 3)
+        or (actorAddr ~= nil and foliagePickupActorAddrs[actorAddr] == true)
+    pcall(function()
+        local it = targetObj:GetItem()
+        if safeValid(it) then
+            local ia = it:GetAddress()
+            snap.itemAddr = ia
+            if excludedItemObjAddrs[ia] then
+                snap.blocked = true
+            end
+            if foliagePickupItemAddrs[ia] then
+                snap.isNatural = true
+            end
+            local rn = ""
+            pcall(function() rn = it.ItemDataRowHandle.RowName:ToString() end)
+            snap.rowName = rn or ""
+            snap.stackSize = math.max(1, tonumber(it.StackSize) or 1)
+        end
+    end)
+    return snap
+end
+
+--- 读取玩家当前主手装备的 UItem、RowName 与当前堆叠数（用于 TryPickupItem 分支 2 叠加到主手鹅卵石/箭矢时的倍增与客机兜底）。
+local function readEquippedMainWeapon(player)
+    if not safeValid(player) then return nil, "", 0 end
+    local weapon, rn, sz = nil, "", 0
+    pcall(function()
+        local eq = player.EquipmentComponent
+        if not safeValid(eq) then return end
+        if eq.GetWeapon then
+            weapon = eq:GetWeapon()
+        elseif eq.GetItemInSlot then
+            weapon = eq:GetItemInSlot(1)
+        end
+        if safeValid(weapon) then
+            pcall(function() rn = weapon.ItemDataRowHandle.RowName:ToString() end)
+            sz = tonumber(weapon.StackSize) or 1
+        end
+    end)
+    return weapon, rn or "", sz
+end
+
+--- 判定不可堆叠物品是否属于可倍增的「易腐昆虫生肉/食材」（CanSpoil=true 且不可装备、无耐久、非搬运物）。
+-- 武器/防具/工具/饰品/火把等单件装备一律返回 false，严禁复制。
+local function isPerishableNonEquipMaterial(item, rowName)
+    if not safeValid(item) or isHaulingRowName(rowName) then return false end
+    local canSpoil = false
+    pcall(function()
+        if item.CanSpoil then
+            local v = item:CanSpoil()
+            canSpoil = (v == true or v == 1)
+        end
+    end)
+    if not canSpoil then
         pcall(function()
-            if player.HasAuthority then hasAuth = (player:HasAuthority() == true) end
+            if item.GetTotalSpoilTime and (tonumber(item:GetTotalSpoilTime()) or 0) > 0 then
+                canSpoil = true
+            end
         end)
-        if not hasAuth then return end
+    end
+    if not canSpoil then return false end
 
-        local allowBoost = false
-        local expectedRow = nil
-        local maxDelta = 1
+    local canEquip = false
+    pcall(function()
+        if item.CanEquip then
+            local v = item:CanEquip()
+            canEquip = (v == true or v == 1)
+        end
+    end)
+    if canEquip then return false end
 
+    local eqSlot = 0
+    pcall(function()
+        if item.GetEquipmentSlot then eqSlot = tonumber(item:GetEquipmentSlot()) or 0 end
+    end)
+    if eqSlot ~= 0 then return false end
+
+    local hasDur = false
+    pcall(function()
+        if item.HasDurability then
+            local v = item:HasDurability()
+            hasDur = (v == true or v == 1)
+        end
+    end)
+    if hasDur then return false end
+
+    local isHaul = false
+    pcall(function()
+        if item.IsAHaulingItem then
+            local v = item:IsAHaulingItem()
+            isHaul = (v == true or v == 1)
+        end
+    end)
+    return not isHaul
+end
+
+--- 计算背包对指定 RowName 当前可额外容纳的总数量（已有未满堆叠余量 + 空槽 * maxStack），确保 Pre-Hook 加倍绝不撑爆背包槽数。
+local function computeInventoryAvailableSpace(inv, rowName, maxStack, canStack)
+    if not safeValid(inv) or not rowName or rowName == "" then return 0, 0 end
+    local allowAdd = true
+    pcall(function()
+        if inv.bAllowAddItems == false or inv.bAllowAddItems == 0 then
+            allowAdd = false
+        end
+    end)
+    if not allowAdd then return 0, 0 end
+
+    local emptySlots = 0
+    local okEmp, emp = pcall(function() return inv:GetEmptySlots() end)
+    if okEmp and type(emp) == "number" then
+        emptySlots = math.max(0, emp)
+    else
         pcall(function()
-            -- 读取玩家当前准星对准的真实交互对象（不再误读仅在持续界面交互时才非空的 CurrentInteractable）
-            local targetObj = unwrapInteractable(player.InteractableInRange)
-            if not safeValid(targetObj) then
-                targetObj = unwrapInteractable(player.InteractableInRangeOnClient)
-            end
-            if not safeValid(targetObj) then
-                targetObj = unwrapInteractable(player.TemporarilyDeinstancedInteractableInRange)
-            end
+            local maxSz = inv.MaxSize or 0
+            local curCnt = inv.Items and #inv.Items or 0
+            emptySlots = math.max(0, maxSz - curCnt)
+        end)
+    end
 
-            local isFoliage = hasValidFoliageKey(player.InteractableFoliageKeyInRange)
-                or hasValidFoliageKey(player.InteractableFoliageKeyInRangeOnClient)
-
-            if safeValid(targetObj) then
-                if isContainerOrBuildingObject(targetObj) then
-                    -- 储物箱、掉落背包、工作台与建筑容器一律不走倍率
-                    allowBoost = false
-                elseif isSpawnedItemObject(targetObj) then
-                    local actorAddr = targetObj:GetAddress()
-                    if excludedSpawnedActorAddrs[actorAddr] then
-                        return
-                    end
-                    -- 拦截原生丢弃者、投掷物与玩家放置物
-                    local droppedBy = nil
-                    local droppedBySpawned = nil
-                    pcall(function() droppedBy = targetObj:GetDroppedBy() end)
-                    pcall(function() droppedBySpawned = targetObj:GetDroppedBySpawnedActor() end)
-                    if safeValid(droppedBy) or safeValid(droppedBySpawned) then
-                        return
-                    end
-                    local wasThrown = (targetObj.bWasThrown == true or targetObj.bWasThrown == 1
-                        or targetObj.bIsThrown == true or targetObj.bIsThrown == 1)
-                    if wasThrown then
-                        return
-                    end
-
-                    local preplaced = 0
-                    pcall(function() preplaced = targetObj.PreplacedType or 0 end)
-                    if preplaced == 0 then
+    local mS = math.max(1, tonumber(maxStack) or 1)
+    local partialRoom = 0
+    if canStack and mS > 1 then
+        pcall(function()
+            local items = inv.Items
+            if not items then return end
+            for i = 1, #items do
+                local it = items[i]
+                if safeValid(it) then
+                    local itRn = ""
+                    pcall(function() itRn = it.ItemDataRowHandle.RowName:ToString() end)
+                    if itRn == rowName then
+                        local itCan = false
                         pcall(function()
-                            if targetObj.GetPreplacedType then preplaced = targetObj:GetPreplacedType() or 0 end
+                            local vCan = it:CanStack()
+                            itCan = (vCan == true or vCan == 1)
                         end)
-                    end
-                    if preplaced == 1 then
-                        -- EPreplacedType::PreplacedUser (1)：玩家放置物一律排除
-                        return
-                    end
-
-                    local itemObj = nil
-                    pcall(function() itemObj = targetObj:GetItem() end)
-                    if not safeValid(itemObj) then return end
-                    if excludedItemObjAddrs[itemObj:GetAddress()] then
-                        return
-                    end
-
-                    local canStack = false
-                    local maxStack = 1
-                    pcall(function() canStack = (itemObj:CanStack() == true) end)
-                    pcall(function() maxStack = itemObj:GetMaxStackSize() or 1 end)
-                    if (not canStack) or maxStack <= 1 then
-                        return
-                    end
-                    -- 仅对地上单件物品生效；多件整堆（如玩家整堆丢出或拆建返还堆）强制保持 1 倍
-                    if (itemObj.StackSize or 1) ~= 1 then
-                        return
-                    end
-
-                    local rn = ""
-                    pcall(function() rn = itemObj.ItemDataRowHandle.RowName:ToString() end)
-                    if rn == "" or rn == "None" or isHaulingRowName(rn) then
-                        return
-                    end
-                    if consumeMatchingExcludedDropEvent(rn, targetObj) then
-                        return
-                    end
-
-                    -- 区分「天然预摆自然物」(PreplacedDesign=2 / PreplacedDesignDynamic=3) 与「采集/击杀爆出物」(NotPreplaced=0)
-                    local isNaturalPreplaced = (preplaced == 2 or preplaced == 3)
-                    if isNaturalPreplaced then
-                        if cfg.harvestAffectPickup then
-                            allowBoost = true
-                            expectedRow = rn
-                            maxDelta = 1
+                        if itCan then
+                            local itMax = mS
+                            pcall(function() itMax = it:GetMaxStackSize() or mS end)
+                            local itCur = tonumber(it.StackSize) or 1
+                            if itMax > itCur then
+                                partialRoom = partialRoom + (itMax - itCur)
+                            end
                         end
-                    else
-                        allowBoost = true
-                        expectedRow = rn
-                        maxDelta = 1
                     end
-                elseif isDeadCreatureCorpse(targetObj) then
-                    -- 按 E 搜刮死虫子尸体直入背包：总开关开启即按倍率入包（仅此一处翻倍，绝不二次叠加）
-                    allowBoost = true
-                    expectedRow = nil
-                    maxDelta = 24
-                elseif isFoliage and cfg.harvestAffectPickup then
-                    -- 部分植被交互的 targetObj 可能是 FoliageDispenser/ISM 组件本身
-                    allowBoost = true
-                    expectedRow = nil
-                    maxDelta = 4
-                end
-            elseif isFoliage then
-                -- 纯 ISM 地面植被直拾（树枝、植物纤维、鹅卵石、小蘑菇、树液等）
-                if cfg.harvestAffectPickup then
-                    allowBoost = true
-                    expectedRow = nil
-                    maxDelta = 4
                 end
             end
         end)
+    end
 
-        if not allowBoost then return end
-        local inv = player.InventoryComponent
-        if not safeValid(inv) then return end
-        local pAddr = player:GetAddress()
-        interactSnapshot[pAddr] = {
-            inv = inv,
-            before = snapshotInventoryCounts(inv),
-            mult = cfg.harvestMultiplier,
-            expectedRow = expectedRow,
-            maxDelta = maxDelta,
-        }
-    end, function(selfParam)
-        local player = selfParam:get()
-        if not safeValid(player) then return end
-        local pAddr = player:GetAddress()
-        local snap = interactSnapshot[pAddr]
-        interactSnapshot[pAddr] = nil
-        if not snap or not safeValid(snap.inv) then return end
+    return partialRoom + emptySlots * mS, emptySlots
+end
 
-        local after = snapshotInventoryCounts(snap.inv)
-        local extraMult = (snap.mult or 1) - 1
-        if extraMult <= 0 then return end
+--- 标记某个 UItem 对象已刚完成倍率结算（短时间窗防 TryPickupItem 分支 4 AddItem->ServerEquipItem 二次倍增）。
+local function markItemRecentlyBoosted(itemAddr)
+    if not itemAddr then return end
+    local now = os.clock()
+    recentlyBoostedItemAddrs[itemAddr] = now
+    -- 轻量惰性清理，避免长局内存增长
+    local count = 0
+    for k, ts in pairs(recentlyBoostedItemAddrs) do
+        count = count + 1
+        if (now - ts) > 3.0 then
+            recentlyBoostedItemAddrs[k] = nil
+        end
+    end
+    if count > 256 then
+        recentlyBoostedItemAddrs = { [itemAddr] = now }
+    end
+end
 
-        local boostedAny = false
-        for rn, newTotal in pairs(after) do
-            if (not snap.expectedRow) or rn == snap.expectedRow then
-                local oldTotal = snap.before[rn] or 0
-                local delta = newTotal - oldTotal
-                if delta > 0 and delta <= (snap.maxDelta or 1) and not isHaulingRowName(rn) then
-                    local addAmount = delta * extraMult
-                    pcall(function()
-                        local items = snap.inv.Items
-                        for i = 1, #items do
-                            local it = items[i]
-                            if safeValid(it) and it.ItemDataRowHandle.RowName:ToString() == rn then
-                                local canStack = false
-                                pcall(function() canStack = (it:CanStack() == true) end)
-                                if canStack then
-                                    local maxS = it:GetMaxStackSize()
-                                    local curS = it.StackSize or 1
-                                    if maxS and maxS > 1 then
-                                        local room = math.max(0, maxS - curS)
-                                        local give = math.min(addAmount, room)
-                                        if give > 0 then
-                                            it:AdjustStackSize(give)
-                                            addAmount = addAmount - give
-                                            boostedAny = true
-                                        end
-                                        if addAmount <= 0 then break end
-                                    end
+local function wasItemRecentlyBoosted(itemAddr)
+    if not itemAddr then return false end
+    local ts = recentlyBoostedItemAddrs[itemAddr]
+    if not ts then return false end
+    if (os.clock() - ts) <= 1.0 then
+        return true
+    end
+    recentlyBoostedItemAddrs[itemAddr] = nil
+    return false
+end
+
+--- 统一为刚入包或刚装备的可堆叠物品（或经校验的易腐昆虫生肉）补发额外倍率数量（先补主目标 UItem，再补背包已有堆叠，超堆叠自动溢出到空闲槽位）。
+local function applyExtraStackAndOverflow(owner, inv, primaryItem, rowName, extraCount, maxStack, pathTag, allowSingleCopyOverflow, itemDataTable)
+    local remaining = tonumber(extraCount) or 0
+    if remaining <= 0 or not rowName or rowName == "" then return false end
+    local boostedAny = false
+    local mStack = math.max(1, tonumber(maxStack) or 1)
+
+    -- 阶段 1：优先把新增数量叠加到本次刚入包/刚装备的主目标 UItem 本身（确保鹅卵石/箭矢等主手装备与新格优先拿到整组）
+    local primaryAddr = nil
+    if safeValid(primaryItem) and mStack > 1 then
+        pcall(function()
+            primaryAddr = primaryItem:GetAddress()
+            local canS = false
+            local vCan = primaryItem:CanStack()
+            canS = (vCan == true or vCan == 1)
+            if canS then
+                local mS = mStack
+                pcall(function() mS = primaryItem:GetMaxStackSize() or mStack end)
+                local curS = tonumber(primaryItem.StackSize) or 1
+                if mS > 1 then
+                    local room = math.max(0, mS - curS)
+                    local give = math.min(remaining, room)
+                    if give > 0 then
+                        primaryItem:AdjustStackSize(give)
+                        remaining = remaining - give
+                        boostedAny = true
+                    end
+                end
+            end
+        end)
+    end
+
+    -- 阶段 2：补满背包内同种已有堆叠
+    if remaining > 0 and mStack > 1 and safeValid(inv) then
+        pcall(function()
+            local items = inv.Items
+            if not items then return end
+            for i = 1, #items do
+                if remaining <= 0 then break end
+                local it = items[i]
+                if safeValid(it) and (primaryAddr == nil or it:GetAddress() ~= primaryAddr) then
+                    local itRn = ""
+                    pcall(function() itRn = it.ItemDataRowHandle.RowName:ToString() end)
+                    if itRn == rowName then
+                        local canS = false
+                        pcall(function()
+                            local vCan = it:CanStack()
+                            canS = (vCan == true or vCan == 1)
+                        end)
+                        if canS then
+                            local mS = mStack
+                            pcall(function() mS = it:GetMaxStackSize() or mStack end)
+                            local curS = tonumber(it.StackSize) or 1
+                            if mS > 1 then
+                                local room = math.max(0, mS - curS)
+                                local give = math.min(remaining, room)
+                                if give > 0 then
+                                    it:AdjustStackSize(give)
+                                    remaining = remaining - give
+                                    boostedAny = true
                                 end
                             end
                         end
-                    end)
+                    end
+                end
+            end
+        end)
+    end
+
+    -- 阶段 3：若当前堆叠已满且仍有溢出数量（或为易腐昆虫生肉补发单份副本），自动按空闲背包格补发（绝不强行塞爆）
+    if remaining > 0 and (mStack > 1 or allowSingleCopyOverflow == true) and safeValid(inv) then
+        local emptySlots = 0
+        local okEmp, emp = pcall(function() return inv:GetEmptySlots() end)
+        if okEmp and type(emp) == "number" then
+            emptySlots = emp
+        else
+            pcall(function()
+                local maxSz = inv.MaxSize or 0
+                local curCnt = inv.Items and #inv.Items or 0
+                emptySlots = math.max(0, maxSz - curCnt)
+            end)
+        end
+
+        if emptySlots > 0 and inv.ServerCreateAndAddItem then
+            local itemsTable = safeValid(itemDataTable) and itemDataTable or ensureAllItemsTable()
+            local maxIter = (allowSingleCopyOverflow == true and mStack <= 1) and 8 or 32
+            local guardIter = 0
+            while remaining > 0 and emptySlots > 0 and guardIter < maxIter do
+                guardIter = guardIter + 1
+                local chunk = math.min(remaining, mStack)
+                inModExtraAddDepth = inModExtraAddDepth + 1
+                local okCreate = pcall(function()
+                    inv:ServerCreateAndAddItem({ DataTable = itemsTable, RowName = FName(rowName) }, chunk)
+                end)
+                inModExtraAddDepth = math.max(0, inModExtraAddDepth - 1)
+                if okCreate then
+                    remaining = remaining - chunk
+                    emptySlots = emptySlots - 1
+                    boostedAny = true
+                else
+                    break
                 end
             end
         end
-        if boostedAny then
-            harvestBoostHits = harvestBoostHits + 1
+    end
+
+    if boostedAny then
+        harvestBoostHits = harvestBoostHits + 1
+        if safeValid(owner) then
+            local ctx = interactContextByPlayer[owner:GetAddress()]
+            if ctx then ctx.boostedDuringInteract = true end
         end
+        if harvestBoostHits <= 15 then
+            logInfo(string.format("采集入包倍率生效(#%d): %s +%d (路径=%s, 倍率=%dx)",
+                harvestBoostHits, rowName, (tonumber(extraCount) or 0) - remaining, tostring(pathTag or "AddItem"), cfg.harvestMultiplier))
+        end
+    end
+    return boostedAny
+end
+
+--- 评估某次新物品拾取/装备是否满足采集倍率资格与四重防刷规则；符合条件返回请求元数据，否则返回 nil。
+local function evaluatePickupItemForBoost(owner, item)
+    if not safeValid(owner) or not safeValid(item) then return nil end
+
+    local hasAuth = true
+    pcall(function()
+        if owner.HasAuthority then hasAuth = (owner:HasAuthority() == true) end
+    end)
+    if not hasAuth then return nil end
+
+    local itemAddr = item:GetAddress()
+    if excludedItemObjAddrs[itemAddr] or wasItemRecentlyBoosted(itemAddr) then
+        return nil
+    end
+
+    local rn = ""
+    local itemDataTable = nil
+    pcall(function()
+        local h = item.ItemDataRowHandle
+        if h then
+            if h.RowName then rn = h.RowName:ToString() end
+            if h.DataTable and safeValid(h.DataTable) then itemDataTable = h.DataTable end
+        end
+    end)
+    if rn == "" or rn == "None" or isHaulingRowName(rn) then
+        return nil
+    end
+
+    local canStack = false
+    local maxStack = 1
+    pcall(function()
+        local vCan = item:CanStack()
+        canStack = (vCan == true or vCan == 1)
+    end)
+    pcall(function() maxStack = item:GetMaxStackSize() or 1 end)
+
+    local isPerishableSingle = false
+    if (not canStack) or maxStack <= 1 then
+        if isPerishableNonEquipMaterial(item, rn) then
+            isPerishableSingle = true
+            canStack = false
+            maxStack = 1
+        else
+            return nil
+        end
+    end
+
+    -- 溯源地面 ASpawnedItem（依次检查 ItemVisuals.FullActor、item:GetOuter()，仅在目标确属该物品时兜底近期交互目标）
+    local ownerAddr = owner:GetAddress()
+    local spawnedActor = nil
+    pcall(function()
+        local visLod = unwrapWeakObject(item.ItemVisuals)
+        if safeValid(visLod) then
+            local fa = nil
+            pcall(function() fa = visLod.FullActor end)
+            if not safeValid(fa) then
+                pcall(function() if visLod.K2_GetFullActor then fa = visLod:K2_GetFullActor() end end)
+            end
+            if safeValid(fa) and isSpawnedItemObject(fa) then
+                spawnedActor = fa
+            end
+        end
+    end)
+    if not safeValid(spawnedActor) then
+        pcall(function()
+            local itemOuter = item:GetOuter()
+            if safeValid(itemOuter) and isSpawnedItemObject(itemOuter) then
+                spawnedActor = itemOuter
+            end
+        end)
+    end
+    local ctx = interactContextByPlayer[ownerAddr]
+    local ctxFresh = (ctx ~= nil and (os.clock() - ctx.clock) <= 0.75)
+    if (not safeValid(spawnedActor)) and ctxFresh then
+        -- 防止摸死虫尸体（ULootComponent 新建 UItem）误套用 0.75 秒内残留的旧 ASpawnedItem（例如插在虫身上的投掷长矛/箭矢）
+        if safeValid(ctx.target) and isSpawnedItemObject(ctx.target) then
+            local targetMatchesItem = false
+            pcall(function()
+                local tIt = ctx.target.GetItem and ctx.target:GetItem() or nil
+                if safeValid(tIt) and tIt:GetAddress() == itemAddr then
+                    targetMatchesItem = true
+                end
+            end)
+            if (not targetMatchesItem) and ctx.targetSnap then
+                if ctx.targetSnap.itemAddr == itemAddr
+                    or (ctx.targetSnap.rowName ~= "" and ctx.targetSnap.rowName == rn) then
+                    targetMatchesItem = true
+                end
+            end
+            if targetMatchesItem then
+                spawnedActor = ctx.target
+            end
+        end
+    end
+
+    -- 四重防刷校验：拦截玩家丢弃物、投掷物、射出的箭矢(AttackOwner)、玩家放置物(PreplacedUser=1)与拆建返还物
+    local preplaced = 0
+    local spawnedAddr = nil
+    if safeValid(spawnedActor) then
+        local blocked
+        blocked, preplaced, spawnedAddr = inspectSpawnedActorFlags(spawnedActor)
+        if blocked then return nil end
+        if consumeMatchingExcludedDropEvent(rn, spawnedActor) then
+            return nil
+        end
+    elseif ctxFresh and ctx.targetSnap and ctx.targetSnap.rowName == rn and ctx.targetSnap.blocked then
+        return nil
+    end
+
+    -- 区分「天然散落物直拾」(ISM 非破坏替换 / PreplacedDesign / 植被交互) 与「采集/击杀掉落及摸尸」
+    local isNaturalDirectPickup = (preplaced == 2 or preplaced == 3)
+        or (spawnedAddr ~= nil and foliagePickupActorAddrs[spawnedAddr] == true)
+        or (foliagePickupItemAddrs[itemAddr] == true)
+    if (not isNaturalDirectPickup) and ctxFresh then
+        if (not safeValid(spawnedActor)) and ctx.isFoliage then
+            isNaturalDirectPickup = true
+        elseif ctx.targetSnap and ctx.targetSnap.rowName == rn and ctx.targetSnap.isNatural then
+            isNaturalDirectPickup = true
+        end
+    end
+    if isNaturalDirectPickup and not cfg.harvestAffectPickup then
+        return nil
+    end
+
+    return {
+        owner = owner,
+        item = item,
+        itemAddr = itemAddr,
+        spawnedAddr = spawnedAddr,
+        rowName = rn,
+        itemDataTable = itemDataTable,
+        canStack = canStack,
+        isPerishableSingle = isPerishableSingle,
+        maxStack = maxStack,
+        mult = cfg.harvestMultiplier,
+        origStack = math.max(1, tonumber(item.StackSize) or 1),
+    }
+end
+
+--- 轻量记录玩家交互上下文（在按 E / 长按交互容器、烤肉架、晾干架、掉落背包期间拉高 inNonHarvestAddDepth 防刷，同时快照地面目标与主手装备）。
+local function enterInteractContext(player, explicitTarget, forceContainer, forceFoliage)
+    if not safeValid(player) then return end
+    local pAddr = player:GetAddress()
+    local targetObj = explicitTarget
+    local isFoliage = (forceFoliage == true)
+    local isCont = (forceContainer == true)
+    pcall(function()
+        if not safeValid(targetObj) then
+            targetObj = unwrapInteractable(player.InteractableInRange)
+        end
+        if not safeValid(targetObj) then
+            targetObj = unwrapInteractable(player.InteractableInRangeOnClient)
+        end
+        if not safeValid(targetObj) then
+            targetObj = unwrapInteractable(player.TemporarilyDeinstancedInteractableInRange)
+        end
+        if not isFoliage then
+            isFoliage = hasValidFoliageKey(player.InteractableFoliageKeyInRange)
+                or hasValidFoliageKey(player.InteractableFoliageKeyInRangeOnClient)
+        end
+        if (not isCont) and safeValid(targetObj) then
+            isCont = isContainerOrBuildingObject(targetObj)
+        end
+    end)
+    if isCont then
+        inNonHarvestAddDepth = inNonHarvestAddDepth + 1
+    end
+    local targetSnap = snapshotSpawnedTarget(targetObj)
+    local eqWeapon, eqRow, eqStack = readEquippedMainWeapon(player)
+    local prev = interactContextByPlayer[pAddr]
+    local prevStack = (prev and prev.depthStack) or {}
+    table.insert(prevStack, isCont)
+    interactContextByPlayer[pAddr] = {
+        target = targetObj,
+        targetSnap = targetSnap,
+        isContainer = isCont,
+        isFoliage = isFoliage,
+        equipWeapon = eqWeapon,
+        equipWeaponRow = eqRow,
+        equipWeaponBefore = eqStack,
+        boostedDuringInteract = false,
+        depthStack = prevStack,
+        clock = os.clock(),
+    }
+end
+
+local function leaveInteractContext(player)
+    if not safeValid(player) then return end
+    local pAddr = player:GetAddress()
+    local ctx = interactContextByPlayer[pAddr]
+    if ctx then
+        local wasBlocked = false
+        if ctx.depthStack and #ctx.depthStack > 0 then
+            wasBlocked = (table.remove(ctx.depthStack) == true)
+            if wasBlocked then
+                inNonHarvestAddDepth = math.max(0, inNonHarvestAddDepth - 1)
+            end
+        end
+
+        -- 联机客机兜底（TryPickupItem 分支 2：客机玩家手持鹅卵石/箭矢再按 E 拾取同类物品时，ClientOnItemAdded 为发往客机的 Client RPC，
+        -- 在房主端不触发本地 Native Hook，此处直接比对主手装备实际堆叠增量并在房主端补足倍率，同时防重复触发）
+        if (not wasBlocked) and (not ctx.boostedDuringInteract) and inNonHarvestAddDepth == 0 and inModExtraAddDepth == 0
+            and cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1
+            and ctx.equipWeaponRow and ctx.equipWeaponRow ~= "" then
+            pcall(function()
+                local hasAuth = true
+                if player.HasAuthority then hasAuth = (player:HasAuthority() == true) end
+                if not hasAuth then return end
+                local curWeapon, curRow, curStack = readEquippedMainWeapon(player)
+                if safeValid(curWeapon) and curRow == ctx.equipWeaponRow and curStack > (ctx.equipWeaponBefore or 0) then
+                    local delta = curStack - (ctx.equipWeaponBefore or 0)
+                    local snap = ctx.targetSnap
+                    if snap and snap.rowName == curRow and snap.blocked then return end
+                    if consumeMatchingExcludedDropEvent(curRow, player) then return end
+                    local isNat = ctx.isFoliage or (snap and snap.rowName == curRow and snap.isNatural)
+                    if isNat and not cfg.harvestAffectPickup then return end
+                    local canS = false
+                    local vCan = curWeapon:CanStack()
+                    canS = (vCan == true or vCan == 1)
+                    local maxS = curWeapon:GetMaxStackSize() or 1
+                    if canS and maxS > 1 then
+                        local extra = delta * (cfg.harvestMultiplier - 1)
+                        applyExtraStackAndOverflow(player, player.InventoryComponent, curWeapon, curRow, extra, maxS, "InteractEquipFallback")
+                    end
+                end
+            end)
+        end
+
+        -- 保留极短时间窗（0.75s）内的植被直拾标记供延迟动画入包判定，容器标记不跨调用残留
+        ctx.isContainer = false
+    end
+end
+
+-- 触碰自动拾取上下文快照（如踩过地上箭矢/鹅卵石触发 ASpawnedItem:HandleTouch）
+pcall(function()
+    RegisterHook("/Script/Maine.SpawnedItem:HandleTouch", function(selfParam, actorParam)
+        pcall(function()
+            local si = selfParam:get()
+            local actor = actorParam and actorParam:get() or nil
+            if not safeValid(si) or not isSurvivalPlayerObject(actor) then return end
+            local pAddr = actor:GetAddress()
+            local prev = interactContextByPlayer[pAddr]
+            local snap = snapshotSpawnedTarget(si)
+            local eqWeapon, eqRow, eqStack = readEquippedMainWeapon(actor)
+            interactContextByPlayer[pAddr] = {
+                target = si,
+                targetSnap = snap,
+                isContainer = false,
+                isFoliage = snap.isNatural,
+                equipWeapon = eqWeapon,
+                equipWeaponRow = eqRow,
+                equipWeaponBefore = eqStack,
+                boostedDuringInteract = false,
+                depthStack = (prev and prev.depthStack) or {},
+                clock = os.clock(),
+            }
+        end)
+    end)
+end)
+
+-- 按实机 SDK（Maine.hpp）精确挂接短按交互与全部长按交互入口（Actor / Building / Foliage 三分入口）：
+pcall(function()
+    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHandleInteract", function(selfParam)
+        enterInteractContext(selfParam:get(), nil, false, false)
+    end, function(selfParam)
+        leaveInteractContext(selfParam:get())
+    end)
+end)
+
+for _, actorHoldPath in ipairs({
+    "/Script/Maine.SurvivalPlayerCharacter:ServerHandleHoldInteractActor",
+    "/Script/Maine.SurvivalPlayerCharacter:ServerEndHoldInteractActor",
+}) do
+    pcall(function()
+        RegisterHook(actorHoldPath, function(selfParam, targetParam)
+            local tObj = nil
+            pcall(function() tObj = targetParam and targetParam:get() or nil end)
+            enterInteractContext(selfParam:get(), unwrapInteractable(tObj), false, false)
+        end, function(selfParam)
+            leaveInteractContext(selfParam:get())
+        end)
+    end)
+end
+
+pcall(function()
+    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHoldInteractSecondaryActor", function(selfParam, _chanParam, targetParam)
+        local tObj = nil
+        pcall(function() tObj = targetParam and targetParam:get() or nil end)
+        enterInteractContext(selfParam:get(), unwrapInteractable(tObj), false, false)
+    end, function(selfParam)
+        leaveInteractContext(selfParam:get())
+    end)
+end)
+
+for _, bldHoldPath in ipairs({
+    "/Script/Maine.SurvivalPlayerCharacter:ServerHandleHoldInteractBuilding",
+    "/Script/Maine.SurvivalPlayerCharacter:ServerHoldInteractSecondaryBuilding",
+    "/Script/Maine.SurvivalPlayerCharacter:ServerEndHoldInteractBuilding",
+}) do
+    pcall(function()
+        RegisterHook(bldHoldPath, function(selfParam)
+            enterInteractContext(selfParam:get(), nil, true, false)
+        end, function(selfParam)
+            leaveInteractContext(selfParam:get())
+        end)
+    end)
+end
+
+for _, folHoldPath in ipairs({
+    "/Script/Maine.SurvivalPlayerCharacter:ServerHandleHoldInteractFoliage",
+    "/Script/Maine.SurvivalPlayerCharacter:ServerHoldInteractSecondaryFoliage",
+    "/Script/Maine.SurvivalPlayerCharacter:ServerEndHoldInteractFoliage",
+}) do
+    pcall(function()
+        RegisterHook(folHoldPath, function(selfParam)
+            enterInteractContext(selfParam:get(), nil, false, true)
+        end, function(selfParam)
+            leaveInteractContext(selfParam:get())
+        end)
+    end)
+end
+
+-- 统一全路径入包与自动装备倍率 Hook（ADR-0005 实机二进制全覆盖版）：
+--   1. /Script/Maine.InventoryComponent:AddItem：覆盖 TryPickupItem 分支 4（经 ServerAddItem 尾调用 AddItem）与 ULootComponent 摸尸直入背包；
+--   2. /Script/Maine.EquipmentComponent:ServerEquipItem（bCheckInventory=false）：覆盖 TryPickupItem 分支 1/3 空手自动装备鹅卵石/箭矢；
+--   3. /Script/Maine.InventoryComponent:ClientOnItemAdded（inAddItemDepth==0）：覆盖 TryPickupItem 分支 2 手持鹅卵石/箭矢时继续拾取直接叠加主手。
+pcall(function()
+    RegisterHook("/Script/Maine.InventoryComponent:AddItem", function(selfParam, itemParam, isNewParam)
+        inAddItemDepth = inAddItemDepth + 1
+        if not (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
+            return
+        end
+        if inNonHarvestAddDepth > 0 or inModExtraAddDepth > 0 then
+            return
+        end
+
+        local isNew = false
+        if isNewParam then
+            local v = isNewParam:get()
+            isNew = (v == true or v == 1)
+        end
+        if not isNew then return end
+
+        local inv = selfParam:get()
+        local item = itemParam and itemParam:get() or nil
+        if not safeValid(inv) or not safeValid(item) then return end
+
+        local owner = getComponentOwnerPlayer(inv)
+        if not owner then return end
+
+        local eval = evaluatePickupItemForBoost(owner, item)
+        if not eval then return end
+
+        eval.beforeCount = countRowInInventory(inv, eval.rowName)
+        eval.preAdded = 0
+        eval.totalExtra = eval.origStack * math.max(0, (eval.mult or 1) - 1)
+
+        -- 关键修复（首次采集即走倍率 + 原生 HUD 同步显示正确总数）：
+        -- 原版 UInventoryComponent::AddItem 会先读取 item->StackSize、执行 AddItemInternal，
+        -- 再在函数末尾触发 OnItemAdded 与 ClientOnItemAdded(TotalCount) 后才回到 Post-Hook。
+        -- 在 Pre-Hook 核验背包安全余量后直接抬升 item.StackSize，确保首次采集入包、背包显示与左下角 HUD 播报 100% 同步走倍率！
+        if eval.canStack and eval.maxStack > 1 and eval.totalExtra > 0 then
+            local availSpace = computeInventoryAvailableSpace(inv, eval.rowName, eval.maxStack, true)
+            if availSpace > 0 then
+                local itemRoom = math.max(0, eval.maxStack - eval.origStack)
+                local invExtraRoom = math.max(0, availSpace - eval.origStack)
+                local preWant = math.min(eval.totalExtra, itemRoom, invExtraRoom)
+                if preWant > 0 then
+                    local beforeSz = tonumber(item.StackSize) or eval.origStack
+                    pcall(function() item:AdjustStackSize(preWant) end)
+                    local afterSz = tonumber(item.StackSize) or beforeSz
+                    eval.preAdded = math.max(0, afterSz - beforeSz)
+                end
+            end
+        end
+
+        local invAddr = inv:GetAddress()
+        local stk = pendingAddItemBoosts[invAddr]
+        if not stk then
+            stk = {}
+            pendingAddItemBoosts[invAddr] = stk
+        end
+        table.insert(stk, eval)
+    end, function(selfParam)
+        inAddItemDepth = math.max(0, inAddItemDepth - 1)
+        local inv = selfParam:get()
+        if not safeValid(inv) then return end
+        local invAddr = inv:GetAddress()
+        local stk = pendingAddItemBoosts[invAddr]
+        if not stk or #stk == 0 then return end
+        local req = table.remove(stk)
+        if #stk == 0 then
+            pendingAddItemBoosts[invAddr] = nil
+        end
+        if not req then return end
+
+        if req.itemAddr then foliagePickupItemAddrs[req.itemAddr] = nil end
+        if req.spawnedAddr then foliagePickupActorAddrs[req.spawnedAddr] = nil end
+
+        local extraMult = (req.mult or 1) - 1
+        if extraMult <= 0 then return end
+
+        -- 用前后精确增量确认物品确实入包；若背包已满被引擎拒绝（actualAdded <= 0），立刻回滚 Pre-Hook 预加量绝不污染地面物品
+        local afterCount = countRowInInventory(inv, req.rowName)
+        local actualAdded = afterCount - (req.beforeCount or 0)
+        if actualAdded <= 0 then
+            if (req.preAdded or 0) > 0 and safeValid(req.item) then
+                pcall(function() req.item:AdjustStackSize(-req.preAdded) end)
+            end
+            return
+        end
+
+        -- 计算除 Pre-Hook 已随原版 AddItem 一起入包的增量外，是否还有超堆叠/易腐生肉副本需要 Post-Hook 补发
+        local preAdded = req.preAdded or 0
+        local baseAdded = math.max(0, actualAdded - preAdded)
+        if preAdded > 0 then
+            -- 若原版 AddItem 实际接纳量小于 origStack + preAdded（例如背包仅剩部分空间），以实际已入包 preAdded 计次
+            harvestBoostHits = harvestBoostHits + 1
+            markItemRecentlyBoosted(req.itemAddr)
+            if safeValid(req.owner) then
+                local ctx = interactContextByPlayer[req.owner:GetAddress()]
+                if ctx then ctx.boostedDuringInteract = true end
+            end
+            if harvestBoostHits <= 15 then
+                logInfo(string.format("采集入包倍率生效(#%d): %s +%d (路径=AddItem-Pre, 倍率=%dx)",
+                    harvestBoostHits, req.rowName, preAdded, cfg.harvestMultiplier))
+            end
+        end
+
+        local wantTotalExtra = (baseAdded > 0 and (baseAdded * extraMult)) or (req.totalExtra or 0)
+        local remainingExtra = math.max(0, wantTotalExtra - preAdded)
+        if remainingExtra <= 0 then return end
+
+        -- 若刚入包的 UItem 仍在背包列表中，将其作为首选目标，确保紧随其后的自动装备拿到整组
+        local primaryInInv = nil
+        pcall(function()
+            local items = inv.Items
+            if items and req.itemAddr then
+                for i = 1, #items do
+                    local it = items[i]
+                    if safeValid(it) and it:GetAddress() == req.itemAddr then
+                        primaryInInv = it
+                        break
+                    end
+                end
+            end
+        end)
+
+        local boostedOverflow = applyExtraStackAndOverflow(
+            req.owner, inv, primaryInInv, req.rowName, remainingExtra, req.maxStack,
+            req.isPerishableSingle and "AddItem-PerishableMeat" or (preAdded > 0 and "AddItem-Overflow" or "AddItem"),
+            req.isPerishableSingle == true, req.itemDataTable)
+        if boostedOverflow then
+            markItemRecentlyBoosted(req.itemAddr)
+        end
+    end)
+end)
+
+-- 路径 2：TryPickupItem 分支 1/3 空手自动装备可堆叠物（如空手捡鹅卵石/箭矢直接走 ServerEquipItem(Item, false) 绕过 AddItem）
+pcall(function()
+    RegisterHook("/Script/Maine.EquipmentComponent:ServerEquipItem", function(selfParam, itemParam, checkInvParam)
+        if not (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
+            return
+        end
+        if inNonHarvestAddDepth > 0 or inModExtraAddDepth > 0 or inAddItemDepth > 0 then
+            return
+        end
+        -- bCheckInventory=true 表示从背包/快捷栏切换装备，严禁倍增；仅地面直拾自动装备时 TryPickupItem 传入 false
+        local checkInv = true
+        if checkInvParam then
+            local v = checkInvParam:get()
+            checkInv = (v == true or v == 1)
+        end
+        if checkInv then return end
+
+        local eq = selfParam:get()
+        local item = itemParam and itemParam:get() or nil
+        if not safeValid(eq) or not safeValid(item) then return end
+
+        local owner = getComponentOwnerPlayer(eq)
+        if not owner then return end
+
+        local eval = evaluatePickupItemForBoost(owner, item)
+        if not eval or eval.isPerishableSingle then return end
+
+        local eqAddr = eq:GetAddress()
+        local stk = pendingEquipBoosts[eqAddr]
+        if not stk then
+            stk = {}
+            pendingEquipBoosts[eqAddr] = stk
+        end
+        table.insert(stk, eval)
+    end, function(selfParam)
+        local eq = selfParam:get()
+        if not safeValid(eq) then return end
+        local eqAddr = eq:GetAddress()
+        local stk = pendingEquipBoosts[eqAddr]
+        if not stk or #stk == 0 then return end
+        local req = table.remove(stk)
+        if #stk == 0 then
+            pendingEquipBoosts[eqAddr] = nil
+        end
+        if not req then return end
+
+        if req.itemAddr then foliagePickupItemAddrs[req.itemAddr] = nil end
+        if req.spawnedAddr then foliagePickupActorAddrs[req.spawnedAddr] = nil end
+        if wasItemRecentlyBoosted(req.itemAddr) then return end
+
+        local extraMult = (req.mult or 1) - 1
+        if extraMult <= 0 then return end
+
+        local inv = nil
+        pcall(function() inv = req.owner.InventoryComponent end)
+        local boosted = applyExtraStackAndOverflow(
+            req.owner, inv, req.item, req.rowName, (req.origStack or 1) * extraMult,
+            req.maxStack, "ServerEquipItem", false, req.itemDataTable)
+        if boosted then
+            markItemRecentlyBoosted(req.itemAddr)
+            if safeValid(inv) then
+                -- 标记该物品刚由 ServerEquipItem 完成倍增，防止 5 条指令后的 ClientOnItemAdded 二次叠加
+                recentEquipHandledByInv[inv:GetAddress()] = { rowName = req.rowName, clock = os.clock() }
+            end
+        end
+    end)
+end)
+
+-- 路径 3：TryPickupItem 分支 2 手持同类可堆叠物继续拾取（如手持鹅卵石再捡鹅卵石，绕过 AddItem 与 ServerEquipItem 直调 ClientOnItemAdded）
+pcall(function()
+    RegisterHook("/Script/Maine.InventoryComponent:ClientOnItemAdded", function(selfParam, rowHandleParam, isNewParam)
+        if inAddItemDepth > 0 or inNonHarvestAddDepth > 0 or inModExtraAddDepth > 0 then
+            return
+        end
+        if not (cfg.harvestEnabled and cfg.harvestMultiplier and cfg.harvestMultiplier > 1) then
+            return
+        end
+        local isNew = false
+        if isNewParam then
+            local v = isNewParam:get()
+            isNew = (v == true or v == 1)
+        end
+        if not isNew then return end
+
+        local inv = selfParam:get()
+        if not safeValid(inv) then return end
+        local owner = getComponentOwnerPlayer(inv)
+        if not owner then return end
+        local hasAuth = true
+        pcall(function()
+            if owner.HasAuthority then hasAuth = (owner:HasAuthority() == true) end
+        end)
+        if not hasAuth then return end
+
+        local rn = ""
+        pcall(function()
+            local h = rowHandleParam and rowHandleParam:get() or nil
+            if h and h.RowName then rn = h.RowName:ToString() end
+        end)
+        if rn == "" or rn == "None" or isHaulingRowName(rn) then return end
+
+        -- 若刚由 ServerEquipItem（分支 1/3）倍增过，消费防重标记并直接返回
+        local invAddr = inv:GetAddress()
+        local recent = recentEquipHandledByInv[invAddr]
+        if recent and recent.rowName == rn and (os.clock() - recent.clock) <= 0.1 then
+            recentEquipHandledByInv[invAddr] = nil
+            return
+        end
+
+        local weapon, wRn, _ = readEquippedMainWeapon(owner)
+        if not safeValid(weapon) or wRn ~= rn then return end
+
+        local canS = false
+        local maxS = 1
+        pcall(function()
+            local vCan = weapon:CanStack()
+            canS = (vCan == true or vCan == 1)
+            maxS = weapon:GetMaxStackSize() or 1
+        end)
+        if (not canS) or maxS <= 1 then return end
+
+        local ownerAddr = owner:GetAddress()
+        local ctx = interactContextByPlayer[ownerAddr]
+        local ctxFresh = (ctx ~= nil and (os.clock() - ctx.clock) <= 0.75)
+        local snap = (ctxFresh and ctx.targetSnap and ctx.targetSnap.rowName == rn) and ctx.targetSnap or nil
+        if snap and snap.blocked then return end
+        if consumeMatchingExcludedDropEvent(rn, owner) then return end
+
+        local isNaturalDirectPickup = (snap and snap.isNatural == true) or (ctxFresh and ctx.isFoliage == true)
+        if isNaturalDirectPickup and not cfg.harvestAffectPickup then
+            return
+        end
+
+        local delta = (snap and snap.stackSize) or 1
+        if ctxFresh and ctx.equipWeaponRow == rn and (ctx.equipWeaponBefore or 0) > 0 then
+            local curS = tonumber(weapon.StackSize) or 1
+            if curS > ctx.equipWeaponBefore then
+                delta = curS - ctx.equipWeaponBefore
+            end
+        end
+        if snap and snap.itemAddr then foliagePickupItemAddrs[snap.itemAddr] = nil end
+        if snap and snap.actorAddr then foliagePickupActorAddrs[snap.actorAddr] = nil end
+
+        local extra = delta * (cfg.harvestMultiplier - 1)
+        applyExtraStackAndOverflow(owner, inv, weapon, rn, extra, maxS, "ClientOnItemAdded-EquipStack")
     end)
 end)
 
@@ -1551,7 +2665,7 @@ local function recoverDroppedBackpacks(recoverAllParty)
             return
         end
 
-        -- 读取 UProxyLootBagActor 归属信息（无需唤醒 FullActor）
+        -- 读取 UProxyLootBagActor 归属信息（无需唤醒 FullActor），并在 ProxyActor 为空时兜底调用 lod:GetOwnerPlayerGuid()
         local proxyGuidKey = markerLodOwnerGuid[lAddr] or ""
         local proxyOwnerNameLow = ""
         pcall(function()
@@ -1564,6 +2678,13 @@ local function recoverDroppedBackpacks(recoverAllParty)
                 if pn ~= "" then proxyOwnerNameLow = pn:lower() end
             end
         end)
+        if proxyGuidKey == "" then
+            pcall(function()
+                if lod.GetOwnerPlayerGuid then
+                    proxyGuidKey = guidToKey(lod:GetOwnerPlayerGuid())
+                end
+            end)
+        end
 
         -- 无主且无 DroppedBackpack 标记的容器属于场景预摆物体，禁止唤醒
         if (not confirmedByMarker) and proxyGuidKey == "" and proxyOwnerNameLow == "" then
@@ -1794,7 +2915,7 @@ end
 -- 7. 功能四：“M” 地图乳牙、高级乳牙与全游戏资源目录扫描
 -- ============================================================
 
---- 懒加载并缓存游戏核心 DataTable（AllItemsTable / HarvestNodesTable / CharactersTable）。
+--- 懒加载并缓存游戏核心 DataTable（AllItemsTable / HarvestNodesTable / CharactersTable / BestiaryTable）。
 local function loadDataTables()
     local gi = UEHelpers.GetGameInstance()
     if safeValid(gi) and safeValid(gi.GlobalTableData) then
@@ -1802,23 +2923,201 @@ local function loadDataTables()
         if safeValid(gtd.AllItemsTable) then cachedAllItemsTable = gtd.AllItemsTable end
         if safeValid(gtd.HarvestNodesTable) then cachedHarvestNodesTable = gtd.HarvestNodesTable end
         if safeValid(gtd.CharactersTable) then cachedCharactersTable = gtd.CharactersTable end
+        if safeValid(gtd.BestiaryTable) then cachedBestiaryTable = gtd.BestiaryTable end
     end
-    if not safeValid(cachedAllItemsTable) then
+    if not safeValid(cachedAllItemsTable) or not safeValid(cachedBestiaryTable) then
         local ok, gtd = pcall(FindFirstOf, "GlobalTableData")
         if ok and safeValid(gtd) then
             if safeValid(gtd.AllItemsTable) then cachedAllItemsTable = gtd.AllItemsTable end
             if safeValid(gtd.HarvestNodesTable) then cachedHarvestNodesTable = gtd.HarvestNodesTable end
             if safeValid(gtd.CharactersTable) then cachedCharactersTable = gtd.CharactersTable end
+            if safeValid(gtd.BestiaryTable) then cachedBestiaryTable = gtd.BestiaryTable end
         end
     end
 end
 
---- 从游戏数据表一次性构建简体中文译名索引与原版资源扫描仪支持列表。
+--- 从 TSoftClassPtr 提取干净的蓝图短类名（如 "/Game/.../BP_Bee.BP_Bee_C" -> "Bee"）。
+local function extractSoftClassShortName(softCls)
+    if not softCls then return "" end
+    local softStr = ""
+    pcall(function()
+        if type(softCls) == "string" then
+            softStr = softCls
+        elseif softCls.AssetPathName then
+            softStr = softCls.AssetPathName:ToString()
+        elseif softCls.ToString then
+            softStr = softCls:ToString()
+        else
+            softStr = tostring(softCls)
+        end
+    end)
+    if softStr == "" or softStr == "None" then return "" end
+    return cleanClassName(softStr)
+end
+
+--- 将蓝图/行名拆分为小写词元集合（支持下划线与驼峰拆分，如 Ant_HillWorker_Black -> {ant, hill, worker, black}）。
+local function splitIdentTokens(s)
+    local set = {}
+    local list = {}
+    if not s or s == "" then return set, list end
+    local spaced = s:gsub("([a-z0-9])([A-Z])", "%1_%2"):lower()
+    for tok in spaced:gmatch("[a-z0-9]+") do
+        if not set[tok] then
+            set[tok] = true
+            table.insert(list, tok)
+        end
+    end
+    return set, list
+end
+
+--- 剥离兜底显示名末尾的 " (ClassName)" 后缀，便于跨变体比对纯中文物种/采集点名。
+local function stripClassFallbackSuffix(name)
+    if not name or name == "" then return "" end
+    local stripped = name:match("^(.-)%s*%([^%(%)]+%)$")
+    if stripped and stripped ~= "" then
+        return stripped
+    end
+    return name
+end
+
+--- 按生物蓝图类名从 CharactersTable 索引解析官方简体中文名（支持精确匹配、词元子集匹配与最长子串兜底）。
+local function resolveCreatureZhName(actorClsShort, rowNameHint)
+    local nk = normalizeKey(actorClsShort)
+    if nk ~= "" and charTableByHint[nk] then
+        return charTableByHint[nk]
+    end
+    if rowNameHint and rowNameHint ~= "" then
+        local rnk = normalizeKey(rowNameHint)
+        if rnk ~= "" and charTableByHint[rnk] then
+            return charTableByHint[rnk]
+        end
+    end
+    if actorClsShort and actorClsShort ~= "" and #charTableRows > 0 then
+        -- 优先词元全包含匹配（如 Ant_HillWorker_Black 包含 {ant, black} -> 精准命中黑工蚁而非红工蚁）
+        local clsTokSet = splitIdentTokens(actorClsShort)
+        local bestTokCount = 0
+        local bestNormLen = 0
+        local bestZh = nil
+        for _, row in ipairs(charTableRows) do
+            if #row.tokens > 0 then
+                local allMatch = true
+                for _, tok in ipairs(row.tokens) do
+                    if not clsTokSet[tok] then
+                        allMatch = false
+                        break
+                    end
+                end
+                if allMatch then
+                    if (#row.tokens > bestTokCount) or (#row.tokens == bestTokCount and #row.norm > bestNormLen) then
+                        bestTokCount = #row.tokens
+                        bestNormLen = #row.norm
+                        bestZh = row.zh
+                    end
+                end
+            end
+        end
+        if bestZh then
+            return bestZh
+        end
+    end
+    if nk ~= "" then
+        -- 兜底选择最长连续子串匹配键
+        local bestKeyLen = 0
+        local bestVal = nil
+        for k, v in pairs(charTableByHint) do
+            if #k > bestKeyLen and (nk == k or nk:find(k, 1, true)) then
+                bestKeyLen = #k
+                bestVal = v
+            end
+        end
+        if bestVal then
+            return bestVal .. " (" .. actorClsShort .. ")"
+        end
+    end
+    return actorClsShort
+end
+
+--- 统一计算某个目录/追踪词条（creature:/node:）对应的全部实时标点桶 ID（供目录计数汇总与 M 地图出点共用，保证列表计数与地图标点严格一致）。
+-- @param tid        待匹配的词条 ID（如 creature:Ant_Black / creature:Bee / node:Rock_Clay）
+-- @param trackedSet 若传入（M 地图渲染期），跳过已被玩家单独勾选的变体 ID 防止重复叠点；目录计数汇总期传 nil
+-- @param buckets    世界实时标点桶（worldPinBuckets 或 refresh 期 newBuckets）
+-- @param metaMap    目录元数据表（metaById 或 catalogMetaById）
+local function collectMatchingBucketIds(tid, trackedSet, buckets, metaMap)
+    local matched = {}
+    if not tid or not buckets then return matched end
+    if buckets[tid] and #buckets[tid] > 0 then
+        table.insert(matched, tid)
+    end
+
+    if tid:sub(1, 9) == "creature:" then
+        local baseCls = tid:sub(10)
+        local baseClsLow = baseCls:lower()
+        local baseMeta = metaMap and metaMap[tid] or nil
+        local rawBaseName = (baseMeta and baseMeta.name)
+            or (staticBestiaryCreatures[baseCls] and staticBestiaryCreatures[baseCls].zh)
+            or resolveCreatureZhName(baseCls)
+        local baseZh = stripClassFallbackSuffix(rawBaseName)
+        local hasRealBaseZh = (baseZh ~= "" and baseZh ~= baseCls)
+        local prefixLow = baseClsLow .. "_"
+        -- 仅图鉴基础物种词条（如 creature:Ant_Black）按同种中文名汇总全部变体；
+        -- 具体变体词条（如 creature:Ant_Black_UpperDeck）仅匹配自身及更细子前缀，避免拉入同种其他变体导致重复标点与重复计数。
+        local isBaseCreature = (staticBestiaryCreatures[baseCls] ~= nil) or (next(staticBestiaryCreatures) == nil)
+
+        for bId, bList in pairs(buckets) do
+            if bId ~= tid and (not (trackedSet and trackedSet[bId])) and bId:sub(1, 9) == "creature:" and #bList > 0 then
+                local liveCls = bId:sub(10)
+                local liveClsLow = liveCls:lower()
+                local liveZh = stripClassFallbackSuffix(bList[1].n or "")
+                local hasRealLiveZh = (liveZh ~= "" and liveZh ~= liveCls)
+
+                local sameSpeciesZh = isBaseCreature and hasRealBaseZh and hasRealLiveZh and (liveZh == baseZh)
+                local samePrefix = (liveClsLow:sub(1, #prefixLow) == prefixLow)
+                    and ((not hasRealBaseZh) or (not hasRealLiveZh) or (liveZh == baseZh))
+                if sameSpeciesZh or samePrefix then
+                    table.insert(matched, bId)
+                end
+            end
+        end
+    elseif tid:sub(1, 5) == "node:" then
+        local baseKey = tid:sub(6)
+        local baseKeyLow = baseKey:lower()
+        local baseNorm = normalizeKey(baseKey)
+        local baseMeta = metaMap and metaMap[tid] or nil
+        local rawBaseName = (baseMeta and baseMeta.name)
+            or (staticHarvestNodes[baseKey] and staticHarvestNodes[baseKey].zh)
+            or fallbackNodeZh(baseKey)
+        local baseZh = stripClassFallbackSuffix(rawBaseName)
+        local hasRealBaseZh = (baseZh ~= "" and baseZh ~= baseKey)
+        local prefixLow = baseKeyLow .. "_"
+        -- 仅数据表基础采集点词条（如 node:Rock_Clay）按中文名/归一化键汇总同族变体；具体变体仅匹配自身及子前缀。
+        local isBaseNode = (staticHarvestNodes[baseKey] ~= nil) or (next(staticHarvestNodes) == nil)
+
+        for bId, bList in pairs(buckets) do
+            if bId ~= tid and (not (trackedSet and trackedSet[bId])) and bId:sub(1, 5) == "node:" and #bList > 0 then
+                local liveKey = bId:sub(6)
+                local liveKeyLow = liveKey:lower()
+                local liveNorm = normalizeKey(liveKey)
+                local liveZh = stripClassFallbackSuffix(bList[1].n or "")
+                local hasRealLiveZh = (liveZh ~= "" and liveZh ~= liveKey)
+
+                local samePrefix = (liveKeyLow:sub(1, #prefixLow) == prefixLow)
+                local normHit = isBaseNode and (baseNorm ~= "" and (liveNorm == baseNorm or liveNorm:find(baseNorm, 1, true) ~= nil))
+                local zhHit = isBaseNode and hasRealBaseZh and hasRealLiveZh and (liveZh == baseZh)
+                if samePrefix or normHit or zhHit then
+                    table.insert(matched, bId)
+                end
+            end
+        end
+    end
+    return matched
+end
+
+--- 从游戏数据表一次性构建简体中文译名索引、真实原版资源扫描仪支持列表，以及客机可用的全图鉴静态生物/采集点索引。
 local function loadTableTranslations()
     loadDataTables()
     local statics = getSurvivalStatics()
 
-    -- 1. AllItemsTable -> 官方简体中文物品名 + 自然资源/可扫描标记
+    -- 1. AllItemsTable -> 官方简体中文物品名 + 真实自然资源可扫描标记（仅限真正带有 Resource.Natural 标签的自然物品，绝不再用 itemType == 0 误标武器/护甲/食谱）
     if next(itemRowToZhName) == nil and safeValid(cachedAllItemsTable) then
         pcall(function()
             cachedAllItemsTable:ForEachRow(function(rowName, rowData)
@@ -1834,44 +3133,69 @@ local function loadTableTranslations()
                 end
                 itemRowToZhName[rowName] = zh
 
-                -- 判定是否支持原版资源扫描仪热区
+                -- 仅真正属于自然资源的物品才支持游戏原版资源扫描仪热区（与 UResourceSurveyComponent::GetSurveyableItems 一致）
                 local isNat = false
                 if statics then
                     pcall(function()
-                        isNat = statics:IsNaturalResource({ DataTable = cachedAllItemsTable, RowName = FName(rowName) })
+                        isNat = (statics:IsNaturalResource({ DataTable = cachedAllItemsTable, RowName = FName(rowName) }) == true)
                     end)
                 end
-                local itemType = 0
-                pcall(function() itemType = rowData.ItemType or 0 end)
-                if isNat or itemType == 0 then
+                if isNat then
                     surveyableRows[rowName] = true
                 end
             end)
         end)
     end
 
-    -- 2. HarvestNodesTable -> 官方简体中文采集点名索引
+    -- 2. HarvestNodesTable -> 官方简体中文采集点名索引 + 静态采集点目录（供客机预勾选）
     if next(harvestTableByHint) == nil and safeValid(cachedHarvestNodesTable) then
         pcall(function()
             cachedHarvestNodesTable:ForEachRow(function(rowName, rowData)
+                if not rowName or rowName == "" or rowName:find("^Debug") or rowName:find("^Test") then return end
                 local zh = ""
                 pcall(function() zh = locStringToZh(rowData.DisplayName) end)
-                if zh ~= "" then
+                if zh ~= "" and not zh:find("Invalid %-1") and not zh:find("%?%?%?") then
                     harvestTableByHint[normalizeKey(rowName)] = zh
+                    staticHarvestNodes[rowName] = { rowName = rowName, zh = zh }
                 end
             end)
         end)
     end
 
-    -- 3. CharactersTable -> 官方简体中文生物名索引
+    -- 3. CharactersTable -> 官方简体中文生物名索引（同时建立词元表用于跨命名变体精准匹配，如 Ant_HillWorker_Black -> 黑工蚁）
     if next(charTableByHint) == nil and safeValid(cachedCharactersTable) then
         pcall(function()
             cachedCharactersTable:ForEachRow(function(rowName, rowData)
                 local zh = ""
                 pcall(function() zh = locStringToZh(rowData.CharacterName) end)
-                if zh ~= "" then
-                    charTableByHint[normalizeKey(rowName)] = zh
+                if zh ~= "" and not zh:find("Invalid %-1") and not zh:find("%?%?%?") then
+                    local nk = normalizeKey(rowName)
+                    charTableByHint[nk] = zh
+                    local _, tokList = splitIdentTokens(rowName)
+                    table.insert(charTableRows, { norm = nk, tokens = tokList, zh = zh })
                 end
+            end)
+        end)
+    end
+
+    -- 4. BestiaryTable -> 全游戏生物图鉴静态类名与中文名（保证联机客机列表完整包含蜜蜂、幼虫、黑工蚁等全部生物）
+    if next(staticBestiaryCreatures) == nil and safeValid(cachedBestiaryTable) then
+        pcall(function()
+            cachedBestiaryTable:ForEachRow(function(rowName, rowData)
+                if not rowName or rowName == "" or rowName:find("^Debug") or rowName:find("^Test") then return end
+                local clsShort = extractSoftClassShortName(rowData.Creature)
+                if clsShort == "" then
+                    clsShort = cleanClassName(rowName)
+                end
+                if clsShort == "" or clsShort == "None" then return end
+                local low = clsShort:lower()
+                if low:find("debug") or low:find("test") or low:find("player") then return end
+                local zh = resolveCreatureZhName(clsShort, rowName)
+                staticBestiaryCreatures[clsShort] = {
+                    clsShort = clsShort,
+                    zh = zh,
+                    rowName = rowName,
+                }
             end)
         end)
     end
@@ -1950,6 +3274,25 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
     lastCatalogRefreshClock = os.clock()
 
     loadTableTranslations()
+    -- 合并原版 ResourceSurveyComponent:GetSurveyableItems() 返回的官方可扫描集合，确保与游戏扫描仪严格对齐
+    pcall(function()
+        local rsc = gs.ResourceSurveyComponent
+        if safeValid(rsc) and rsc.GetSurveyableItems then
+            local survList = rsc:GetSurveyableItems()
+            if survList then
+                for i = 1, #survList do
+                    local h = survList[i]
+                    local rn = ""
+                    pcall(function()
+                        if h and h.RowName then rn = h.RowName:ToString() end
+                    end)
+                    if rn ~= "" and rn ~= "None" and itemRowToZhName[rn] then
+                        surveyableRows[rn] = true
+                    end
+                end
+            end
+        end
+    end)
     if not safeValid(cachedHealthLodClass) then
         pcall(function()
             local cls = StaticFindObject("/Script/Maine.HealthLODComponent")
@@ -2143,18 +3486,7 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
                                 if s ~= "" then zh = s end
                             end)
                             if (not zh or zh == "") then
-                                local nk = normalizeKey(actorClsShort)
-                                if charTableByHint[nk] then
-                                    zh = charTableByHint[nk]
-                                else
-                                    -- 尝试前缀匹配 CharactersTable
-                                    for k, v in pairs(charTableByHint) do
-                                        if nk == k or nk:find(k, 1, true) then
-                                            zh = v .. " (" .. actorClsShort .. ")"
-                                            break
-                                        end
-                                    end
-                                end
+                                zh = resolveCreatureZhName(actorClsShort)
                             end
                             if not zh or zh == "" then zh = actorClsShort end
                             creatureClassToZhName[actorClsShort] = zh
@@ -2364,17 +3696,7 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
                                 end
                             end)
                             if not zh or zh == "" then
-                                local nk = normalizeKey(actorClsShort)
-                                if charTableByHint[nk] then
-                                    zh = charTableByHint[nk]
-                                else
-                                    for k, v in pairs(charTableByHint) do
-                                        if nk == k or nk:find(k, 1, true) then
-                                            zh = v .. " (" .. actorClsShort .. ")"
-                                            break
-                                        end
-                                    end
-                                end
+                                zh = resolveCreatureZhName(actorClsShort)
                             end
                             if not zh or zh == "" then zh = actorClsShort end
                             creatureClassToZhName[actorClsShort] = zh
@@ -2519,6 +3841,52 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
         end)
     end
 
+    -- B3. 静态全图鉴目录补全（修复联机客机缺少蜜蜂、幼虫、黑工蚁等远距生物/采集点的问题）：
+    -- 房主的 LODActors 覆盖全图，而客机端仅能感知网络同步半径（约 50~150m）内的实体；
+    -- 从客机本地静态 DataTable（BestiaryTable / HarvestNodesTable）补全全游戏生物与采集点词条（初始 count=0），
+    -- 客机随时可搜索并预勾选，靠近同步范围后实时标点会自动出现，零联机协议修改。
+    for clsShort, info in pairs(staticBestiaryCreatures) do
+        local cid = "creature:" .. clsShort
+        if not metaById[cid] then
+            metaById[cid] = {
+                id = cid,
+                name = info.zh,
+                rawName = clsShort,
+                category = "creature",
+                count = 0,
+                surveyable = false,
+                rowName = "",
+            }
+        end
+    end
+
+    if (not isHostNow) or (not hasAnyLodBucket) then
+        -- 客机端补充静态采集点词条（去重：若已有同名或同归一化键的实时 node: 词条则不重复生成）
+        local existingNodeZh = {}
+        local existingNodeNorm = {}
+        for id, m in pairs(metaById) do
+            if m.category == "node" then
+                existingNodeZh[m.name] = true
+                existingNodeNorm[normalizeKey(m.rawName)] = true
+            end
+        end
+        for rowName, info in pairs(staticHarvestNodes) do
+            local nk = normalizeKey(rowName)
+            local nid = "node:" .. rowName
+            if (not metaById[nid]) and (not existingNodeZh[info.zh]) and (not existingNodeNorm[nk]) then
+                metaById[nid] = {
+                    id = nid,
+                    name = info.zh,
+                    rawName = rowName,
+                    category = "node",
+                    count = 0,
+                    surveyable = false,
+                    rowName = "",
+                }
+            end
+        end
+    end
+
     -- 记录本存档已知的全部词条：即使某生物/资源暂时被全部清光（count=0 等待重生），
     -- 仍保留在菜单列表中供取消勾选，且重生后会立刻自动恢复标点与数量。
     for id, m in pairs(metaById) do
@@ -2545,7 +3913,7 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
         end
     end
 
-    -- C. 将所有可扫描物品补全到目录（确保全游戏所有物品都能中文搜索并联动原版扫描热区）
+    -- C. 将所有真实支持原版扫描仪的自然资源物品补全到目录（确保全游戏所有自然资源都能中文搜索并安全联动原版扫描热区）
     for rn, _ in pairs(surveyableRows) do
         local itemId = "item:" .. rn
         local zh = itemRowToZhName[rn] or rn
@@ -2565,12 +3933,47 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
         end
     end
 
+    -- D. 统一用 collectMatchingBucketIds 汇总生物与采集点词条的真实匹配标点数，
+    -- 确保如预勾选「蜜蜂(creature:Bee)」时若周边存在 Bee_HiveWorker，目录计数同步更新为 1 处而非继续显示“范围内 0 处”。
+    for id, m in pairs(metaById) do
+        if m.category == "creature" or m.category == "node" then
+            local matchedIds = collectMatchingBucketIds(id, nil, newBuckets, metaById)
+            local totalMatched = 0
+            for _, bId in ipairs(matchedIds) do
+                local bList = newBuckets[bId]
+                if bList then totalMatched = totalMatched + #bList end
+            end
+            m.count = totalMatched
+        end
+    end
+
+    -- 检测目录条目集或任意实时计数是否相对上次发生变化：
+    -- 当 M 地图持续开启且生物/采集点进出客机同步范围时，仅在计数或词条实际变更时自动同步写出 catalog.json，
+    -- 既保持零无意义磁盘写入，又彻底消除“地图已有标点但列表仍显示 0”的同步滞后。
+    local catalogChanged = false
+    for id, m in pairs(metaById) do
+        local prev = catalogMetaById[id]
+        if (not prev) or prev.count ~= m.count or prev.name ~= m.name
+            or prev.surveyable ~= m.surveyable or prev.category ~= m.category then
+            catalogChanged = true
+            break
+        end
+    end
+    if not catalogChanged then
+        for id, _ in pairs(catalogMetaById) do
+            if not metaById[id] then
+                catalogChanged = true
+                break
+            end
+        end
+    end
+
     collectiblePins = newCollectibles
     worldPinBuckets = newBuckets
+    catalogMetaById = metaById
     molarStats = { unMilk = unMilk, totMilk = totMilk, unMega = unMega, totMega = totMega }
 
-    if writeCatalogFile then
-        lastCatalogWriteClock = os.clock()
+    if writeCatalogFile or catalogChanged then
         local list = {}
         for _, m in pairs(metaById) do
             table.insert(list, m)
@@ -2584,7 +3987,12 @@ local function refreshWorldCatalogAndPins(writeCatalogFile, quietLog)
             return a.name < b.name
         end)
         catalogList = list
-        writeAtomicText(CATALOG_PATH, json.encode(json.array(list)))
+        local encodedCatalog = json.encode(json.array(list))
+        if writeCatalogFile or encodedCatalog ~= lastCatalogJson then
+            lastCatalogWriteClock = os.clock()
+            lastCatalogJson = encodedCatalog
+            writeAtomicText(CATALOG_PATH, encodedCatalog)
+        end
         if not quietLog then
             logInfo(string.format("已生成全图资源目录: %d 项 | 未采普通乳牙 %d/%d, 未采高级乳牙 %d/%d",
                 #list, unMilk, totMilk, unMega, totMega))
@@ -2896,13 +4304,19 @@ local function updateMapLiveFrame(now)
     end
 
     if cfg.trackedIds then
+        local trackedSet = {}
+        for _, tid in ipairs(cfg.trackedIds) do
+            trackedSet[tid] = true
+        end
+        -- 跨勾选词条全局去重桶集合：无论勾选顺序如何，同一个实时标点桶每帧最多绘制一次，杜绝基础物种与变体同选时重复叠标
+        local emittedBuckets = {}
         for idx, tid in ipairs(cfg.trackedIds) do
             local colorIdx = (idx - 1) % 12
-            local bucket = worldPinBuckets[tid]
             local bucketCells = nil
-            if bucket and #bucket > 0 then
-                bucketCells = {}
-                for _, p in ipairs(bucket) do
+            local function appendBucketPins(bList)
+                if not bList or #bList == 0 then return end
+                if not bucketCells then bucketCells = {} end
+                for _, p in ipairs(bList) do
                     table.insert(pins, {
                         id = tid, n = p.n, cat = p.cat,
                         x = p.x, y = p.y, z = p.z, c = colorIdx, col = false,
@@ -2911,6 +4325,14 @@ local function updateMapLiveFrame(now)
                     bucketCells[ck] = true
                 end
             end
+            local matchedIds = collectMatchingBucketIds(tid, trackedSet, worldPinBuckets, catalogMetaById)
+            for _, bId in ipairs(matchedIds) do
+                if not emittedBuckets[bId] then
+                    emittedBuckets[bId] = true
+                    appendBucketPins(worldPinBuckets[bId])
+                end
+            end
+
             -- 对于自然物品，同时合并实时存活的植被点（草/鹅卵石/树枝/三叶草/树液/蘑菇等），已采集自动消失、重生自动恢复
             if tid:sub(1, 5) == "item:" then
                 local rn = tid:sub(6)
@@ -2966,15 +4388,109 @@ end
 -- 9. 处理菜单一次性操作指令（通过 data/actions.json 序列号去重）
 -- ============================================================
 
---- 消费 C++ 悬浮菜单写入的一次性操作指令（放路标、开扫描仪、一键秒建、重扫世界、一键找回背包等）。
-local function processActions()
-    local raw = readAllText(ACTIONS_PATH)
-    if not raw or raw == "" then return end
-    local act = json.decode(raw)
-    if not act or not act.seq or act.seq <= lastActionSeq then return end
-    lastActionSeq = act.seq
-    os.remove(ACTIONS_PATH)
+--- 房主端真正一键建成当前世界中所有未完工的建筑蓝图（替代在 Shipping 版中被编译为空操作的 ServerCheatBuildAllBuildings）。
+local function buildAllUnderConstructionBlueprints()
+    local gs = cachedGameState
+    if not safeValid(gs) then
+        local okGs, found = pcall(FindFirstOf, "SurvivalGameState")
+        if okGs and safeValid(found) then gs = found end
+    end
+    if not safeValid(gs) then
+        lastStatusMessage = "当前尚未进入存档，无法一键建成蓝图"
+        logInfo(lastStatusMessage)
+        return
+    end
 
+    local isHost = true
+    pcall(function() isHost = (gs:HasAuthority() == true) end)
+    if not isHost then
+        lastStatusMessage = "仅房主可执行一键建成已放置的未完工蓝图"
+        logInfo(lastStatusMessage)
+        return
+    end
+
+    -- 获取当前活跃 USurvivalGameModeSettings，临时确保 bAutoCompleteBuildings = true，完成后按 cfg.instantBuildEnabled 精确还原
+    local gms = nil
+    local prevAutoComplete = nil
+    pcall(function()
+        local sm = gs.SurvivalModeManagerComponent
+        if safeValid(sm) and safeValid(sm.GameModeSettings) then
+            gms = sm.GameModeSettings
+            prevAutoComplete = (gms.bAutoCompleteBuildings == true)
+            if not prevAutoComplete then
+                gms.bAutoCompleteBuildings = true
+            end
+        end
+    end)
+
+    local builtCount = 0
+    local foundBlueprints = 0
+    pcall(function()
+        local allBuildings = FindAllOf("Building")
+        if not allBuildings then return end
+        for _, bld in ipairs(allBuildings) do
+            if safeValid(bld) then
+                pcall(function()
+                    local fullName = bld:GetFullName() or ""
+                    if isTemplateOrCdoName(fullName) then return end
+                    if bld.IsActorBeingDestroyed and bld:IsActorBeingDestroyed() == true then return end
+
+                    -- EBuildingState::UnderConstruction == 4, Built == 1
+                    local isUnder = false
+                    pcall(function() isUnder = (bld.BuildingState == 4) end)
+                    if not isUnder then
+                        pcall(function()
+                            if bld.IsUnderConstruction and bld:IsUnderConstruction() == true then
+                                isUnder = true
+                            end
+                        end)
+                    end
+                    if not isUnder then return end
+
+                    foundBlueprints = foundBlueprints + 1
+                    -- 若蓝图尚未缓存 GameModeManagerComponent，先触发 OnGameModeChanged 刷新引用
+                    pcall(function()
+                        if not safeValid(bld.GameModeManagerComponent) and bld.OnGameModeChanged then
+                            bld:OnGameModeChanged()
+                        end
+                    end)
+                    -- ABuilding::SetUnderConstruction 内部检查 bAutoCompleteBuildings 并直接触发原生建成状态机与联机同步
+                    bld:SetUnderConstruction()
+
+                    local nowBuilt = false
+                    pcall(function() nowBuilt = (bld.BuildingState == 1) end)
+                    if not nowBuilt then
+                        pcall(function()
+                            if bld.IsBuilt and bld:IsBuilt() == true then nowBuilt = true end
+                        end)
+                    end
+                    if nowBuilt then
+                        builtCount = builtCount + 1
+                    end
+                end)
+            end
+        end
+    end)
+
+    -- 若用户未长期开启无材料秒建，还原 bAutoCompleteBuildings 原值
+    if safeValid(gms) and (not cfg.instantBuildEnabled) and prevAutoComplete ~= nil then
+        pcall(function()
+            gms.bAutoCompleteBuildings = prevAutoComplete
+        end)
+    end
+
+    if builtCount > 0 then
+        lastStatusMessage = string.format("已一键建成当前世界中 %d 个未完工建筑蓝图！", builtCount)
+    elseif foundBlueprints > 0 then
+        lastStatusMessage = string.format("检测到 %d 个未完工蓝图，但部分建筑不支持自动建成", foundBlueprints)
+    else
+        lastStatusMessage = "当前世界中没有未完工的建筑蓝图"
+    end
+    logInfo(lastStatusMessage)
+end
+
+--- 执行单条来自 C++ 悬浮菜单的一次性操作指令。
+local function executeSingleAction(act)
     local t = act.type
     if t == "place_waypoint" then
         pcall(function()
@@ -3006,35 +4522,20 @@ local function processActions()
                 end
                 if safeValid(pc) and safeValid(pc.PlayerState) and safeValid(cachedAllItemsTable) then
                     local ps = pc.PlayerState
-                    local statics = getSurvivalStatics()
-                    local netHandle = nil
-                    if statics then
-                        pcall(function()
-                            local arr = statics:DataTableArrayToNetCrc({ { DataTable = cachedAllItemsTable, RowName = FName(rn) } })
-                            if arr and #arr >= 1 then netHandle = arr[1] end
-                        end)
-                    end
-                    if netHandle then
-                        ps:ServerSetSurveyedResource(netHandle)
-                    else
-                        ps:ServerSetSurveyedResource({ DataTable = cachedAllItemsTable, RowName = FName(rn) })
-                    end
+                    -- 直接传入纯 Lua 表由 UE4SS convert_lua_table_to_struct 转为 FDataTableRowHandle_NetCrc，
+                    -- 彻底规避 DataTableArrayToNetCrc 返回的临时 UScriptStruct userdata 悬空指针闪退！
+                    ps:ServerSetSurveyedResource({ DataTable = cachedAllItemsTable, RowName = FName(rn) })
                     ps:SetResourceSurveyVisible(true)
                     lastSurveyedName = itemRowToZhName[rn] or rn
                     lastStatusMessage = "已开启全队原版资源热区扫描: " .. lastSurveyedName
                     logInfo(lastStatusMessage)
+                else
+                    lastStatusMessage = "当前尚未进入存档或物品表未就绪，无法开启原版热区扫描"
                 end
             end)
         end
     elseif t == "build_all_blueprints" then
-        pcall(function()
-            local pc = UEHelpers.GetPlayerController()
-            if safeValid(pc) and safeValid(pc.Pawn) then
-                pc.Pawn:ServerCheatBuildAllBuildings()
-                lastStatusMessage = "已一键建成当前世界中所有未完工的建筑蓝图！"
-                logInfo(lastStatusMessage)
-            end
-        end)
+        buildAllUnderConstructionBlueprints()
     elseif t == "recover_my_backpacks" then
         recoverDroppedBackpacks(false)
     elseif t == "recover_all_backpacks" then
@@ -3053,6 +4554,46 @@ local function processActions()
             lastStatusMessage = string.format("已重新扫描世界，共发现 %d 类资源", #catalogList)
         else
             lastStatusMessage = "当前尚未进入存档，无法扫描世界资源"
+        end
+    end
+end
+
+--- 消费 C++ 悬浮菜单写入的一次性操作指令队列（先原子重命名认领再读取删除，彻底杜绝读后删导致的跨线程丢单，按序列号严格去重）。
+local function processActions()
+    local claimPath = ACTIONS_PATH .. ".proc"
+    os.remove(claimPath)
+    local okRename = os.rename(ACTIONS_PATH, claimPath)
+    if not okRename then return end
+
+    local raw = readAllText(claimPath)
+    os.remove(claimPath)
+    if not raw or raw == "" then return end
+
+    local decoded = json.decode(raw)
+    if not decoded then return end
+
+    local list = nil
+    if type(decoded.actions) == "table" then
+        list = decoded.actions
+    elseif decoded.seq then
+        list = { decoded }
+    else
+        return
+    end
+
+    local batchSession = type(decoded.session) == "string" and decoded.session or ""
+    for _, act in ipairs(list) do
+        if type(act) == "table" and type(act.seq) == "number" then
+            local actSession = (type(act.session) == "string" and act.session ~= "") and act.session or batchSession
+            if actSession ~= "" and actSession ~= lastActionSession then
+                -- 新会话（例如重启游戏/重新加载悬浮层后序列号从 1 重新计数）：切换会话并重置已消费水位
+                lastActionSession = actSession
+                lastActionSeq = 0
+            end
+            if act.seq > lastActionSeq then
+                lastActionSeq = act.seq
+                executeSingleAction(act)
+            end
         end
     end
 end
@@ -3092,6 +4633,8 @@ local function writeRuntimeStatus(inWorld, isHost, diffName, liveP, liveE, liveK
         lootCompCount = harvestBoostHits,
         stackSummary = lastStackSummary,
         surveyedItemName = lastSurveyedName,
+        lastActionSession = lastActionSession,
+        lastActionSeq = lastActionSeq,
         lastMessage = lastStatusMessage,
     })
     if encoded ~= lastStatusJson then
@@ -3155,15 +4698,13 @@ local function onGameThreadTick()
         lastSlowTickClock = now
 
         local cfgChanged = pollConfig()
-        processActions()
-
         local inWorld, gs = resolveActiveWorldObjects()
 
         if inWorld then
             local isHost = true
             pcall(function() isHost = gs:HasAuthority() end)
 
-            -- 检测到切换世界/新读档，重置上一存档缓存并等待 2.5 秒完成流式加载
+            -- 检测到切换世界/新读档（含暂停菜单直接读另一个档，不经过主菜单），彻底重置上一存档瞬态与防刷缓存
             local worldKey = gs:GetAddress()
             local enteredNewWorld = (catalogBuiltForWorld ~= worldKey)
             if enteredNewWorld then
@@ -3172,10 +4713,31 @@ local function onGameThreadTick()
                 worldInitialScanDone = false
                 lastStackConfigKey = ""
                 lastHarvestConfigKey = ""
+                catalogMetaById = {}
+                lastCatalogJson = ""
+                lastCatalogWriteClock = 0
                 foliagePinCache = {}
                 noFoliageRows = {}
                 knownCatalogMeta = {}
                 cachedWorldIsms = nil
+                origDamageMap = {}
+                harvestBoostHits = 0
+                spawnLootActiveDepth = {}
+                spawnLootRestoreMap = {}
+                excludedSpawnedActorAddrs = {}
+                excludedItemObjAddrs = {}
+                recentExcludedDropEvents = {}
+                inExcludedDropDepth = 0
+                inNonHarvestAddDepth = 0
+                inModExtraAddDepth = 0
+                inAddItemDepth = 0
+                foliagePickupActorAddrs = {}
+                foliagePickupItemAddrs = {}
+                interactContextByPlayer = {}
+                pendingAddItemBoosts = {}
+                pendingEquipBoosts = {}
+                recentEquipHandledByInv = {}
+                recentlyBoostedItemAddrs = {}
                 lastStatusMessage = "正在加载世界资源与乳牙坐标..."
             end
 
@@ -3203,8 +4765,12 @@ local function onGameThreadTick()
                 lastHarvestConfigKey = harvestKey
             end
 
+            -- 在世界句柄与设置刷新后再消费一次性操作指令，确保指令看到最新世界状态且反馈提示不被“正在加载”覆盖
+            processActions()
+
             writeRuntimeStatus(true, isHost, diffName, liveP, liveE, liveKeepInv, liveNoDurPenalty)
         else
+            processActions()
             -- 退出存档返回主菜单时彻底清空旧世界对象地址与防刷黑名单缓存，避免悬空地址复用
             if catalogBuiltForWorld ~= nil or cachedPawnAddr ~= nil then
                 catalogBuiltForWorld = nil
@@ -3216,6 +4782,9 @@ local function onGameThreadTick()
                 lastStackConfigKey = ""
                 lastHarvestConfigKey = ""
                 catalogList = {}
+                catalogMetaById = {}
+                lastCatalogJson = ""
+                lastCatalogWriteClock = 0
                 worldPinBuckets = {}
                 collectiblePins = {}
                 foliagePinCache = {}
@@ -3224,12 +4793,22 @@ local function onGameThreadTick()
                 cachedWorldIsms = nil
                 origDamageMap = {}
                 harvestBoostHits = 0
-                spawnLootRestoreStack = {}
+                spawnLootActiveDepth = {}
+                spawnLootRestoreMap = {}
                 excludedSpawnedActorAddrs = {}
                 excludedItemObjAddrs = {}
                 recentExcludedDropEvents = {}
                 inExcludedDropDepth = 0
-                interactSnapshot = {}
+                inNonHarvestAddDepth = 0
+                inModExtraAddDepth = 0
+                inAddItemDepth = 0
+                foliagePickupActorAddrs = {}
+                foliagePickupItemAddrs = {}
+                interactContextByPlayer = {}
+                pendingAddItemBoosts = {}
+                pendingEquipBoosts = {}
+                recentEquipHandledByInv = {}
+                recentlyBoostedItemAddrs = {}
                 if lastMapOpen then
                     lastMapOpen = false
                     lastMapLiveJson = ""
@@ -3264,4 +4843,4 @@ LoopAsync(100, function()
     return false
 end)
 
-logInfo("GroundedQoL v1.4 初始化完成（采集入包倍率零模板污染 + 客机独立地图追踪 + 菜单期光标零闪烁 + 顶层自绘中文候选条）！按 Insert 或 F8 打开中文菜单。")
+logInfo("GroundedQoL v1.1.0 初始化完成（采集入包倍率零模板污染 + 客机独立地图追踪 + 菜单期光标零闪烁 + 顶层自绘中文候选条）！按 Insert 或 F8 打开中文菜单。")

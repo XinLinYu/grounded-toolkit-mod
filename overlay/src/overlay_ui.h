@@ -24,4 +24,7 @@ bool HandleMapQuickShortcut(UINT msg, WPARAM wParam, LPARAM lParam);
 /// 返回最近一帧 M 地图层实际绘制到屏幕上的有效标点数量（供自动化回归测试与诊断使用）。
 int GetLastRenderedMapPinCount();
 
+/// 返回最近一帧主菜单窗口在视口内的矩形（用于回归测试验证分辨率缩小后自动回拉防越界）。
+void GetLastMenuWindowRect(float* outX, float* outY, float* outW, float* outH);
+
 } // namespace gqol
