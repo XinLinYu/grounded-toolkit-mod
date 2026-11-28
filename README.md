@@ -60,9 +60,9 @@
 
 ## 适用版本与安装方法
 
-- **当前最新版本**：`v1.1.0`（适配 Steam 版 Grounded `v1.4.7`，兼容 DirectX 12 与 DirectX 11，支持 Windows 10 / 11 64 位）。
+- **当前最新版本**：`v1.1.1`（适配 Steam 版 Grounded `v1.4.7`，兼容 DirectX 12 与 DirectX 11，支持 Windows 10 / 11 64 位）。
 - **安装步骤（3 步完成，无需额外运行库）**：
-  1. 前往本仓库的 [Releases 页面](https://github.com/XinLinYu/grounded-toolkit-mod/releases/latest) 下载最新版绿色安装包 `GroundedQoL_v1.1.0.zip`。
+  1. 前往本仓库的 [Releases 页面](https://github.com/XinLinYu/grounded-toolkit-mod/releases/latest) 下载最新版绿色安装包 `GroundedQoL_v1.1.1.zip`。
   2. 在 Steam 库中右键点击 **Grounded** → **管理** → **浏览本地文件**，依次进入目录：
      ```text
      Grounded\Maine\Binaries\Win64\
@@ -107,7 +107,7 @@
 | **物品堆叠上限倍率** | **建议队友一起安装** | 主机与箱子按大堆叠生效，但未装 Mod 的队友手动拖拽拆分时，本地 UI 仍按原版上限截断；队友解压压缩包并设成相同倍率即可完美同步 |
 | **M 地图乳牙与独立追踪标点 / 菜单** | **各自独立追踪（乳牙共享）** | 队友解压压缩包即可各自独立勾选并仅在本机 M 地图显示追踪标点（客机自动追踪全图植被及周边已同步的采集点/生物/宝箱，主客机互不共享）；乳牙/高级乳牙/SCA.B 由游戏原生全队共享同步 |
 
-> **联机小贴士**：只需把下载的 `GroundedQoL_v1.1.0.zip` 直接发给队友，让队友解压到自己的 `Maine\Binaries\Win64\` 目录下，双方即可享受到完全一致的大堆叠、免费制作与全图实时追踪体验。
+> **联机小贴士**：只需把下载的 `GroundedQoL_v1.1.1.zip` 直接发给队友，让队友解压到自己的 `Maine\Binaries\Win64\` 目录下，双方即可享受到完全一致的大堆叠、免费制作与全图实时追踪体验。
 
 ---
 
@@ -132,7 +132,18 @@
 
 ## 更新日志
 
-### `v1.1.0`（首个正式版 / 最新）
+### `v1.1.1`（稳定性与底层修复 / 最新）
+- **根治长时间游玩/高频交互下的随机闪退（[ADR-0006](./docs/adr/0006-gamethread-only-lua-scheduler.md)）**：
+  - 彻底移除后台异步线程 `LoopAsync` + 周期跨线程 `ExecuteInGameThread`，杜绝 UE4SS 4.x 后台线程与主线程 `RegisterHook` 并发读写同一个 `m_hook_lua` 栈引发的访问违例（`0xC0000005`）与堆损坏（`0xC0000374`）；
+  - 改为启动期唯一一次 `ExecuteInGameThread` 引导并在 UE 游戏主线程上串行注册全部原生 Hook 与 `LoopInGameThreadWithDelay(100, ...)` 主线程调度器，运行期 100% 单线程执行，零功能改动、零跨线程竞争。
+- **修复 UE4SS 4.x 生物图鉴软类指针解析与历史脏配置自动清洗**：
+  - 优先使用 `TSoftObjectPtrUserdata:GetObjectID():GetAssetPathName():ToString()` 解析 `BestiaryTable` 与远距 `ULootBagLODActor` 蓝图类名，彻底消除 `catalog.json` 中出现 `TSoftObjectPtrUserdata: 0x...` 无效生物条目；
+  - 在 Lua 与 C++ 悬浮层启动读取 `config.json` 时双向自动清理旧版残留的损坏 `trackedIds` 指针条目并落盘修复。
+- **防刷缓存有界化与搬运 Hook 零开销早退**：
+  - 为丢弃物防刷黑名单与植被直拾地址缓存增加有界 TTL 与 512 上限淘汰，防止超长时间存档地址复用误拦截或表膨胀；关闭搬运倍率时 `SpawnLoot` / `OnDeath` / `OnDamaged` 走纯 Lua 零 UObject 早退。
+- **回归测试扩容至 34 项 Lua 用例（`L1 ~ L33` 含 `L5a`）**，新增纯 GameThread 静态/运行时红线守卫、`TSoftObjectPtr` 解析、`trackedIds` 清洗、缓存 TTL 与搬运早退校验。
+
+### `v1.1.0`（首个正式版）
 - **DX12 / DX11 全中文游戏内悬浮菜单与高鲁棒性渲染（[ADR-0003](./docs/adr/0003-window-thread-hybrid-ime.md) / [ADR-0004](./docs/adr/0004-idle-passthrough-cursor-and-ondemand-scan.md)）**：
   - 完整挂钩 `Present`、`Present1`、`ResizeBuffers`、`IDXGISwapChain3::ResizeBuffers1` 与 `CreateSwapChainForHwnd`，支持 10-bit/HDR 格式（`R10G10B10A2_UNORM`）或缓冲数切换时自动重建 `ImGui_ImplDX12` PSO、同窗口 SwapChain 重建自动热重绑、失活后缓冲自动校验重建及窗口缩小视口回拉钳制，彻底杜绝进图后“只出鼠标不见菜单”；
   - 菜单关闭、M 地图关闭且开场提示消失后走空闲零开销直通路径；菜单打开期间通过条件 MinHook 托管单一系统原生硬件光标并临时解锁 `ClipCursor`，全程零闪烁且关闭瞬间精确归还 UE4；
@@ -161,13 +172,13 @@
 ```text
 .
 ├── GLOSSARY.md                 # 领域术语表（统一死亡保护、掉落背包、房主权威、采集入包倍率与独立追踪定义）
-├── docs/adr/                   # 架构决策记录（ADR-0001~0005：原地保成就 / 唤醒找包 / 混合顶层 IME / 空闲直通与光标 API 接管 / 入包倍率与瞬时搬运 Hook）
+├── docs/adr/                   # 架构决策记录（ADR-0001~0006：原地保成就 / 唤醒找包 / 混合顶层 IME / 空闲直通与光标 API 接管 / 入包倍率与瞬时搬运 Hook / 纯 GameThread 单线程调度）
 ├── lua/
 │   ├── GroundedQoL/Scripts/
-│   │   ├── main.lua            # UE4SS Lua 逻辑层（入包倍率、搬运瞬时缩放、死亡保护、客机多源地图扫描与按需调度）
+│   │   ├── main.lua            # UE4SS Lua 逻辑层（纯 GameThread 调度、入包倍率、搬运瞬时缩放、死亡保护与客机多源地图扫描）
 │   │   └── json.lua            # 轻量级 JSON 编解码库
 │   └── tests/
-│       └── lua_regression_test.lua  # Lua 逻辑层全场景离线自动化回归测试套件（29 项用例 L1~L28，含首采 Pre-Hook、昆虫掉落与防刷校验）
+│       └── lua_regression_test.lua  # Lua 逻辑层全场景离线自动化回归测试套件（34 项用例 L1~L33，含纯主线程调度红线、首采 Pre-Hook、昆虫掉落与防刷校验）
 ├── overlay/
 │   ├── CMakeLists.txt          # CMake 构建配置（静态链接 MSVC 运行时 /MT）
 │   ├── src/                    # C++ DX12/DX11 双后端 Dear ImGui 悬浮菜单与 M 地图投影渲染

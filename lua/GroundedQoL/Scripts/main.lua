@@ -2,7 +2,8 @@
     文件：lua/GroundedQoL/Scripts/main.lua
     职责：GroundedQoL（禁闭求生体验增强工具箱）UE4SS v4.0.0 Lua 引擎逻辑层。
     核心架构：
-      1. 单异步定时器 + ExecuteInGameThread 单飞调度器，彻底规避 UE4SS 多 LoopAsync 并发访问 UObject 导致的崩溃。
+      1. 纯游戏主线程单线程调度（启动期一次性 ExecuteInGameThread 统一安装 Hook 与 LoopInGameThreadWithDelay），
+         彻底杜绝 UE4SS 4.x 后台 LoopAsync 调用 ExecuteInGameThread 并发踩踏 m_hook_lua 栈导致的闪退（见 ADR-0006）。
       2. 通过原子文件 IPC（data/*.json）与原生 C++ DX12/DX11 Dear ImGui 悬浮层解耦通信。
       3. 原地覆写运行时 USurvivalGameModeSettings（绝不切换为自定义模式），100% 保留 Steam 成就。
     核心功能：
@@ -736,11 +737,60 @@ local function hasValidFoliageKey(fk)
     return valid
 end
 
+local ADDR_CACHE_MAX_ENTRIES = 512
+local EXCLUDED_ADDR_TTL = 600.0
+local FOLIAGE_ADDR_TTL = 120.0
+
+--- 向带 TTL 与容量上限的地址映射登记时间戳，防止同图长时游玩表无限增长或命中 UE4 GC 复用的旧对象地址。
+local function markBoundedAddr(map, addr, ttlSeconds, maxEntries)
+    if not addr then return end
+    local now = os.clock()
+    map[addr] = now
+    local cap = maxEntries or ADDR_CACHE_MAX_ENTRIES
+    local cnt = 0
+    for _ in pairs(map) do
+        cnt = cnt + 1
+    end
+    if cnt > cap then
+        local oldestK, oldestTs = nil, now + 1.0
+        local remain = 0
+        for k, ts in pairs(map) do
+            if type(ts) ~= "number" or (now - ts) > ttlSeconds then
+                map[k] = nil
+            else
+                remain = remain + 1
+                if k ~= addr and ts < oldestTs then
+                    oldestTs = ts
+                    oldestK = k
+                end
+            end
+        end
+        if remain > cap and oldestK ~= nil then
+            map[oldestK] = nil
+        end
+    end
+end
+
+--- 查询带 TTL 的地址缓存是否仍在有效窗口内；已过期条目顺带惰性清理。
+local function hasBoundedAddr(map, addr, ttlSeconds)
+    if not addr then return false end
+    local v = map[addr]
+    if v == nil then return false end
+    if v == true then return true end
+    if type(v) == "number" then
+        if (os.clock() - v) <= ttlSeconds then
+            return true
+        end
+        map[addr] = nil
+    end
+    return false
+end
+
 --- 向防刷黑名单登记被玩家丢弃、投掷或拆建返还的 UItem 与空间事件（有界裁剪防内存增长）。
 local function recordExcludedDrop(itemObj, rowNameHint, actorForPos, countHint, radiusOverride)
     if safeValid(itemObj) then
         pcall(function()
-            excludedItemObjAddrs[itemObj:GetAddress()] = true
+            markBoundedAddr(excludedItemObjAddrs, itemObj:GetAddress(), EXCLUDED_ADDR_TTL)
         end)
         if (not rowNameHint or rowNameHint == "" or rowNameHint == "None") then
             pcall(function() rowNameHint = itemObj.ItemDataRowHandle.RowName:ToString() end)
@@ -814,6 +864,11 @@ end
 -- 覆盖 ULootComponent:OnDeath / OnDamaged / SpawnLoot 三大入口，使用每对象嵌套深度防止重复缩放，
 -- 按 ELootSpawnType 精确过滤对应阶段条目（避免未砍倒时的 OnDamaged 空计次），并在最外层 Post-Hook 立刻还原原版 Count（ADR-0005）。
 local function scaleHaulingLootPre(selfParam, expectedSpawnType, skipThisCall)
+    -- 纯 Lua 早退：关闭采集/搬运倍率且无在途缩放时，零 UObject 访问直接返回（避免全图 OnDamaged 高频开销）
+    if (not (cfg.harvestEnabled and cfg.harvestAffectHauling and cfg.harvestMultiplier and cfg.harvestMultiplier > 1))
+        and next(spawnLootActiveDepth) == nil then
+        return
+    end
     pcall(function()
         local lc = selfParam:get()
         if not safeValid(lc) then return end
@@ -921,6 +976,9 @@ end
 
 --- 搬运物瞬时缩放 Post-Hook 共用实现：在最外层调用退出时立即还原原版 Count。
 local function restoreHaulingLootPost(selfParam)
+    if next(spawnLootActiveDepth) == nil and next(spawnLootRestoreMap) == nil then
+        return
+    end
     pcall(function()
         local lc = selfParam:get()
         if not safeValid(lc) then return end
@@ -950,297 +1008,300 @@ local function restoreHaulingLootPost(selfParam)
     end)
 end
 
-pcall(function()
-    RegisterHook("/Script/Maine.LootComponent:SpawnLoot", function(selfParam, _looterParam, spawnTypeParam)
-        local st = nil
-        pcall(function() if spawnTypeParam then st = spawnTypeParam:get() end end)
-        scaleHaulingLootPre(selfParam, st, false)
-    end, restoreHaulingLootPost)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.LootComponent:OnDeath", function(selfParam)
-        -- ELootSpawnType::SpawnOnDeath == 2
-        scaleHaulingLootPre(selfParam, 2, false)
-    end, restoreHaulingLootPost)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.LootComponent:OnDamaged", function(selfParam, _dmgParam, _infoParam, _instParam, _causerParam, isKillingBlowParam)
-        local isKill = false
-        pcall(function()
-            if isKillingBlowParam then
-                local v = isKillingBlowParam:get()
-                isKill = (v == true or v == 1)
-            end
-        end)
-        -- ELootSpawnType::SpawnOnHit == 1；致命一击由紧随其后的 OnDeath 统一掉落，此处跳过
-        scaleHaulingLootPre(selfParam, 1, isKill)
-    end, restoreHaulingLootPost)
-end)
-
--- 防刷拦截钩子组 A：实时登记玩家丢弃、快捷丢弃、投掷、脱手以及拆毁建筑/取消蓝图返还的地面物品（始终保持 1 倍）。
-pcall(function()
-    RegisterHook("/Script/Maine.InventoryComponent:ServerDropItem", function(selfParam, itemParam, countParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local inv = selfParam:get()
-            local owner = safeValid(inv) and inv:GetOuter() or nil
-            local it = itemParam and itemParam:get() or nil
-            local cnt = countParam and countParam:get() or 1
-            recordExcludedDrop(it, "", owner, cnt, 400.0)
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+--- 统一在游戏主线程安装搬运物缩放与全链路防刷钩子（见 ADR-0006）。
+local function registerLootAndAntiExploitHooks()
+    pcall(function()
+        RegisterHook("/Script/Maine.LootComponent:SpawnLoot", function(selfParam, _looterParam, spawnTypeParam)
+            local st = nil
+            pcall(function() if spawnTypeParam then st = spawnTypeParam:get() end end)
+            scaleHaulingLootPre(selfParam, st, false)
+        end, restoreHaulingLootPost)
     end)
-end)
 
-pcall(function()
-    RegisterHook("/Script/Maine.EquipmentComponent:ServerDropItem", function(selfParam, itemParam, countParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local eq = selfParam:get()
-            local owner = safeValid(eq) and eq:GetOuter() or nil
-            local it = itemParam and itemParam:get() or nil
-            local cnt = countParam and countParam:get() or 1
-            recordExcludedDrop(it, "", owner, cnt, 400.0)
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    pcall(function()
+        RegisterHook("/Script/Maine.LootComponent:OnDeath", function(selfParam)
+            -- ELootSpawnType::SpawnOnDeath == 2
+            scaleHaulingLootPre(selfParam, 2, false)
+        end, restoreHaulingLootPost)
     end)
-end)
 
-pcall(function()
-    RegisterHook("/Script/Maine.EquipmentComponent:ServerDumpItem", function(selfParam, itemParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local eq = selfParam:get()
-            local owner = safeValid(eq) and eq:GetOuter() or nil
-            local it = itemParam and itemParam:get() or nil
-            recordExcludedDrop(it, "", owner, 1, 400.0)
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+    pcall(function()
+        RegisterHook("/Script/Maine.LootComponent:OnDamaged", function(selfParam, _dmgParam, _infoParam, _instParam, _causerParam, isKillingBlowParam)
+            local isKill = false
+            pcall(function()
+                if isKillingBlowParam then
+                    local v = isKillingBlowParam:get()
+                    isKill = (v == true or v == 1)
+                end
+            end)
+            -- ELootSpawnType::SpawnOnHit == 1；致命一击由紧随其后的 OnDeath 统一掉落，此处跳过
+            scaleHaulingLootPre(selfParam, 1, isKill)
+        end, restoreHaulingLootPost)
     end)
-end)
 
-pcall(function()
-    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHotDrop", function(selfParam, itemParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local player = selfParam:get()
-            local it = itemParam and itemParam:get() or nil
-            recordExcludedDrop(it, "", player, 1, 400.0)
+    -- 防刷拦截钩子组 A：实时登记玩家丢弃、快捷丢弃、投掷、脱手以及拆毁建筑/取消蓝图返还的地面物品（始终保持 1 倍）。
+    pcall(function()
+        RegisterHook("/Script/Maine.InventoryComponent:ServerDropItem", function(selfParam, itemParam, countParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local inv = selfParam:get()
+                local owner = safeValid(inv) and inv:GetOuter() or nil
+                local it = itemParam and itemParam:get() or nil
+                local cnt = countParam and countParam:get() or 1
+                recordExcludedDrop(it, "", owner, cnt, 400.0)
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
         end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
     end)
-end)
 
-pcall(function()
-    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHandleDrop", function(selfParam, objParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local player = selfParam:get()
-            local obj = objParam and objParam:get() or nil
-            local it = nil
-            local rn = ""
-            if safeValid(obj) then
-                excludedSpawnedActorAddrs[obj:GetAddress()] = true
-                pcall(function()
-                    if obj.GetItem then it = obj:GetItem() end
-                end)
-                if not safeValid(it) then
+    pcall(function()
+        RegisterHook("/Script/Maine.EquipmentComponent:ServerDropItem", function(selfParam, itemParam, countParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local eq = selfParam:get()
+                local owner = safeValid(eq) and eq:GetOuter() or nil
+                local it = itemParam and itemParam:get() or nil
+                local cnt = countParam and countParam:get() or 1
+                recordExcludedDrop(it, "", owner, cnt, 400.0)
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.EquipmentComponent:ServerDumpItem", function(selfParam, itemParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local eq = selfParam:get()
+                local owner = safeValid(eq) and eq:GetOuter() or nil
+                local it = itemParam and itemParam:get() or nil
+                recordExcludedDrop(it, "", owner, 1, 400.0)
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHotDrop", function(selfParam, itemParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local player = selfParam:get()
+                local it = itemParam and itemParam:get() or nil
+                recordExcludedDrop(it, "", player, 1, 400.0)
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerHandleDrop", function(selfParam, objParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local player = selfParam:get()
+                local obj = objParam and objParam:get() or nil
+                local it = nil
+                local rn = ""
+                if safeValid(obj) then
+                    markBoundedAddr(excludedSpawnedActorAddrs, obj:GetAddress(), EXCLUDED_ADDR_TTL)
                     pcall(function()
-                        if obj.ItemDataRowHandle and obj.ItemDataRowHandle.RowName then
-                            it = obj
+                        if obj.GetItem then it = obj:GetItem() end
+                    end)
+                    if not safeValid(it) then
+                        pcall(function()
+                            if obj.ItemDataRowHandle and obj.ItemDataRowHandle.RowName then
+                                it = obj
+                            end
+                        end)
+                    end
+                    if safeValid(it) then
+                        pcall(function() rn = it.ItemDataRowHandle.RowName:ToString() end)
+                    end
+                end
+                -- 仅在能明确物品 RowName 时写入空间兜底事件，避免通配符 "" 误伤附近击杀昆虫爆出的材料
+                if safeValid(it) or (rn ~= "" and rn ~= "None") then
+                    recordExcludedDrop(it, rn, player, 1, 400.0)
+                end
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerReleaseThrow", function(selfParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local player = selfParam:get()
+                local weapon = nil
+                local wRow = ""
+                if safeValid(player) then
+                    pcall(function()
+                        local eq = player.EquipmentComponent
+                        if safeValid(eq) then
+                            if eq.GetWeapon then weapon = eq:GetWeapon()
+                            elseif eq.GetItemInSlot then weapon = eq:GetItemInSlot(1) end
+                            if safeValid(weapon) then
+                                pcall(function() wRow = weapon.ItemDataRowHandle.RowName:ToString() end)
+                            end
                         end
                     end)
                 end
-                if safeValid(it) then
-                    pcall(function() rn = it.ItemDataRowHandle.RowName:ToString() end)
+                -- 只登记实际被投掷武器的精确 RowName（严禁写通配符 ""，否则投掷长矛/石子击杀昆虫后 15 秒 6 米内的虫材料会被误拦！）
+                if safeValid(weapon) or (wRow ~= "" and wRow ~= "None") then
+                    recordExcludedDrop(weapon, wRow, player, 1, 600.0)
                 end
-            end
-            -- 仅在能明确物品 RowName 时写入空间兜底事件，避免通配符 "" 误伤附近击杀昆虫爆出的材料
-            if safeValid(it) or (rn ~= "" and rn ~= "None") then
-                recordExcludedDrop(it, rn, player, 1, 400.0)
-            end
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.SurvivalPlayerCharacter:ServerReleaseThrow", function(selfParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local player = selfParam:get()
-            local weapon = nil
-            local wRow = ""
-            if safeValid(player) then
-                pcall(function()
-                    local eq = player.EquipmentComponent
-                    if safeValid(eq) then
-                        if eq.GetWeapon then weapon = eq:GetWeapon()
-                        elseif eq.GetItemInSlot then weapon = eq:GetItemInSlot(1) end
-                        if safeValid(weapon) then
-                            pcall(function() wRow = weapon.ItemDataRowHandle.RowName:ToString() end)
-                        end
-                    end
-                end)
-            end
-            -- 只登记实际被投掷武器的精确 RowName（严禁写通配符 ""，否则投掷长矛/石子击杀昆虫后 15 秒 6 米内的虫材料会被误拦！）
-            if safeValid(weapon) or (wRow ~= "" and wRow ~= "None") then
-                recordExcludedDrop(weapon, wRow, player, 1, 600.0)
-            end
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.HaulingComponent:ServerDropItem", function()
-        inExcludedDropDepth = inExcludedDropDepth + 1
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.HaulingComponent:ServerDropAll", function()
-        inExcludedDropDepth = inExcludedDropDepth + 1
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.Building:DropItem", function(selfParam, itemParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local bld = selfParam:get()
-            local it = itemParam and itemParam:get() or nil
-            recordExcludedDrop(it, "", bld, 4, 550.0)
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.Building:DropNewItem", function(selfParam, rowParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            local bld = selfParam:get()
-            local rn = ""
-            pcall(function()
-                local h = rowParam and rowParam:get() or nil
-                if h and h.RowName then rn = h.RowName:ToString() end
             end)
-            recordExcludedDrop(nil, rn, bld, 4, 550.0)
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
-    end)
-end)
-
--- 注意：Building:BlueprintDropItems 是蓝图脚本函数（UE4SS 注册为 script hook (N, N)），
--- 绝不可传第二个 Post-Hook 回调（否则 UE4SS 既不会触发 Post 导致 inExcludedDropDepth 永久泄漏拉黑全图掉落，
--- 还会反复报 Lua::Registry::get_function_ref / attempt to call a RemoteUnrealParam value 错误）！
-pcall(function()
-    RegisterHook("/Script/Maine.Building:BlueprintDropItems", function(selfParam)
-        pcall(function()
-            recordExcludedDrop(nil, "", selfParam:get(), 16, 600.0)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
         end)
     end)
-end)
 
-pcall(function()
-    RegisterHook("/Script/Maine.Building:CancelBuild", function(selfParam)
-        inExcludedDropDepth = inExcludedDropDepth + 1
-        pcall(function()
-            recordExcludedDrop(nil, "", selfParam:get(), 16, 600.0)
-        end)
-    end, function()
-        inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Maine.SpawnedItem:NotifySpawned", function(selfParam)
-        if inExcludedDropDepth <= 0 then return end
-        pcall(function()
-            local actor = selfParam:get()
-            if safeValid(actor) then
-                excludedSpawnedActorAddrs[actor:GetAddress()] = true
-                local it = nil
-                pcall(function() it = actor:GetItem() end)
-                if safeValid(it) then
-                    excludedItemObjAddrs[it:GetAddress()] = true
-                end
-            end
+    pcall(function()
+        RegisterHook("/Script/Maine.HaulingComponent:ServerDropItem", function()
+            inExcludedDropDepth = inExcludedDropDepth + 1
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
         end)
     end)
-end)
 
--- 精准标记天然植被直拾（ISM -> ASpawnedItem，bFromDamage == false），与砍伐/破坏爆出（bFromDamage == true）彻底区分
-pcall(function()
-    RegisterHook("/Script/Maine.SpawnedItem:NotifySwapped", function(selfParam, _fromKeyParam, fromDamageParam)
-        pcall(function()
-            local fromDmg = false
-            if fromDamageParam then
-                local v = fromDamageParam:get()
-                fromDmg = (v == true or v == 1)
-            end
-            if not fromDmg then
+    pcall(function()
+        RegisterHook("/Script/Maine.HaulingComponent:ServerDropAll", function()
+            inExcludedDropDepth = inExcludedDropDepth + 1
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.Building:DropItem", function(selfParam, itemParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local bld = selfParam:get()
+                local it = itemParam and itemParam:get() or nil
+                recordExcludedDrop(it, "", bld, 4, 550.0)
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.Building:DropNewItem", function(selfParam, rowParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                local bld = selfParam:get()
+                local rn = ""
+                pcall(function()
+                    local h = rowParam and rowParam:get() or nil
+                    if h and h.RowName then rn = h.RowName:ToString() end
+                end)
+                recordExcludedDrop(nil, rn, bld, 4, 550.0)
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    -- 注意：Building:BlueprintDropItems 是蓝图脚本函数（UE4SS 注册为 script hook (N, N)），
+    -- 绝不可传第二个 Post-Hook 回调（否则 UE4SS 既不会触发 Post 导致 inExcludedDropDepth 永久泄漏拉黑全图掉落，
+    -- 还会反复报 Lua::Registry::get_function_ref / attempt to call a RemoteUnrealParam value 错误）！
+    pcall(function()
+        RegisterHook("/Script/Maine.Building:BlueprintDropItems", function(selfParam)
+            pcall(function()
+                recordExcludedDrop(nil, "", selfParam:get(), 16, 600.0)
+            end)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.Building:CancelBuild", function(selfParam)
+            inExcludedDropDepth = inExcludedDropDepth + 1
+            pcall(function()
+                recordExcludedDrop(nil, "", selfParam:get(), 16, 600.0)
+            end)
+        end, function()
+            inExcludedDropDepth = math.max(0, inExcludedDropDepth - 1)
+        end)
+    end)
+
+    pcall(function()
+        RegisterHook("/Script/Maine.SpawnedItem:NotifySpawned", function(selfParam)
+            if inExcludedDropDepth <= 0 then return end
+            pcall(function()
                 local actor = selfParam:get()
                 if safeValid(actor) then
-                    foliagePickupActorAddrs[actor:GetAddress()] = true
+                    markBoundedAddr(excludedSpawnedActorAddrs, actor:GetAddress(), EXCLUDED_ADDR_TTL)
                     local it = nil
                     pcall(function() it = actor:GetItem() end)
                     if safeValid(it) then
-                        foliagePickupItemAddrs[it:GetAddress()] = true
+                        markBoundedAddr(excludedItemObjAddrs, it:GetAddress(), EXCLUDED_ADDR_TTL)
                     end
                 end
-            end
+            end)
         end)
     end)
-end)
 
--- 防刷拦截钩子组 B：容器转移、堆叠合并、物品制作、卸下装备与内部创建 RPC 期间严格保持 1 倍，绝不误倍增。
--- 关键注意：严禁把 /Script/Maine.InventoryComponent:ServerAddItem 加入此处！
--- 经实机二进制验证，ASurvivalPlayerCharacter::TryPickupItem 常规拾取路径调用的就是 ServerAddItem(Item, true) -> 尾调用 AddItem(Item, true)，
--- 其余 14 处 ServerAddItem 调用方要么传 bIsNewItem=false，要么已被下方 ServerTransfer*/ServerSwap* 拦截。
-local function hookNonHarvestDepth(funcPath)
+    -- 精准标记天然植被直拾（ISM -> ASpawnedItem，bFromDamage == false），与砍伐/破坏爆出（bFromDamage == true）彻底区分
     pcall(function()
-        RegisterHook(funcPath, function()
-            inNonHarvestAddDepth = inNonHarvestAddDepth + 1
-        end, function()
-            inNonHarvestAddDepth = math.max(0, inNonHarvestAddDepth - 1)
+        RegisterHook("/Script/Maine.SpawnedItem:NotifySwapped", function(selfParam, _fromKeyParam, fromDamageParam)
+            pcall(function()
+                local fromDmg = false
+                if fromDamageParam then
+                    local v = fromDamageParam:get()
+                    fromDmg = (v == true or v == 1)
+                end
+                if not fromDmg then
+                    local actor = selfParam:get()
+                    if safeValid(actor) then
+                        markBoundedAddr(foliagePickupActorAddrs, actor:GetAddress(), FOLIAGE_ADDR_TTL)
+                        local it = nil
+                        pcall(function() it = actor:GetItem() end)
+                        if safeValid(it) then
+                            markBoundedAddr(foliagePickupItemAddrs, it:GetAddress(), FOLIAGE_ADDR_TTL)
+                        end
+                    end
+                end
+            end)
         end)
     end)
-end
 
-for _, nonHarvestRpc in ipairs({
-    "/Script/Maine.InventoryComponent:ServerTransferItemTo",
-    "/Script/Maine.InventoryComponent:ServerTransferItemFrom",
-    "/Script/Maine.InventoryComponent:ServerTransferAllTo",
-    "/Script/Maine.InventoryComponent:ServerTransferAllFrom",
-    "/Script/Maine.InventoryComponent:ServerSwapItemSlots",
-    "/Script/Maine.InventoryComponent:ServerSwapItemSlotsBetweenInventories",
-    "/Script/Maine.InventoryComponent:ServerMergeItemStacks",
-    "/Script/Maine.InventoryComponent:ServerCraftRecipe",
-    "/Script/Maine.InventoryComponent:ServerCraftRecipeForInventory",
-    "/Script/Maine.InventoryComponent:ServerCraftRecipeDataForInventory",
-    "/Script/Maine.InventoryComponent:ServerCreateAndAddItem",
-    "/Script/Maine.SurvivalPlayerController:ServerCraftRecipeAtBuilding",
-    "/Script/Maine.SurvivalPlayerController:ServerCraftRecipeDataAtBuilding",
-    "/Script/Maine.EquipmentComponent:ServerUnequipItem",
-    "/Script/Maine.EquipmentComponent:ServerUnequipItemSlot",
-}) do
-    hookNonHarvestDepth(nonHarvestRpc)
+    -- 防刷拦截钩子组 B：容器转移、堆叠合并、物品制作、卸下装备与内部创建 RPC 期间严格保持 1 倍，绝不误倍增。
+    -- 关键注意：严禁把 /Script/Maine.InventoryComponent:ServerAddItem 加入此处！
+    -- 经实机二进制验证，ASurvivalPlayerCharacter::TryPickupItem 常规拾取路径调用的就是 ServerAddItem(Item, true) -> 尾调用 AddItem(Item, true)，
+    -- 其余 14 处 ServerAddItem 调用方要么传 bIsNewItem=false，要么已被下方 ServerTransfer*/ServerSwap* 拦截。
+    local function hookNonHarvestDepth(funcPath)
+        pcall(function()
+            RegisterHook(funcPath, function()
+                inNonHarvestAddDepth = inNonHarvestAddDepth + 1
+            end, function()
+                inNonHarvestAddDepth = math.max(0, inNonHarvestAddDepth - 1)
+            end)
+        end)
+    end
+
+    for _, nonHarvestRpc in ipairs({
+        "/Script/Maine.InventoryComponent:ServerTransferItemTo",
+        "/Script/Maine.InventoryComponent:ServerTransferItemFrom",
+        "/Script/Maine.InventoryComponent:ServerTransferAllTo",
+        "/Script/Maine.InventoryComponent:ServerTransferAllFrom",
+        "/Script/Maine.InventoryComponent:ServerSwapItemSlots",
+        "/Script/Maine.InventoryComponent:ServerSwapItemSlotsBetweenInventories",
+        "/Script/Maine.InventoryComponent:ServerMergeItemStacks",
+        "/Script/Maine.InventoryComponent:ServerCraftRecipe",
+        "/Script/Maine.InventoryComponent:ServerCraftRecipeForInventory",
+        "/Script/Maine.InventoryComponent:ServerCraftRecipeDataForInventory",
+        "/Script/Maine.InventoryComponent:ServerCreateAndAddItem",
+        "/Script/Maine.SurvivalPlayerController:ServerCraftRecipeAtBuilding",
+        "/Script/Maine.SurvivalPlayerController:ServerCraftRecipeDataAtBuilding",
+        "/Script/Maine.EquipmentComponent:ServerUnequipItem",
+        "/Script/Maine.EquipmentComponent:ServerUnequipItemSlot",
+    }) do
+        hookNonHarvestDepth(nonHarvestRpc)
+    end
 end
 
 --- 统计背包内指定 RowName 的当前总堆叠数量（单物品 O(N) 轻量计数）。
@@ -1346,7 +1407,7 @@ end
 local function inspectSpawnedActorFlags(spawnedActor)
     if not safeValid(spawnedActor) then return false, 0, nil end
     local spawnedAddr = spawnedActor:GetAddress()
-    if excludedSpawnedActorAddrs[spawnedAddr] then
+    if hasBoundedAddr(excludedSpawnedActorAddrs, spawnedAddr, EXCLUDED_ADDR_TTL) then
         return true, 0, spawnedAddr
     end
     local blocked = false
@@ -1398,16 +1459,16 @@ local function snapshotSpawnedTarget(targetObj)
     snap.blocked = blocked
     snap.actorAddr = actorAddr
     snap.isNatural = (preplaced == 2 or preplaced == 3)
-        or (actorAddr ~= nil and foliagePickupActorAddrs[actorAddr] == true)
+        or hasBoundedAddr(foliagePickupActorAddrs, actorAddr, FOLIAGE_ADDR_TTL)
     pcall(function()
         local it = targetObj:GetItem()
         if safeValid(it) then
             local ia = it:GetAddress()
             snap.itemAddr = ia
-            if excludedItemObjAddrs[ia] then
+            if hasBoundedAddr(excludedItemObjAddrs, ia, EXCLUDED_ADDR_TTL) then
                 snap.blocked = true
             end
-            if foliagePickupItemAddrs[ia] then
+            if hasBoundedAddr(foliagePickupItemAddrs, ia, FOLIAGE_ADDR_TTL) then
                 snap.isNatural = true
             end
             local rn = ""
@@ -1710,7 +1771,7 @@ local function evaluatePickupItemForBoost(owner, item)
     if not hasAuth then return nil end
 
     local itemAddr = item:GetAddress()
-    if excludedItemObjAddrs[itemAddr] or wasItemRecentlyBoosted(itemAddr) then
+    if hasBoundedAddr(excludedItemObjAddrs, itemAddr, EXCLUDED_ADDR_TTL) or wasItemRecentlyBoosted(itemAddr) then
         return nil
     end
 
@@ -1810,8 +1871,8 @@ local function evaluatePickupItemForBoost(owner, item)
 
     -- 区分「天然散落物直拾」(ISM 非破坏替换 / PreplacedDesign / 植被交互) 与「采集/击杀掉落及摸尸」
     local isNaturalDirectPickup = (preplaced == 2 or preplaced == 3)
-        or (spawnedAddr ~= nil and foliagePickupActorAddrs[spawnedAddr] == true)
-        or (foliagePickupItemAddrs[itemAddr] == true)
+        or hasBoundedAddr(foliagePickupActorAddrs, spawnedAddr, FOLIAGE_ADDR_TTL)
+        or hasBoundedAddr(foliagePickupItemAddrs, itemAddr, FOLIAGE_ADDR_TTL)
     if (not isNaturalDirectPickup) and ctxFresh then
         if (not safeValid(spawnedActor)) and ctx.isFoliage then
             isNaturalDirectPickup = true
@@ -1932,6 +1993,8 @@ local function leaveInteractContext(player)
     end
 end
 
+--- 在 GameThread 统一注册交互、入包与自动装备倍率 Hook（见 ADR-0006）。
+local function registerPickupMultiplierHooks()
 -- 触碰自动拾取上下文快照（如踩过地上箭矢/鹅卵石触发 ASpawnedItem:HandleTouch）
 pcall(function()
     RegisterHook("/Script/Maine.SpawnedItem:HandleTouch", function(selfParam, actorParam)
@@ -2304,6 +2367,7 @@ pcall(function()
         applyExtraStackAndOverflow(owner, inv, weapon, rn, extra, maxS, "ClientOnItemAdded-EquipStack")
     end)
 end)
+end
 
 -- ============================================================
 -- 6.5. 死亡保护扩展：一键找回掉落背包（唤醒远距 LOD + 瞬移到目标玩家脚边）
@@ -2357,6 +2421,104 @@ local function isLootBagEmpty(bag)
     return empty
 end
 
+--- 将 UE4SS TSoftClassPtr / TSoftObjectPtr / FSoftObjectPath 安全转换为资产路径字符串。
+-- 优先走 UE4SS 4.x 原生 TSoftObjectPtrUserdata:GetObjectID():GetAssetPathName():ToString()，
+-- 彻底过滤 "TSoftObjectPtrUserdata: 0x..." 指针文本，防止污染 catalog.json / config.json。
+local function softClassToString(softCls)
+    if not softCls then return "" end
+    if type(softCls) == "string" then
+        if softCls == "" or softCls == "None"
+            or softCls:find("Userdata:", 1, true)
+            or softCls:find("userdata:", 1, true) then
+            return ""
+        end
+        return softCls
+    end
+
+    local softStr = ""
+    -- 1. UE4SS 4.x TSoftObjectPtrUserdata -> GetObjectID() -> FSoftObjectPathUserdata -> GetAssetPathName()
+    pcall(function()
+        if softCls.GetObjectID then
+            local oid = softCls:GetObjectID()
+            if oid then
+                if oid.GetAssetPathName then
+                    local apn = oid:GetAssetPathName()
+                    if type(apn) == "string" then
+                        softStr = apn
+                    elseif apn and apn.ToString then
+                        softStr = apn:ToString()
+                    end
+                elseif oid.AssetPathName then
+                    local apn = oid.AssetPathName
+                    if type(apn) == "string" then
+                        softStr = apn
+                    elseif apn and apn.ToString then
+                        softStr = apn:ToString()
+                    end
+                end
+            end
+        end
+    end)
+
+    -- 2. 直接 FSoftObjectPath 接口
+    if softStr == "" or softStr == "None" then
+        pcall(function()
+            if softCls.GetAssetPathName then
+                local apn = softCls:GetAssetPathName()
+                if type(apn) == "string" then
+                    softStr = apn
+                elseif apn and apn.ToString then
+                    softStr = apn:ToString()
+                end
+            end
+        end)
+    end
+    if softStr == "" or softStr == "None" then
+        pcall(function()
+            local apn = softCls.AssetPathName
+            if type(apn) == "string" then
+                softStr = apn
+            elseif apn and apn.ToString then
+                softStr = apn:ToString()
+            end
+        end)
+    end
+
+    -- 3. ToString() 兜底
+    if softStr == "" or softStr == "None" then
+        pcall(function()
+            if softCls.ToString then
+                local s = softCls:ToString()
+                if type(s) == "string" then softStr = s end
+            end
+        end)
+    end
+
+    -- 4. 若资产已在内存中，纯只读读取 GetWeakPtr():Get():GetFName()（不触发任何加载）
+    if softStr == "" or softStr == "None"
+        or softStr:find("Userdata:", 1, true)
+        or softStr:find("userdata:", 1, true) then
+        softStr = ""
+        pcall(function()
+            if softCls.GetWeakPtr then
+                local wp = softCls:GetWeakPtr()
+                local obj = wp and wp.Get and wp:Get() or nil
+                if safeValid(obj) then
+                    softStr = obj:GetFName():ToString()
+                end
+            end
+        end)
+    end
+
+    if type(softStr) ~= "string" or softStr == "" or softStr == "None"
+        or softStr:find("Userdata:", 1, true)
+        or softStr:find("userdata:", 1, true)
+        or softStr:find("table:", 1, true) then
+        return ""
+    end
+    return softStr
+end
+
 --- 从 UBaseLODActor 提取未加载目标蓝图短类名（纯只读查询，绝不触发 LOD 唤醒）。
 local function getLodActorClassShort(lod)
     local clsShort = ""
@@ -2370,20 +2532,9 @@ local function getLodActorClassShort(lod)
     if clsShort == "" then
         pcall(function()
             local softCls = lod:GetActorClassSoft()
-            if softCls then
-                local softStr = ""
-                if type(softCls) == "string" then
-                    softStr = softCls
-                elseif softCls.AssetPathName then
-                    softStr = softCls.AssetPathName:ToString()
-                elseif softCls.ToString then
-                    softStr = softCls:ToString()
-                else
-                    softStr = tostring(softCls)
-                end
-                if softStr and softStr ~= "" and softStr ~= "None" then
-                    clsShort = cleanClassName(softStr)
-                end
+            local softStr = softClassToString(softCls)
+            if softStr ~= "" then
+                clsShort = cleanClassName(softStr)
             end
         end)
     end
@@ -2938,20 +3089,8 @@ end
 
 --- 从 TSoftClassPtr 提取干净的蓝图短类名（如 "/Game/.../BP_Bee.BP_Bee_C" -> "Bee"）。
 local function extractSoftClassShortName(softCls)
-    if not softCls then return "" end
-    local softStr = ""
-    pcall(function()
-        if type(softCls) == "string" then
-            softStr = softCls
-        elseif softCls.AssetPathName then
-            softStr = softCls.AssetPathName:ToString()
-        elseif softCls.ToString then
-            softStr = softCls:ToString()
-        else
-            softStr = tostring(softCls)
-        end
-    end)
-    if softStr == "" or softStr == "None" then return "" end
+    local softStr = softClassToString(softCls)
+    if softStr == "" then return "" end
     return cleanClassName(softStr)
 end
 
@@ -4599,8 +4738,14 @@ local function processActions()
 end
 
 -- ============================================================
--- 10. 单线程安全主调度器（彻底避免 UE4SS 多 LoopAsync 并发崩溃，游玩期零周期全扫）
+-- 10. 纯游戏主线程安全主调度器（见 ADR-0006：零 LoopAsync，零跨线程踩栈，游玩期零周期全扫）
 -- ============================================================
+
+--- 判断追踪 ID 是否包含损坏的 UE4SS Userdata 内存指针文本（兼容历史污染 config.json 自动清洗）。
+local function isCorruptTrackedId(id)
+    if type(id) ~= "string" or id == "" then return true end
+    return (id:find("Userdata:", 1, true) ~= nil) or (id:find("userdata:", 1, true) ~= nil)
+end
 
 --- 轮询 data/config.json，若文本内容发生变化则解码并合并到内存配置表 cfg。
 local function pollConfig()
@@ -4610,7 +4755,17 @@ local function pollConfig()
     if not parsed then return false end
     lastConfigRaw = raw
     for k, v in pairs(parsed) do
-        cfg[k] = v
+        if k == "trackedIds" and type(v) == "table" then
+            local cleanIds = {}
+            for _, id in ipairs(v) do
+                if not isCorruptTrackedId(id) then
+                    table.insert(cleanIds, id)
+                end
+            end
+            cfg[k] = cleanIds
+        else
+            cfg[k] = v
+        end
     end
     return true
 end
@@ -4644,7 +4799,6 @@ local function writeRuntimeStatus(inWorld, isHost, diffName, liveP, liveE, liveK
 end
 
 local tickInFlight = false
-local tickStartClock = 0
 local lastSlowTickClock = -10.0
 local lastMapCheckClock = -10.0
 
@@ -4680,7 +4834,7 @@ local function resolveActiveWorldObjects()
     return true, gs
 end
 
---- 游戏主线程统一调度入口（由唯一 LoopAsync 经 ExecuteInGameThread 串行驱动，保证 UObject 线程安全）。
+--- 游戏主线程统一调度入口（由 LoopInGameThreadWithDelay 在 GameThread 直接串行驱动，保证 Lua 栈与 UObject 100% 线程安全）。
 local function onGameThreadTick()
     local now = os.clock()
 
@@ -4818,29 +4972,51 @@ local function onGameThreadTick()
             writeRuntimeStatus(false, true, "未进入存档", 1.0, 1.0, false, false)
         end
     end
-
-    tickInFlight = false
 end
 
--- 唯一异步定时驱动器：先在异步线程判断是否有任务到期再派发 ExecuteInGameThread，降低游戏主线程唤醒频率
-LoopAsync(100, function()
-    local now = os.clock()
+--- 游戏主线程轻量定时入口（由 LoopInGameThreadWithDelay(100, ...) 驱动，见 ADR-0006）：
+-- 先用纯 Lua 时钟判断是否到期，未到期立即返回（零 UObject/IO 开销）；
+-- 与全部 RegisterHook 回调共享同一 GameThread 串行执行，彻底根除 UE4SS 4.x 跨线程踩踏 m_hook_lua 栈引发的闪退。
+local function onScheduledGameThreadCheck()
     if tickInFlight then
-        -- 看门狗：若超过 3 秒未释放（如极罕见切换关卡丢帧），自动解锁防止调度器永久卡死
-        if now - tickStartClock < 3.0 then
-            return false
-        end
+        return
     end
+    local now = os.clock()
     local mapInterval = lastMapOpen and 0.25 or 0.35
     local needMapCheck = (catalogBuiltForWorld ~= nil) and ((now - lastMapCheckClock) >= mapInterval)
     local needSlowTick = (now - lastSlowTickClock) >= 0.6
     if not needMapCheck and not needSlowTick then
-        return false
+        return
     end
     tickInFlight = true
-    tickStartClock = now
-    ExecuteInGameThread(onGameThreadTick)
-    return false
-end)
+    local ok, err = pcall(onGameThreadTick)
+    tickInFlight = false
+    if not ok then
+        logInfo("GameThread 定时调度异常: " .. tostring(err))
+    end
+end
 
-logInfo("GroundedQoL v1.1.0 初始化完成（采集入包倍率零模板污染 + 客机独立地图追踪 + 菜单期光标零闪烁 + 顶层自绘中文候选条）！按 Insert 或 F8 打开中文菜单。")
+local gameThreadBootstrapped = false
+local mainSchedulerHandle = nil
+
+--- 游戏主线程一次性启动引导（见 ADR-0006）：
+-- 在 GameThread 上原子串行完成全部 RegisterHook 安装与 LoopInGameThreadWithDelay 主线程定时器注册；
+-- 引导结束后本 Mod 100% 运行于 UE 游戏主线程，彻底消灭后台异步 Lua 线程与 m_hook_lua 并发竞争。
+local function bootstrapOnGameThread()
+    if gameThreadBootstrapped then return end
+    gameThreadBootstrapped = true
+
+    registerLootAndAntiExploitHooks()
+    registerPickupMultiplierHooks()
+
+    if type(LoopInGameThreadWithDelay) == "function" then
+        mainSchedulerHandle = LoopInGameThreadWithDelay(100, onScheduledGameThreadCheck)
+        logInfo("GroundedQoL v1.1.1 初始化完成（纯 GameThread 单线程调度零闪退 + 采集入包倍率零模板污染 + 客机独立地图追踪 + 菜单期光标零闪烁）！按 Insert 或 F8 打开中文菜单。")
+    else
+        logInfo("警告：当前 UE4SS 版本缺少 LoopInGameThreadWithDelay，请升级至 RE-UE4SS v3.0.1+ / v4.x！")
+    end
+end
+
+-- 启动期唯一一次 ExecuteInGameThread：此时尚未注册任何 RegisterHook，无 m_hook_lua 并发风险；
+-- 将全部 Hook 注册与主线程定时器统一迁入 GameThread 后，运行期全程零异步线程调用。
+ExecuteInGameThread(bootstrapOnGameThread)

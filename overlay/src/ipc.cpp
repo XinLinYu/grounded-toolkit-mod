@@ -52,6 +52,13 @@ unsigned long long GetFileMtime64(const std::wstring& path) {
     return ui.QuadPart;
 }
 
+/// 判断追踪 ID 是否包含历史版本遗留的损坏 UE4SS Userdata 内存指针文本。
+bool IsCorruptTrackedId(const std::string& id) {
+    return id.empty()
+        || id.find("Userdata:") != std::string::npos
+        || id.find("userdata:") != std::string::npos;
+}
+
 /// 将 ModConfig 统一序列化为 JSON 对象（供首次初始化落盘与用户修改保存复用，防止字段漂移）。
 json SerializeConfigJson(const ModConfig& cfg) {
     return json{
@@ -222,6 +229,7 @@ bool IpcBridge::LoadConfigLocked() {
     }
     try {
         json j = json::parse(ifs);
+        ifs.close();
         auto cfg = std::make_shared<ModConfig>();
         // 对每个字段使用默认值兜底，确保旧版本升级后新增字段平滑兼容
         cfg->stackEnabled = j.value("stackEnabled", cfg->stackEnabled);
@@ -246,10 +254,24 @@ bool IpcBridge::LoadConfigLocked() {
         cfg->showMapLegend = j.value("showMapLegend", cfg->showMapLegend);
         cfg->mapIconScale = j.value("mapIconScale", cfg->mapIconScale);
         cfg->imeCandidateMode = std::clamp(j.value("imeCandidateMode", cfg->imeCandidateMode), 0, 2);
+        bool sanitizedTrackedIds = false;
         if (j.contains("trackedIds") && j["trackedIds"].is_array()) {
-            cfg->trackedIds = j["trackedIds"].get<std::vector<std::string>>();
+            auto rawIds = j["trackedIds"].get<std::vector<std::string>>();
+            cfg->trackedIds.reserve(rawIds.size());
+            for (auto& id : rawIds) {
+                if (IsCorruptTrackedId(id)) {
+                    sanitizedTrackedIds = true;
+                    continue;
+                }
+                if (std::find(cfg->trackedIds.begin(), cfg->trackedIds.end(), id) == cfg->trackedIds.end()) {
+                    cfg->trackedIds.push_back(std::move(id));
+                }
+            }
         }
         m_configSnap = std::move(cfg);
+        if (sanitizedTrackedIds) {
+            AtomicWriteText(path, SerializeConfigJson(*m_configSnap).dump(2));
+        }
         return true;
     } catch (...) {
         return false;

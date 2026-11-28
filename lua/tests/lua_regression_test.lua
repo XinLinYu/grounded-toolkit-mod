@@ -28,6 +28,15 @@
       - L22: 全量 RegisterHook 路径对照实机 SDK（Maine.hpp）严格校核 + 控制器工作台制作与长按交互防刷验证
       - L23: 同株多条肩扛搬运物总上限封顶 12 根（3+2 @ 4x -> 总计 12 而非 20）及精准还原
       - L24: actions.json 读写交错竞态回归（Lua 读 A 期间写端并发发布 A+B，验证原子认领 0 丢单且 0 重复执行）
+      - L25: 建筑/储物箱交互、烤肉架与晾干架上下文防刷回归
+      - L26: TryPickupItem 全四分支（AddItem / ServerEquipItem / ClientOnItemAdded / 客机主手兜底）回归
+      - L27: 首次采集 Pre-Hook 同步走倍率、满包拒绝回滚与同对象防重回归
+      - L28: 击杀昆虫掉落（BlueprintDropItems 单回调、投掷精准行名、昆虫 DroppedByActor 放行与易腐昆虫生肉补发）
+      - L29: ADR-0006 纯 GameThread 调度静态源码红线与运行时启动引导校验（零 LoopAsync / 零运行期 ExecuteInGameThread）
+      - L30: UE4SS 4.x TSoftObjectPtrUserdata 解析修复（BestiaryTable 与未加载 ULootBagLODActor 零 Userdata 指针泄漏）
+      - L31: pollConfig() 历史损坏 trackedIds 自动清洗防回归（保留正常追踪项、过滤 Userdata 指针项）
+      - L32: 反作弊与植被地址缓存有界 TTL + 512 上限淘汰校验（不误拦复用地址、不破坏近距防刷）
+      - L33: scaleHaulingLootPre / restoreHaulingLootPost 关闭搬运开关时的纯 Lua 零 UObject 早退校验
 ]]
 
 -- ============================================================
@@ -127,6 +136,31 @@ local function makeWeakPtr(obj)
     return {
         Get = function() return obj end,
     }
+end
+
+--- 构造模拟 UE4SS v4.0.0 TSoftObjectPtrUserdata（tostring 返回指针地址，直接访问 .AssetPathName 会抛错，
+--- 仅提供 :GetObjectID():GetAssetPathName():ToString() 与 :GetWeakPtr()）。
+local function makeSoftObjectPtrUserdata(assetPath, hexAddr)
+    local fakePtrStr = "TSoftObjectPtrUserdata: " .. tostring(hexAddr or "000001D82641E4D8")
+    local oid = setmetatable({
+        GetAssetPathName = function()
+            return makeFName(assetPath or "None")
+        end,
+    }, {
+        __tostring = function() return "FSoftObjectPathUserdata: " .. tostring(hexAddr or "000001D82641E4D8") end,
+    })
+    return setmetatable({
+        GetObjectID = function() return oid end,
+        GetWeakPtr = function() return makeWeakPtr(nil) end,
+    }, {
+        __tostring = function() return fakePtrStr end,
+        __index = function(_, key)
+            if key == "AssetPathName" then
+                error("Tried accessing non-existent property AssetPathName on TSoftObjectPtrUserdata")
+            end
+            return nil
+        end,
+    })
 end
 
 --- 构造模拟玩家角色及其 PlayerState（含 GUID、名称、位置、朝向与完整模拟背包组件）。
@@ -403,19 +437,29 @@ os.clock = function() return mockClock end
 package.loadlib = function() return function() return 0 end end
 
 local capturedLoopCallback = nil
+local capturedLoopDelayMs = nil
 local capturedHooks = {}
+local inGameThreadDepth = 0
+local hooksRegisteredOutsideGameThread = 0
 local perfCounters = {
     findFirst = {},
     findAll = {},
     fileWrites = {},
-    gameThreadTicks = 0,
+    gameThreadBootstraps = 0,
+    loopInGameThreadRegs = 0,
+    configPolls = 0,
+    playerControllerQueries = 0,
 }
 
 local origIoOpen = io.open
 io.open = function(path, mode)
-    if type(mode) == "string" and mode:find("w") and type(path) == "string" then
+    if type(path) == "string" then
         local base = path:match("([^\\]+)$") or path
-        perfCounters.fileWrites[base] = (perfCounters.fileWrites[base] or 0) + 1
+        if type(mode) == "string" and mode:find("w") then
+            perfCounters.fileWrites[base] = (perfCounters.fileWrites[base] or 0) + 1
+        elseif (mode == nil or (type(mode) == "string" and mode:find("r"))) and base == "config.json" then
+            perfCounters.configPolls = perfCounters.configPolls + 1
+        end
     end
     return origIoOpen(path, mode)
 end
@@ -428,17 +472,42 @@ local gameInstanceMock = makeUObject("SurvivalGameInstance", "GI", {
 
 package.loaded["UEHelpers"] = {
     GetGameInstance = function() return gameInstanceMock end,
-    GetPlayerController = function() return world.inWorld and world.pc or nil end,
+    GetPlayerController = function()
+        perfCounters.playerControllerQueries = perfCounters.playerControllerQueries + 1
+        return world.inWorld and world.pc or nil
+    end,
 }
 
 _G.FName = makeFName
 _G.RegisterHook = function(funcPath, preFn, postFn)
+    if inGameThreadDepth <= 0 then
+        hooksRegisteredOutsideGameThread = hooksRegisteredOutsideGameThread + 1
+    end
     capturedHooks[funcPath] = { pre = preFn, post = postFn }
 end
-_G.LoopAsync = function(_intervalMs, fn) capturedLoopCallback = fn end
+-- ADR-0006 禁令：严禁任何后台异步线程 API（避免 UE4SS 4.x 跨线程篡改 m_hook_lua 栈闪退）
+_G.LoopAsync = function()
+    error("ADR-0006 违例：禁止调用 LoopAsync！")
+end
+_G.ExecuteAsync = function()
+    error("ADR-0006 违例：禁止调用 ExecuteAsync！")
+end
+_G.ExecuteWithDelay = function()
+    error("ADR-0006 违例：禁止调用 ExecuteWithDelay！")
+end
+_G.LoopInGameThreadWithDelay = function(delayMs, fn)
+    assertTrue(inGameThreadDepth > 0, "LoopInGameThreadWithDelay 必须在 GameThread 启动引导内注册")
+    perfCounters.loopInGameThreadRegs = perfCounters.loopInGameThreadRegs + 1
+    capturedLoopDelayMs = delayMs
+    capturedLoopCallback = fn
+    return 1001
+end
 _G.ExecuteInGameThread = function(fn)
-    perfCounters.gameThreadTicks = perfCounters.gameThreadTicks + 1
-    fn()
+    perfCounters.gameThreadBootstraps = perfCounters.gameThreadBootstraps + 1
+    inGameThreadDepth = inGameThreadDepth + 1
+    local ok, err = pcall(fn)
+    inGameThreadDepth = inGameThreadDepth - 1
+    if not ok then error(err, 0) end
 end
 
 local mockNaturalRows = {
@@ -539,12 +608,19 @@ local logs = {}
 _G.print = function(s) table.insert(logs, tostring(s)) end
 
 assert(loadfile(mainLuaPath))()
-assertTrue(type(capturedLoopCallback) == "function", "main.lua 必须注册唯一 LoopAsync 调度器")
+assertEq(perfCounters.gameThreadBootstraps, 1, "ADR-0006：main.lua 启动期必须且仅调用 1 次 ExecuteInGameThread 进行主线程引导")
+assertEq(perfCounters.loopInGameThreadRegs, 1, "ADR-0006：main.lua 必须注册唯一 1 个 LoopInGameThreadWithDelay 调度器")
+assertEq(capturedLoopDelayMs, 100, "LoopInGameThreadWithDelay 间隔应为 100ms")
+assertEq(hooksRegisteredOutsideGameThread, 0, "ADR-0006：全部 RegisterHook 必须在 GameThread 引导内安装（顶层注册必须为 0）")
+assertTrue(type(capturedLoopCallback) == "function", "main.lua 必须注册唯一纯 GameThread 定时回调")
 
---- 推进虚拟时钟并执行一次真实 onGameThreadTick()。
+--- 推进虚拟时钟并执行一次真实 onScheduledGameThreadCheck()（在 GameThread 上运行）。
 local function stepTick(dt)
     mockClock = mockClock + (dt or 1.0)
-    capturedLoopCallback()
+    inGameThreadDepth = inGameThreadDepth + 1
+    local ok, err = pcall(capturedLoopCallback)
+    inGameThreadDepth = inGameThreadDepth - 1
+    if not ok then error(err, 0) end
 end
 
 local actionSeq = 0
@@ -908,13 +984,19 @@ runCase("L10: 正常游玩期 30 秒性能不变量（0 次周期全图扫描、
     local statusWritesBefore = perfCounters.fileWrites["status.json.tmp"] or 0
     local catWritesBefore = perfCounters.fileWrites["catalog.json.tmp"] or 0
 
-    -- 模拟玩家关闭菜单和 M 地图持续跑图 30 秒（含高频 0.1s 定时器步进验证自适应调度）
-    local ticksBefore = perfCounters.gameThreadTicks
+    -- 模拟玩家关闭菜单和 M 地图持续跑图 30 秒（含高频 0.1s 定时器步进验证纯 GameThread 轻量节流与零跨线程调用）
+    local bootstrapsBefore = perfCounters.gameThreadBootstraps
+    local configPollsBefore = perfCounters.configPolls
+    local pcQueriesBefore = perfCounters.playerControllerQueries
     for _ = 1, 300 do
         stepTick(0.1)
     end
-    local ticksDelta = perfCounters.gameThreadTicks - ticksBefore
+    local bootstrapsDelta = perfCounters.gameThreadBootstraps - bootstrapsBefore
+    local configPollsDelta = perfCounters.configPolls - configPollsBefore
+    local pcQueriesDelta = perfCounters.playerControllerQueries - pcQueriesBefore
 
+    assertEq(bootstrapsDelta, 0,
+        "ADR-0006：稳态游玩 30 秒内严禁再调用任何跨线程 ExecuteInGameThread")
     assertEq((perfCounters.findFirst["SurvivalGameState"] or 0) - ffGsBefore, 0,
         "稳态游玩期间严禁重复 FindFirstOf(SurvivalGameState)")
     assertEq((perfCounters.findFirst["GlobalItemData"] or 0) - ffGidBefore, 0,
@@ -925,8 +1007,9 @@ runCase("L10: 正常游玩期 30 秒性能不变量（0 次周期全图扫描、
         "状态无变化时严禁每 0.6s 无效重写 status.json")
     assertEq((perfCounters.fileWrites["catalog.json.tmp"] or 0) - catWritesBefore, 0,
         "游玩期严禁每 10s 后台全图扫描并重写 catalog.json")
-    assertTrue(ticksDelta < 120,
-        "30 秒内自适应调度应大幅减少 GameThread 唤醒次数（实际=" .. tostring(ticksDelta) .. "）")
+    assertTrue(configPollsDelta <= 55 and pcQueriesDelta <= 140,
+        string.format("30 秒内 100ms 轻量检查应严格节流实际工作频率（configPolls=%d, pcQueries=%d）",
+            configPollsDelta, pcQueriesDelta))
 end)
 
 runCase("L11: SpawnLoot 瞬时 Pre/Post 还原（仅肩扛搬运物缩放封顶 12 并立即还原，橡果/模板始终 1 倍零复利）", function()
@@ -1551,9 +1634,9 @@ runCase("L16: 原版热区防闪退与真实自然资源过滤（直传纯 Lua �
         { "Ant", { CharacterName = { zh = "红工蚁" } } },
     })
     local bestiaryTbl = makeMockDataTable("DT_Bestiary", {
-        { "Bee", { Creature = "/Game/Blueprints/Creatures/Bee/BP_Bee.BP_Bee_C" } },
-        { "Larva", { Creature = "/Game/Blueprints/Creatures/Larva/BP_Larva.BP_Larva_C" } },
-        { "Ant_Black", { Creature = "/Game/Blueprints/Creatures/Ant/BP_Ant_Black.BP_Ant_Black_C" } },
+        { "Bee", { Creature = makeSoftObjectPtrUserdata("/Game/Blueprints/Creatures/Bee/BP_Bee.BP_Bee_C", "000001D82641E4D8") } },
+        { "Larva", { Creature = makeSoftObjectPtrUserdata("None", "000001D82641FFFF") } },
+        { "Ant_Black", { Creature = makeSoftObjectPtrUserdata("/Game/Blueprints/Creatures/Ant/BP_Ant_Black.BP_Ant_Black_C", "000001D82641A001") } },
     })
     gameInstanceMock.GlobalTableData = makeUObject("GlobalTableData", "GTD", {
         AllItemsTable = allItemsTbl,
@@ -2440,6 +2523,313 @@ runCase("L28: 击杀昆虫掉落全场景回归（BlueprintDropItems 不泄漏�
     equippablePerishable.GetEquipmentSlot = function() return 2 end
     simulateAddItem(pHost28.InventoryComponent, equippablePerishable, true)
     assertEq(getInvTotal(pHost28.InventoryComponent, "SlimeMoldTorch"), 1, "可装备单件物品即使带耐久/腐败也严禁复制，必须严格 1 倍")
+end)
+
+runCase("L29: ADR-0006 纯 GameThread 调度静态源码红线与运行时启动引导校验", function()
+    -- 1. 静态扫描 main.lua 有效非注释代码行：禁止任何后台异步调度调用，仅允许 1 次启动期 ExecuteInGameThread + LoopInGameThreadWithDelay
+    local f = assert(origIoOpen(mainLuaPath, "rb"))
+    local src = f:read("*a")
+    f:close()
+
+    local inBlockComment = false
+    local execInGtCalls = 0
+    local loopInGtCalls = 0
+    local bannedCalls = {}
+    local lineNo = 0
+    for line in (src .. "\n"):gmatch("(.-)\r?\n") do
+        lineNo = lineNo + 1
+        local code = line
+        if inBlockComment then
+            local closePos = code:find("]]", 1, true)
+            if closePos then
+                inBlockComment = false
+                code = code:sub(closePos + 2)
+            else
+                code = ""
+            end
+        end
+        if code ~= "" then
+            local blkStart = code:find("%-%-%[%[")
+            if blkStart then
+                local before = code:sub(1, blkStart - 1)
+                if not code:find("]]", blkStart + 4, true) then
+                    inBlockComment = true
+                end
+                code = before
+            else
+                code = code:gsub("%-%-.*$", "")
+            end
+        end
+        if code:find("LoopAsync%s*%(") then table.insert(bannedCalls, "L" .. lineNo .. ":LoopAsync") end
+        if code:find("ExecuteAsync%s*%(") then table.insert(bannedCalls, "L" .. lineNo .. ":ExecuteAsync") end
+        if code:find("ExecuteWithDelay%s*%(") then table.insert(bannedCalls, "L" .. lineNo .. ":ExecuteWithDelay") end
+        if code:find("ExecuteInGameThread%s*%(") then execInGtCalls = execInGtCalls + 1 end
+        if code:find("LoopInGameThreadWithDelay%s*%(") then loopInGtCalls = loopInGtCalls + 1 end
+    end
+
+    assertEq(#bannedCalls, 0, "ADR-0006：main.lua 严禁存在任何 LoopAsync/ExecuteAsync/ExecuteWithDelay 调用，发现=" .. table.concat(bannedCalls, ","))
+    assertEq(execInGtCalls, 1, "ADR-0006：main.lua 仅允许启动期 1 次 ExecuteInGameThread 引导调用")
+    assertEq(loopInGtCalls, 1, "ADR-0006：main.lua 必须通过 LoopInGameThreadWithDelay 挂载唯一主线程循环")
+
+    -- 2. 运行时核验：全过程至今 ExecuteInGameThread 总计严格等于 1，且全部 45 个 Hook 均在 GameThread 引导内安装完成
+    assertEq(perfCounters.gameThreadBootstraps, 1, "整个回归过程运行期 ExecuteInGameThread 调用总数必须始终为 1")
+    assertEq(hooksRegisteredOutsideGameThread, 0, "严禁任何 RegisterHook 在 GameThread 之外注册")
+    local hookCount = 0
+    for _ in pairs(capturedHooks) do hookCount = hookCount + 1 end
+    assertTrue(hookCount >= 40, "主线程引导必须完整注册全部原生 UFunction Hook（当前=" .. tostring(hookCount) .. "）")
+end)
+
+runCase("L30: UE4SS 4.x TSoftObjectPtrUserdata 解析修复（BestiaryTable 与未加载 ULootBagLODActor 零 Userdata 泄漏）", function()
+    local _, _, pHost30 = buildWorld({ worldTag = "T30_SoftPtr", isHost = true })
+    stepTick(1.0)
+    stepTick(3.0)
+
+    -- 1. 验证 L16 使用 TSoftObjectPtrUserdata 构造的 BestiaryTable 产出干净目录，绝对不包含任何 "Userdata:" 指针条目
+    local cat = readJsonFile(modDataDir .. "\\catalog.json")
+    assertTrue(cat ~= nil and #cat > 0, "应正常生成 catalog.json")
+    local hasBee, hasLarva, hasBlackAnt = false, false, false
+    for _, e in ipairs(cat) do
+        assertTrue(not tostring(e.id):find("Userdata:", 1, true) and not tostring(e.id):find("userdata:", 1, true),
+            "catalog.json 严禁出现 TSoftObjectPtrUserdata 内存地址条目: " .. tostring(e.id))
+        assertTrue(not tostring(e.name):find("Userdata:", 1, true),
+            "catalog.json 显示名严禁包含 Userdata 内存地址: " .. tostring(e.name))
+        if e.id == "creature:Bee" and e.name == "蜜蜂" then hasBee = true end
+        if e.id == "creature:Larva" and e.name == "幼虫" then hasLarva = true end
+        if e.id == "creature:Ant_Black" and e.name == "黑工蚁" then hasBlackAnt = true end
+    end
+    assertTrue(hasBee, "TSoftObjectPtrUserdata:GetObjectID():GetAssetPathName() 必须精准解析 creature:Bee -> 蜜蜂")
+    assertTrue(hasLarva, "当 TSoftObjectPtrUserdata 路径为 None 时必须拒绝指针文本并安全回退 rowName -> creature:Larva(幼虫)")
+    assertTrue(hasBlackAnt, "TSoftObjectPtrUserdata 必须精准解析 creature:Ant_Black -> 黑工蚁")
+
+    -- 2. 验证远距未加载 ULootBagLODActor 在 GetActorClassHard() 为空、仅 GetActorClassSoft() 返回 TSoftObjectPtrUserdata 时：
+    --    - 玩家背包(BP_Backpack_C)能被正确识别并唤醒找回；
+    --    - Ominent 宝箱(BP_Ominent_Chest_C)与坏指针(None)均被严密拦截、0 唤醒！
+    local softBackpack = makeLootBag({
+        id = "SoftPtrHostBag", bagType = 1, itemCount = 2,
+        ownerGuid = pHost30.PlayerGuid, ownerName = "HostAlice",
+        x = 60000, y = -30000, z = 120,
+    })
+    local lodSoftBackpack = makeUnloadedLootBagLod(softBackpack, { actorClassName = "BP_Backpack_C" })
+    lodSoftBackpack.GetActorClassHard = function() return nil end
+    lodSoftBackpack.GetActorClassSoft = function()
+        return makeSoftObjectPtrUserdata("/Game/Blueprints/Items/BP_Backpack.BP_Backpack_C", "000001D811112222")
+    end
+    lodSoftBackpack.IsFullActorType = function() return false end
+
+    local softChest = makeLootBag({
+        id = "SoftPtrOminentChest", bagType = 0, itemCount = 4,
+        ownerGuid = pHost30.PlayerGuid, ownerName = "HostAlice",
+        x = 61000, y = -31000, z = 120,
+    })
+    local lodSoftChest = makeUnloadedLootBagLod(softChest, { actorClassName = "BP_Ominent_Chest_C" })
+    lodSoftChest.GetActorClassHard = function() return nil end
+    lodSoftChest.GetActorClassSoft = function()
+        return makeSoftObjectPtrUserdata("/Game/Blueprints/Props/BP_Ominent_Chest.BP_Ominent_Chest_C", "000001D833334444")
+    end
+    lodSoftChest.IsFullActorType = function() return false end
+
+    world.lods = { lodSoftBackpack, lodSoftChest }
+    world.gs.LODActorManagerComponent.LODActors = world.lods
+    world.loadedBags = {}
+
+    sendAction("recover_my_backpacks")
+    stepTick(1.0)
+    assertEq(lodSoftBackpack._convertCalled, 1, "仅通过 TSoftObjectPtrUserdata 暴露 BP_Backpack_C 的远距玩家背包应被正确识别并唤醒")
+    assertEq(softBackpack._movedCount, 1, "远距软指针背包唤醒后应成功瞬移到房主脚边")
+    assertEq(lodSoftChest._convertCalled, 0, "通过 TSoftObjectPtrUserdata 暴露 BP_Ominent_Chest_C 的未加载宝箱必须被黑名单拦死（0 唤醒）")
+end)
+
+runCase("L31: pollConfig() 自动清洗历史损坏 trackedIds（过滤 Userdata 指针项并保留正常追踪项）", function()
+    buildWorld({ worldTag = "T31_SanitizeTracked", isHost = false })
+    world.lods = {}
+    world.gs.LODActorManagerComponent.LODActors = world.lods
+    world.creatures = {
+        makeUObject("BP_Bee_C", "AR:Bee31", { K2_GetActorLocation = function() return { X = 2100, Y = 3100, Z = 100 } end }),
+    }
+    world.harvestNodes = {
+        makeUObject("BP_Rock_Clay_C", "AR:Clay31", { K2_GetActorLocation = function() return { X = 2200, Y = 3200, Z = 20 } end }),
+    }
+
+    local mapPanelMock = makeUObject("MapPanelWidget", "MapPanel31", {
+        MinBounds = { X = -80000, Y = -80000 }, MaxBounds = { X = 80000, Y = 80000 },
+        TextureSize = { X = 2048, Y = 2048 },
+        CollectibleCanvas = makeUObject("CanvasPanel", "CC31"),
+        MapBorder = makeUObject("Border", "MB31"),
+        PlayerCanvas = makeUObject("CanvasPanel", "PC31", { GetChildrenCount = function() return 0 end }),
+    })
+    local rootWinMock = makeUObject("InGameMenuWidget", "UI_InGameMenu31", {
+        Map = makeUObject("UI_Map", "UI_Map_C31", { Active = true, MapPanel = mapPanelMock }),
+    })
+    gameInstanceMock.WidgetManager = makeUObject("WidgetManager", "WM31", {
+        GetTopWindow = function() return rootWinMock end,
+        WindowStack = { rootWinMock },
+    })
+
+    writeJsonFile(modDataDir .. "\\config.json", {
+        trackedIds = {
+            "creature:TSoftObjectPtrUserdata: 000001D82641E4D8",
+            "creature:Bee",
+            "node:userdata: 0xdeadbeef",
+            "node:Rock_Clay",
+        },
+    })
+    stepTick(1.0)
+    stepTick(3.0)
+    stepTick(0.5)
+
+    local ml = readJsonFile(modDataDir .. "\\map_live.json")
+    assertTrue(ml ~= nil and ml.mapOpen == true and ml.pins ~= nil, "含脏 trackedIds 的 config.json 不得导致 M 地图渲染异常")
+    local pinIds = {}
+    for _, p in ipairs(ml.pins) do
+        assertTrue(not tostring(p.id):find("Userdata:", 1, true) and not tostring(p.id):find("userdata:", 1, true),
+            "M 地图标点严禁包含已清洗的 Userdata 脏 ID: " .. tostring(p.id))
+        pinIds[p.id] = (pinIds[p.id] or 0) + 1
+    end
+    assertEq(pinIds["creature:Bee"], 1, "清洗脏 trackedIds 后正常追踪生物 creature:Bee 必须照常亮标")
+    assertEq(pinIds["node:Rock_Clay"], 1, "清洗脏 trackedIds 后正常追踪矿点 node:Rock_Clay 必须照常亮标")
+
+    rootWinMock.Map.Active = false
+    stepTick(0.5)
+    gameInstanceMock.WidgetManager = nil
+end)
+
+runCase("L32: 反作弊与植被地址缓存有界 TTL + 容量淘汰校验（超 TTL 不误拦复用地址，有效期内防刷严格不变）", function()
+    local _, _, pHost32 = buildWorld({ worldTag = "T32_BoundedCache", isHost = true })
+    pHost32.HasAuthority = function() return true end
+
+    writeJsonFile(modDataDir .. "\\config.json", {
+        harvestEnabled = true, harvestMultiplier = 3,
+        harvestAffectHauling = true, harvestAffectPickup = true,
+    })
+    stepTick(1.0)
+    stepTick(3.0)
+
+    local dropHook = capturedHooks["/Script/Maine.InventoryComponent:ServerDropItem"]
+    local notifySpawnHook = capturedHooks["/Script/Maine.SpawnedItem:NotifySpawned"]
+    local swapHook = capturedHooks["/Script/Maine.SpawnedItem:NotifySwapped"]
+
+    -- 1. 玩家丢弃物品 A（记录其地址），推进 25 秒（超过 20s 事件窗但远小于 600s 地址 TTL）-> 捡回仍必须严格 1 倍防刷
+    local droppedA = makeInvItem("Sap", 1, 100, true)
+    local addrA = droppedA:GetAddress()
+    local actorA = makeSpawnedItemActor({ rowName = "Sap", itemObj = droppedA })
+    dropHook.pre({ get = function() return pHost32.InventoryComponent end }, { get = function() return droppedA end }, { get = function() return 1 end })
+    notifySpawnHook.pre({ get = function() return actorA end })
+    dropHook.post()
+
+    mockClock = mockClock + 25.0
+    local pickupA = makeInvItem("Sap", 1, 100, true)
+    pickupA._addr = addrA
+    simulateAddItem(pHost32.InventoryComponent, pickupA, true)
+    assertEq(getInvTotal(pHost32.InventoryComponent, "Sap"), 1, "600s TTL 内玩家自丢物地址仍必须严格保持 1 倍防刷")
+
+    -- 2. 模拟超长时间游玩推进 605 秒（> EXCLUDED_ADDR_TTL=600s），引擎内存复用同一地址生成全新野生采集物 -> 过期条目自动释放，正常走 3 倍
+    mockClock = mockClock + 605.0
+    local reusedWildSap = makeInvItem("Sap", 1, 100, true)
+    reusedWildSap._addr = addrA
+    simulateAddItem(pHost32.InventoryComponent, reusedWildSap, true)
+    assertEq(getInvTotal(pHost32.InventoryComponent, "Sap"), 4, "超过 600s TTL 后复用地址的新野生掉落应自动解除黑名单并走 3 倍(1+3=4)")
+
+    -- 3. 批量注入 600 个不同丢弃地址触发 512 容量上限淘汰，验证最新丢弃物仍严格保持 1 倍且不会无限增长
+    local newestDroppedAddr = nil
+    for i = 1, 600 do
+        mockClock = mockClock + 0.05
+        local dummy = makeInvItem("AcornBits", 1, 100, true)
+        local dAct = makeSpawnedItemActor({ rowName = "AcornBits", itemObj = dummy })
+        dropHook.pre({ get = function() return pHost32.InventoryComponent end }, { get = function() return dummy end }, { get = function() return 1 end })
+        notifySpawnHook.pre({ get = function() return dAct end })
+        dropHook.post()
+        newestDroppedAddr = dummy:GetAddress()
+    end
+    mockClock = mockClock + 25.0
+    local newestPick = makeInvItem("AcornBits", 1, 100, true)
+    newestPick._addr = newestDroppedAddr
+    simulateAddItem(pHost32.InventoryComponent, newestPick, true)
+    assertEq(getInvTotal(pHost32.InventoryComponent, "AcornBits"), 1, "容量淘汰仅清理最旧地址，最新丢弃物仍必须严格保持 1 倍")
+
+    -- 4. 植被直拾地址缓存 TTL(120s)：关闭自然直拾时 5s 内严格 1 倍；超过 125s 后复用地址的非直拾掉落自动解封走 3 倍
+    writeJsonFile(modDataDir .. "\\config.json", {
+        harvestEnabled = true, harvestMultiplier = 3,
+        harvestAffectHauling = true, harvestAffectPickup = false,
+    })
+    stepTick(1.0)
+
+    local folActFresh, folItemFresh = makeSpawnedItemActor({ rowName = "PlantFiber", preplacedType = 0 })
+    local folActExp, folItemExp = makeSpawnedItemActor({ rowName = "PlantFiber", preplacedType = 0 })
+    local folExpAddr = folItemExp:GetAddress()
+    swapHook.pre({ get = function() return folActFresh end }, nil, { get = function() return false end })
+    swapHook.pre({ get = function() return folActExp end }, nil, { get = function() return false end })
+
+    mockClock = mockClock + 5.0
+    simulateAddItem(pHost32.InventoryComponent, folItemFresh, true)
+    assertEq(getInvTotal(pHost32.InventoryComponent, "PlantFiber"), 1, "120s TTL 内且关闭自然直拾时，植被直拾物品必须保持 1 倍")
+
+    mockClock = mockClock + 125.0
+    local reusedWildFiber = makeInvItem("PlantFiber", 1, 100, true)
+    reusedWildFiber._addr = folExpAddr
+    simulateAddItem(pHost32.InventoryComponent, reusedWildFiber, true)
+    assertEq(getInvTotal(pHost32.InventoryComponent, "PlantFiber"), 4, "超过 120s TTL 后复用地址的新采集物不得再被误判为自然直拾(1+3=4)")
+end)
+
+runCase("L33: scaleHaulingLootPre / restoreHaulingLootPost 关闭搬运开关时的纯 Lua 零 UObject 早退校验", function()
+    buildWorld({ worldTag = "T33_HaulingEarlyExit", isHost = true })
+
+    local spawnHook = capturedHooks["/Script/Maine.LootComponent:SpawnLoot"]
+    local onDeathHook = capturedHooks["/Script/Maine.LootComponent:OnDeath"]
+    local onDamagedHook = capturedHooks["/Script/Maine.LootComponent:OnDamaged"]
+    local plankEntry = { Type = 0, Count = 4, ItemData = { RowName = makeFName("GrassPlank") } }
+    local lcGrass = makeUObject("LootComponent", "LC_Grass_33", {
+        GetOuter = function() return makeUObject("HarvestNode", "BP_GrassBlade_A_C_33") end,
+        Items = { plankEntry },
+    })
+
+    local selfGetCalls = 0
+    local trackedSelfParam = {
+        get = function()
+            selfGetCalls = selfGetCalls + 1
+            return lcGrass
+        end,
+    }
+    local killingBlowParam = { get = function() return true end }
+
+    -- 1. harvestEnabled=true 但 harvestAffectHauling=false：全部搬运入口 Pre/Post 必须零 UObject 读取早退
+    writeJsonFile(modDataDir .. "\\config.json", {
+        harvestEnabled = true, harvestMultiplier = 4,
+        harvestAffectHauling = false, harvestAffectPickup = true,
+    })
+    stepTick(1.0)
+    selfGetCalls = 0
+    spawnHook.pre(trackedSelfParam)
+    spawnHook.post(trackedSelfParam)
+    onDeathHook.pre(trackedSelfParam)
+    onDeathHook.post(trackedSelfParam)
+    onDamagedHook.pre(trackedSelfParam, nil, nil, nil, nil, killingBlowParam)
+    onDamagedHook.post(trackedSelfParam)
+    assertEq(selfGetCalls, 0, "关闭搬运物倍率子开关时，SpawnLoot/OnDeath/OnDamaged 必须纯 Lua 零 UObject(selfParam:get) 早退")
+    assertEq(plankEntry.Count, 4, "关闭搬运物子开关时草板 Count 保持原版 4")
+
+    -- 2. harvestEnabled=false 且 harvestAffectHauling=true：同样必须零 UObject 读取早退
+    writeJsonFile(modDataDir .. "\\config.json", {
+        harvestEnabled = false, harvestMultiplier = 4,
+        harvestAffectHauling = true, harvestAffectPickup = true,
+    })
+    stepTick(1.0)
+    selfGetCalls = 0
+    spawnHook.pre(trackedSelfParam)
+    spawnHook.post(trackedSelfParam)
+    assertEq(selfGetCalls, 0, "关闭采集倍率总开关时，搬运 Hook 必须纯 Lua 零 UObject 早退")
+
+    -- 3. 重新双开后正常瞬时放大封顶 12 并精确还原为 4（确认早退逻辑不影响正常功能）
+    writeJsonFile(modDataDir .. "\\config.json", {
+        harvestEnabled = true, harvestMultiplier = 4,
+        harvestAffectHauling = true, harvestAffectPickup = true,
+    })
+    stepTick(1.0)
+    selfGetCalls = 0
+    spawnHook.pre(trackedSelfParam)
+    assertEq(plankEntry.Count, 12, "重新开启搬运倍率后草板应瞬时放大封顶 12")
+    spawnHook.post(trackedSelfParam)
+    assertEq(plankEntry.Count, 4, "Post-Hook 必须精准还原草板原版 Count=4")
+    assertTrue(selfGetCalls >= 2, "开启状态下应正常读取 LootComponent UObject")
 end)
 
 -- 清理本次测试在 lua/GroundedQoL/data 下产生的临时 JSON 文件

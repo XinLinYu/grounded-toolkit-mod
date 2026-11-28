@@ -840,7 +840,14 @@ static int RunDx11Test(const std::wstring& dllPath) {
                "  \"noDeathDurabilityPenalty\": true,\n"
                "  \"imeCandidateMode\": 2,\n"
                "  \"stackEnabled\": true,\n"
-               "  \"stackMultiplier\": 15\n"
+               "  \"stackMultiplier\": 15,\n"
+               "  \"trackedIds\": [\n"
+               "    \"creature:Bee\",\n"
+               "    \"creature:TSoftObjectPtrUserdata: 000001D82641E4D8\",\n"
+               "    \"node:userdata: 0xdeadbeef\",\n"
+               "    \"creature:Bee\",\n"
+               "    \"node:Rock_Clay\"\n"
+               "  ]\n"
                "}\n";
     }
     // 模拟上次游戏会话退出后磁盘残留的 status.json（旧会话确认号 lastActionSeq=8）：
@@ -954,7 +961,14 @@ static int RunDx11Test(const std::wstring& dllPath) {
             std::printf("[FAIL] Pre-existing config was unexpectedly overwritten!\n");
             return 27;
         }
-        std::printf("[TEST-DX11] Verified pre-existing config (including imeCandidateMode=2) preserved!\n");
+        if (cfgText.find("TSoftObjectPtrUserdata") != std::string::npos ||
+            cfgText.find("userdata:") != std::string::npos ||
+            cfgText.find("\"creature:Bee\"") == std::string::npos ||
+            cfgText.find("\"node:Rock_Clay\"") == std::string::npos) {
+            std::printf("[FAIL] Dirty trackedIds were NOT sanitized or valid entries lost! cfg=%s\n", cfgText.c_str());
+            return 63;
+        }
+        std::printf("[TEST-DX11] Verified pre-existing config (including imeCandidateMode=2 + dirty trackedIds auto-sanitized)!\n");
     }
 
     WNDCLASSEXW wc{};
